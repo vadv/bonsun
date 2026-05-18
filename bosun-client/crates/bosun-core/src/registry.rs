@@ -9,8 +9,8 @@ pub enum RegistryError {
     DuplicateId(ResourceId),
     #[error("unknown handle referenced: {0}")]
     UnknownHandle(ResourceId),
-    #[error("dependency cycle detected: {path}")]
-    Cycle { path: String },
+    #[error("dependency cycle detected; stuck nodes: {nodes}")]
+    Cycle { nodes: String },
 }
 
 #[derive(Default)]
@@ -42,6 +42,12 @@ impl Registry {
         &self.resources
     }
 
+    /// Топологический порядок ресурсов. При обнаружении цикла возвращает
+    /// `Cycle { nodes }` — отсортированный список вершин, у которых остался
+    /// ненулевой in-degree (Kahn не смог их «погасить»). Это множество
+    /// застрявших вершин, а не конкретный path по циклу: восстановить путь
+    /// требует back-edge DFS, который для MVP избыточен. Если нужен exact
+    /// cycle, выводить его придётся в Phase 5+ при отладке сложных манифестов.
     pub fn topological_order(&self) -> Result<Vec<ResourceId>, RegistryError> {
         // Kahn algorithm: рёбра — от dependency к dependent.
         // reload_on и depends_on в MVP трактуются одинаково.
@@ -82,14 +88,17 @@ impl Registry {
         }
 
         if order.len() != n {
-            // Цикл. Собираем хоть какую-то цепочку для сообщения.
-            let stuck: Vec<String> = in_degree
+            // Цикл. HashMap-итерация не детерминирована, поэтому сортируем
+            // stuck-вершины перед формированием сообщения, иначе один и тот
+            // же манифест давал бы разный текст ошибки между запусками.
+            let mut stuck: Vec<String> = in_degree
                 .iter()
                 .filter(|(_, &d)| d > 0)
                 .map(|(k, _)| k.to_string())
                 .collect();
+            stuck.sort();
             return Err(RegistryError::Cycle {
-                path: stuck.join(" -> "),
+                nodes: stuck.join(", "),
             });
         }
         Ok(order)
@@ -184,7 +193,15 @@ mod tests {
         })
         .unwrap();
         let err = reg.topological_order().unwrap_err();
-        assert!(matches!(err, RegistryError::Cycle { .. }));
+        let nodes = match &err {
+            RegistryError::Cycle { nodes } => nodes,
+            other => unreachable!("expected Cycle, got {other:?}"),
+        };
+        // Сортировка детерминирована: "apt.package:a" < "apt.package:b".
+        assert_eq!(nodes, "apt.package:a, apt.package:b");
+        let msg = err.to_string();
+        assert!(msg.contains("apt.package:a"), "msg={msg}");
+        assert!(msg.contains("apt.package:b"), "msg={msg}");
     }
 
     #[test]
