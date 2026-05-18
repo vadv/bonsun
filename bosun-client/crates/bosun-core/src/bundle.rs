@@ -278,10 +278,14 @@ fn yaml_to_json(v: serde_norway::Value) -> Result<serde_json::Value, String> {
 
 /// Deep-merge defaults и override с null-семантикой удаления.
 /// - Object + Object: ключи сливаются; null в override удаляет ключ defaults.
+/// - null на корне override: «override не задан», возвращаем defaults без изменений.
+///   Это отличается от null внутри map: null-как-значение-ключа удаляет ключ,
+///   но null-как-корень означает отсутствие самого override.
 /// - Иначе override полностью заменяет defaults.
 fn merge_json(base: serde_json::Value, over: serde_json::Value) -> serde_json::Value {
     use serde_json::Value;
     match (base, over) {
+        (base, Value::Null) => base,
         (Value::Object(mut base_map), Value::Object(over_map)) => {
             for (k, v) in over_map {
                 if v.is_null() {
@@ -504,12 +508,20 @@ entry = "manifests/missing.star"
     }
 
     #[test]
-    fn merge_inventory_null_at_root_overrides_nothing_above() {
-        // null на уровне корня override'а не имеет parent-объекта, чтобы удалять.
-        // Возвращаем сам override (null). Это маргинальный кейс, фиксируем поведение.
+    fn merge_inventory_null_at_root_keeps_defaults() {
+        // null на корне override'а трактуем как «override не передан» —
+        // возвращаем defaults без изменений. Этот путь срабатывает, когда
+        // CLI вызывается без флага `--inventory`.
         let bundle = with_defaults(serde_json::json!({"a": 1}));
         let result = bundle.merge_inventory(serde_json::Value::Null);
-        assert_eq!(result, serde_json::Value::Null);
+        assert_eq!(result, serde_json::json!({"a": 1}));
+    }
+
+    #[test]
+    fn merge_inventory_null_at_root_with_empty_defaults_keeps_empty_object() {
+        let bundle = with_defaults(serde_json::json!({}));
+        let result = bundle.merge_inventory(serde_json::Value::Null);
+        assert_eq!(result, serde_json::json!({}));
     }
 
     #[test]
