@@ -1,0 +1,25 @@
+# Cloned reference projects — each has its own git repo
+/chiit/
+/chiit-server/
+/postgres-chiit/
+/self-upgrade/
+
+# Wiki — separate repo at .claude-memory-compiler/
+/.claude-memory-compiler/
+
+# Claude Code per-project state (settings, channel tokens)
+/.claude/
+
+# Rust / build
+target/
+Cargo.lock.bak
+
+# Editor / OS
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Backup files from edits
+*.bak
+*.orig
