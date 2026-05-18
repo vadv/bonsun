@@ -4,6 +4,9 @@
 //! из ApplyCtx. В payload остаются sha256 + size, по которым plan сравнивает
 //! состояние без чтения секретов.
 
+use std::path::{Component, Path};
+
+use bosun_core::PrimitiveError;
 use serde::Deserialize;
 
 /// Спека `file.content`, как она лежит в `Resource.payload`.
@@ -26,8 +29,42 @@ const fn default_mode() -> u32 {
     0o644
 }
 
+impl FileContentSpec {
+    /// Проверить, что `path` — абсолютный и не содержит `..`-сегментов
+    /// или NUL-байт. Без этого манифест может попросить запись по
+    /// `../../etc/shadow.poisoned` или встроить нулевой байт, что
+    /// разламывает построение backup-пути и открывает arbitrary write.
+    ///
+    /// Симлинки и тип файла на target проверяются в plan/apply через
+    /// `symlink_metadata` — на уровне spec'а мы валидируем только саму
+    /// строку пути.
+    pub fn validate(&self) -> Result<(), PrimitiveError> {
+        if self.path.contains('\0') {
+            return Err(PrimitiveError::InvalidPayload(
+                "file.content.path contains NUL byte".to_string(),
+            ));
+        }
+        let p = Path::new(&self.path);
+        if !p.is_absolute() {
+            return Err(PrimitiveError::InvalidPayload(format!(
+                "file.content.path must be absolute, got: {}",
+                self.path,
+            )));
+        }
+        for component in p.components() {
+            if matches!(component, Component::ParentDir) {
+                return Err(PrimitiveError::InvalidPayload(format!(
+                    "file.content.path contains '..' segment: {}",
+                    self.path,
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -95,5 +132,49 @@ mod tests {
         });
         let spec: FileContentSpec = serde_json::from_value(json).unwrap();
         assert!(spec.owner.is_none());
+    }
+
+    fn spec_with_path(path: &str) -> FileContentSpec {
+        FileContentSpec {
+            path: path.to_string(),
+            mode: 0o644,
+            owner: None,
+            group: None,
+            content_sha256: "x".into(),
+            content_size: 0,
+        }
+    }
+
+    #[test]
+    fn spec_accepts_absolute_path() {
+        spec_with_path("/etc/nginx/nginx.conf").validate().unwrap();
+    }
+
+    #[test]
+    fn spec_rejects_relative_path() {
+        let err = spec_with_path("etc/foo").validate().unwrap_err();
+        match err {
+            PrimitiveError::InvalidPayload(msg) => assert!(msg.contains("absolute")),
+            other => panic!("expected InvalidPayload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spec_rejects_parent_dir() {
+        // Security-critical: path-traversal через `..` запрещён.
+        let err = spec_with_path("/etc/../etc/foo").validate().unwrap_err();
+        match err {
+            PrimitiveError::InvalidPayload(msg) => assert!(msg.contains("'..'")),
+            other => panic!("expected InvalidPayload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spec_rejects_nul_byte() {
+        let err = spec_with_path("/etc/foo\0bar").validate().unwrap_err();
+        match err {
+            PrimitiveError::InvalidPayload(msg) => assert!(msg.contains("NUL")),
+            other => panic!("expected InvalidPayload, got {other:?}"),
+        }
     }
 }

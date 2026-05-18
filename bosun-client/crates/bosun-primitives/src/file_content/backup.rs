@@ -30,7 +30,7 @@ pub fn backup_with_rotation(
         backup_root,
         target,
         &Utc::now().format("%Y%m%dT%H%M%SZ").to_string(),
-    );
+    )?;
 
     if let Some(parent) = backup_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| PrimitiveError::Io {
@@ -53,19 +53,32 @@ pub fn backup_with_rotation(
 /// Реализация конкатенирует строки путей напрямую, потому что `target`
 /// абсолютный (`/etc/nginx/...`) — `Path::join(backup_root, target)` сбросит
 /// `backup_root`. Чтобы сохранить structure, мы пропускаем leading-slash.
-fn build_backup_path(backup_root: &Path, target: &Path, ts: &str) -> PathBuf {
+///
+/// `target` без `file_name` — например, путь, оканчивающийся на `/` или
+/// корневой `/` — здесь невозможен: `FileContentSpec::validate` уже
+/// отбрасывает path-traversal и относительные пути, а реальный файл всегда
+/// имеет имя. Но defense-in-depth: вместо тихого fallback'а `"backup"`
+/// возвращаем `InvalidPayload`.
+fn build_backup_path(
+    backup_root: &Path,
+    target: &Path,
+    ts: &str,
+) -> Result<PathBuf, PrimitiveError> {
     let mut out: PathBuf = backup_root.to_path_buf();
     let rel = target.strip_prefix("/").unwrap_or(target);
     out.push(rel);
     // Дописываем `.{ts}` к имени файла, сохраняя расширение.
-    let mut file_name: OsString = out
-        .file_name()
-        .map(OsString::from)
-        .unwrap_or_else(|| OsString::from("backup"));
-    file_name.push(".");
-    file_name.push(ts);
-    out.set_file_name(file_name);
-    out
+    let file_name: OsString = out.file_name().map(OsString::from).ok_or_else(|| {
+        PrimitiveError::InvalidPayload(format!(
+            "cannot build backup path: target {} has no file_name",
+            target.display(),
+        ))
+    })?;
+    let mut with_ts = file_name;
+    with_ts.push(".");
+    with_ts.push(ts);
+    out.set_file_name(with_ts);
+    Ok(out)
 }
 
 /// Удалить старые бэкапы для пути, оставив только последние `keep_last`.
@@ -125,7 +138,7 @@ fn rotate(new_backup: &Path, keep_last: usize) -> Result<(), PrimitiveError> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use std::fs;
     use std::io::Write;
@@ -144,7 +157,7 @@ mod tests {
     fn build_backup_path_strips_leading_slash_and_appends_ts() {
         let backup_root = Path::new("/var/backups/bosun");
         let target = Path::new("/etc/nginx/nginx.conf");
-        let path = build_backup_path(backup_root, target, "20260518T120000Z");
+        let path = build_backup_path(backup_root, target, "20260518T120000Z").unwrap();
         assert_eq!(
             path,
             Path::new("/var/backups/bosun/etc/nginx/nginx.conf.20260518T120000Z")
@@ -155,8 +168,24 @@ mod tests {
     fn build_backup_path_relative_target() {
         let backup_root = Path::new("/tmp/bosun");
         let target = Path::new("etc/host");
-        let path = build_backup_path(backup_root, target, "X");
+        let path = build_backup_path(backup_root, target, "X").unwrap();
         assert_eq!(path, Path::new("/tmp/bosun/etc/host.X"));
+    }
+
+    #[test]
+    fn build_backup_path_rejects_target_without_file_name() {
+        // Защита-on-belt-and-braces: validate() в spec.rs не пускает такие
+        // пути в apply, но build_backup_path не должен молча проглатывать
+        // их и писать в файл с именем "backup". Конструируем такой кейс
+        // на root-paths: и backup_root, и target равны `/`, после strip
+        // суммарный путь остаётся `/`, у него нет file_name.
+        let backup_root = Path::new("/");
+        let target = Path::new("/");
+        let err = build_backup_path(backup_root, target, "X").unwrap_err();
+        match err {
+            PrimitiveError::InvalidPayload(msg) => assert!(msg.contains("file_name")),
+            other => panic!("expected InvalidPayload, got {other:?}"),
+        }
     }
 
     #[test]

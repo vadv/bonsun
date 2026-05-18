@@ -29,6 +29,7 @@ pub fn apply(
 ) -> Result<ChangeReport, PrimitiveError> {
     let spec: FileContentSpec = serde_json::from_value(resource.payload.clone())
         .map_err(|e| PrimitiveError::InvalidPayload(format!("file.content payload: {e}")))?;
+    spec.validate()?;
     let target = Path::new(&spec.path);
 
     let sensitive = ctx.sensitive.take(&resource.id).ok_or_else(|| {

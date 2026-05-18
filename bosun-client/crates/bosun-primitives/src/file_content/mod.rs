@@ -82,6 +82,7 @@ impl Primitive for FilePrimitive {
     ) -> Result<Diff, PrimitiveError> {
         let spec: FileContentSpec = serde_json::from_value(resource.payload.clone())
             .map_err(|e| PrimitiveError::InvalidPayload(format!("file.content payload: {e}")))?;
+        spec.validate()?;
         let target = Path::new(&spec.path);
 
         match std::fs::symlink_metadata(target) {
