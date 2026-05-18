@@ -36,6 +36,7 @@ tempfile = "3"
 clap = { version = "4", features = ["derive"] }
 procfs = "=0.16"
 num_cpus = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tokio-util = "0.7"
 debversion = "0.4"
 libc = "0.2"
@@ -45,3 +46,4 @@ toml = "0.8"
 fs4 = "0.13"
 chrono = { version = "0.4", features = ["clock"] }
 signal-hook = "0.3"
+cucumber = "0.21"
