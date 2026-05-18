@@ -44,3 +44,4 @@ minijinja = "2"
 toml = "0.8"
 fs4 = "0.13"
 chrono = { version = "0.4", features = ["clock"] }
+signal-hook = "0.3"
