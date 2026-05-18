@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use crate::resource::ResourceId;
 
@@ -49,13 +49,27 @@ impl SensitiveStore {
     }
 
     pub fn put(&self, id: ResourceId, value: SensitivePayload<String>) {
-        if let Ok(mut guard) = self.inner.lock() {
-            guard.insert(id, value);
-        }
+        let mut guard = self.lock_recovering();
+        guard.insert(id, value);
     }
 
     pub fn take(&self, id: &ResourceId) -> Option<SensitivePayload<String>> {
-        self.inner.lock().ok().and_then(|mut g| g.remove(id))
+        let mut guard = self.lock_recovering();
+        guard.remove(id)
+    }
+
+    /// Берёт mutex, восстанавливая после возможного poisoning. Состояние
+    /// внутри `HashMap` не имеет инвариантов, которые мог бы нарушить
+    /// прерванный writer (insert/remove атомарны для самой структуры),
+    /// поэтому продолжать работу безопаснее, чем терять put/take молча.
+    fn lock_recovering(&self) -> MutexGuard<'_, HashMap<ResourceId, SensitivePayload<String>>> {
+        match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!("SensitiveStore mutex was poisoned; recovering");
+                poisoned.into_inner()
+            }
+        }
     }
 }
 
@@ -83,5 +97,29 @@ mod tests {
         let taken = store.take(&id).unwrap();
         assert_eq!(taken.into_inner(), "body");
         assert!(store.take(&id).is_none(), "second take returns None");
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn store_recovers_from_poisoned_mutex() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let store = Arc::new(SensitiveStore::new());
+        let store_clone = Arc::clone(&store);
+        let handle = thread::spawn(move || {
+            // Захватываем lock и паникуем — это poison'ит mutex.
+            // mod tests — дочерний модуль, поэтому доступен приватный inner.
+            let _g = store_clone.inner.lock().unwrap();
+            panic!("inducing poison");
+        });
+        // Ожидаем именно панику в child thread'е.
+        assert!(handle.join().is_err(), "child thread should have panicked");
+
+        let kind = ResourceKind::from_static("file.content");
+        let id = ResourceId::new(&kind, "/etc/secret");
+        store.put(id.clone(), SensitivePayload::new("body".into()));
+        let taken = store.take(&id).unwrap();
+        assert_eq!(taken.into_inner(), "body");
     }
 }
