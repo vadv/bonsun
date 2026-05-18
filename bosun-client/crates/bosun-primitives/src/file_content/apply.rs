@@ -214,6 +214,7 @@ mod tests {
             tracing::Span::none(),
             store,
             backup_root,
+            std::path::PathBuf::from("/tmp"),
         )
     }
 

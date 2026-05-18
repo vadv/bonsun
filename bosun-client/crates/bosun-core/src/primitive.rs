@@ -49,6 +49,11 @@ pub struct ApplyCtx {
     /// под `backup_root = /var/backups/bosun` даёт
     /// `/var/backups/bosun/etc/nginx/nginx.conf.YYYYMMDDTHHMMSSZ`.
     pub backup_root: PathBuf,
+    /// Каталог для лог-файлов примитивов: например, `apt.package` пишет
+    /// полный stderr в `{log_dir}/apt-install-last-error.log` при провале,
+    /// чтобы оператор мог поднять post-mortem без перезапуска bosun.
+    /// В production CLI задаёт `/var/log/bosun`.
+    pub log_dir: PathBuf,
 }
 
 impl PlanCtx {
@@ -71,6 +76,7 @@ impl ApplyCtx {
         log_span: tracing::Span,
         sensitive: Arc<SensitiveStore>,
         backup_root: PathBuf,
+        log_dir: PathBuf,
     ) -> Self {
         Self {
             deadline,
@@ -78,6 +84,7 @@ impl ApplyCtx {
             log_span,
             sensitive,
             backup_root,
+            log_dir,
         }
     }
 

@@ -21,6 +21,11 @@ tempfile = { workspace = true }
 minijinja = { workspace = true }
 libc = { workspace = true }
 chrono = { workspace = true }
+# fs4 — advisory file-lock через flock(2) для apt.package dpkg-lock probe
+# (`/var/lib/dpkg/lock-frontend`). Тот же crate уже использован в bosun-cli
+# для per-host bosun-lock; кросс-platform не нужно, но дублирование с std
+# было бы дороже сопровождать.
+fs4 = { workspace = true }
 
 [dev-dependencies]
 # CancellationToken нужен для конструирования PlanCtx/ApplyCtx в unit-тестах
