@@ -9,8 +9,10 @@
 
 pub mod cgroup;
 pub mod collector;
+pub mod cpu_count;
 pub mod hostname;
 pub mod init_system;
 pub mod is_pod;
+pub mod memory_mb;
 
 pub use collector::{Fact, FactCollectCtx, FactsCollector, FactsSnapshot, FactsView};
