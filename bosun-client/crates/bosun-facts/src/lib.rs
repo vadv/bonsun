@@ -12,6 +12,7 @@ pub mod collector;
 pub mod cpu_count;
 pub mod hostname;
 pub mod init_system;
+pub mod installed_packages;
 pub mod is_pod;
 pub mod memory_mb;
 
