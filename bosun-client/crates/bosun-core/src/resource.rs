@@ -1,9 +1,17 @@
 use std::sync::Arc;
 
+use serde::{Serialize, Serializer};
+
 /// Newtype для типа ресурса (например "apt.package", "file.content").
 /// Хранится как Arc<str> для дешёвого clone и поддержки runtime-регистрации.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ResourceKind(Arc<str>);
+
+impl Serialize for ResourceKind {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -55,6 +63,12 @@ impl std::fmt::Display for ResourceKind {
 /// Глобально уникальный идентификатор ресурса. Хранится как Arc<str>.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ResourceId(Arc<str>);
+
+impl Serialize for ResourceId {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0)
+    }
+}
 
 impl ResourceId {
     /// Сконструировать ResourceId из kind и identity-segment.

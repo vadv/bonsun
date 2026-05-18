@@ -4,8 +4,10 @@ pub mod bundle;
 pub mod call_args;
 pub mod diff;
 pub mod digest;
+pub mod evaluator;
 pub mod facts;
 pub mod inventory;
+pub mod orchestrator;
 pub mod primitive;
 pub mod registry;
 pub mod resource;
@@ -16,8 +18,13 @@ pub use bundle::{Bundle, BundleError, BundleMetadata};
 pub use call_args::{ArgValue, CallArgs, CallArgsError};
 pub use diff::{ChangeReport, Diff};
 pub use digest::sha256_hex;
+pub use evaluator::Evaluator;
 pub use facts::{FactCategory, FactValue, RefreshPolicy};
 pub use inventory::{InventoryError, InventorySource, JsonInventory};
+pub use orchestrator::{
+    ApplyOpts, ApplyReport, ApplySummary, Orchestrator, Outcome, PlanFailure, PlanReport,
+    PlanSummary, ResourceApplyOutcome, ResourcePlan,
+};
 pub use primitive::{ApplyCtx, FactsSource, PlanCtx, Primitive, PrimitiveError};
 pub use registry::{Registry, RegistryError};
 pub use resource::{Handle, Resource, ResourceId, ResourceKind, ResourceKindError};

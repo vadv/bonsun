@@ -13,7 +13,7 @@ pub enum RegistryError {
     Cycle { nodes: String },
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Registry {
     resources: Vec<Resource>,
     by_id: HashMap<ResourceId, usize>,
