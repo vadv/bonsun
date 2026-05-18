@@ -188,9 +188,9 @@ impl CallArgs {
 
 ```rust
 /// Newtype над строкой kind. Создаётся через два конструктора —
-/// const fn для built-ins из статики и try_new для динамической
-/// регистрации (в будущем, для PackageProvider trait). Хранит Arc<str>
-/// для дешёвого clone.
+/// `from_static` для built-ins (один alloc в Arc, не const fn) и
+/// `try_new` для динамической регистрации (в будущем, для PackageProvider
+/// trait). Хранит Arc<str> для дешёвого clone.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct ResourceKind(std::sync::Arc<str>);
 
