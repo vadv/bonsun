@@ -16,6 +16,7 @@ impl<T> SensitivePayload<T> {
         self.0
     }
 
+    #[allow(clippy::should_implement_trait)]
     pub fn as_ref(&self) -> &T {
         &self.0
     }
