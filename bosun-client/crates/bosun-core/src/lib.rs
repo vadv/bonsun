@@ -9,6 +9,7 @@ pub mod primitive;
 pub mod registry;
 pub mod resource;
 pub mod sensitive;
+pub mod starlark_glue;
 
 pub use bundle::{Bundle, BundleError, BundleMetadata};
 pub use call_args::{ArgValue, CallArgs, CallArgsError};
@@ -19,3 +20,4 @@ pub use primitive::{ApplyCtx, FactsSource, PlanCtx, Primitive, PrimitiveError};
 pub use registry::{Registry, RegistryError};
 pub use resource::{Handle, Resource, ResourceId, ResourceKind, ResourceKindError};
 pub use sensitive::{SensitivePayload, SensitiveStore};
+pub use starlark_glue::{evaluate_manifest, StarlarkGlueError};
