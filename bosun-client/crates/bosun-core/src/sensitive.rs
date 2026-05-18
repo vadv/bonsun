@@ -89,6 +89,15 @@ mod tests {
     }
 
     #[test]
+    fn display_masks_value() {
+        let s: SensitivePayload<String> = SensitivePayload::new("super-secret-password".into());
+        let disp = format!("{}", s);
+        assert!(!disp.contains("super-secret-password"));
+        assert!(disp.contains("sensitive"));
+        assert!(disp.contains("21 bytes"));
+    }
+
+    #[test]
     fn store_put_take_round_trip() {
         let kind = ResourceKind::from_static("file.content");
         let id = ResourceId::new(&kind, "/etc/secret");

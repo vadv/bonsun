@@ -69,15 +69,15 @@ impl CallArgs {
     pub fn optional_u32(&self, name: &str) -> Result<Option<u32>, CallArgsError> {
         match self.inner.get(name) {
             Some(ArgValue::Int(i)) => {
-                if *i < 0 || *i > i64::from(u32::MAX) {
-                    Err(CallArgsError::OutOfRange {
-                        name: name.into(),
-                        value: *i,
-                        target: "u32",
-                    })
-                } else {
-                    Ok(Some(*i as u32))
-                }
+                // u32::try_from(i64) сам ловит и отрицательные значения, и
+                // выход за u32::MAX — заменяет ручной диапазон-чек и
+                // потенциально lossy `as u32`.
+                let value = u32::try_from(*i).map_err(|_| CallArgsError::OutOfRange {
+                    name: name.into(),
+                    value: *i,
+                    target: "u32",
+                })?;
+                Ok(Some(value))
             }
             Some(other) => Err(CallArgsError::WrongType {
                 name: name.into(),

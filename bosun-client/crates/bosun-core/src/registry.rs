@@ -111,16 +111,12 @@ mod tests {
     use super::*;
     use crate::resource::ResourceKind;
 
-    // Helper since from_static needs &'static str, but tests use dynamic strings.
-    impl ResourceKind {
-        fn from_static_to_owned(s: &str) -> Self {
-            // Test-only: проксируем через try_new (валидные kind'ы в тестах).
-            Self::try_new(s).unwrap()
-        }
+    fn kind(s: &str) -> ResourceKind {
+        ResourceKind::try_new(s).unwrap()
     }
 
-    fn res(kind: &str, name: &str, deps: Vec<ResourceId>) -> Resource {
-        let k = ResourceKind::from_static_to_owned(kind);
+    fn res(kind_str: &str, name: &str, deps: Vec<ResourceId>) -> Resource {
+        let k = kind(kind_str);
         let id = ResourceId::new(&k, name);
         Resource {
             id,
@@ -171,7 +167,7 @@ mod tests {
         let mut reg = Registry::new();
         // Сначала создаём оба, потом добавим связь — но связь хранится в depends_on.
         // Создадим вручную с обратными ссылками.
-        let ka = ResourceKind::from_static_to_owned("apt.package");
+        let ka = kind("apt.package");
         let id_a = ResourceId::new(&ka, "a");
         let id_b = ResourceId::new(&ka, "b");
         reg.add(Resource {
@@ -207,7 +203,7 @@ mod tests {
     #[test]
     fn unknown_handle_rejected() {
         let mut reg = Registry::new();
-        let ghost = ResourceId::new(&ResourceKind::try_new("apt.package").unwrap(), "ghost");
+        let ghost = ResourceId::new(&kind("apt.package"), "ghost");
         reg.add(res("file.content", "/a", vec![ghost])).unwrap();
         let err = reg.topological_order().unwrap_err();
         assert!(matches!(err, RegistryError::UnknownHandle(_)));

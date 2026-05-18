@@ -16,8 +16,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
+# tempfile нужен в Phase 6.1 для atomic-write (NamedTempFile + persist) в file.content::apply.
+# Tests внутри крейта получают его транзитивно через [dependencies], дубль в [dev-dependencies] не нужен.
 tempfile = { workspace = true }
 minijinja = { workspace = true }
-
-[dev-dependencies]
-tempfile = { workspace = true }
