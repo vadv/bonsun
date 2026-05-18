@@ -196,7 +196,8 @@ pub struct ResourceKind(std::sync::Arc<str>);
 
 impl ResourceKind {
     /// Для built-ins. Статика гарантирует формат на этапе компиляции.
-    pub const fn from_static(s: &'static str) -> Self;
+    /// Аллокация в Arc — не const, но дешёвая (один alloc на built-in).
+    pub fn from_static(s: &'static str) -> Self;
     /// Для runtime-регистрации. Валидация формата (kebab-case + точки).
     pub fn try_new(s: impl Into<String>) -> Result<Self, ResourceKindError>;
     pub fn as_str(&self) -> &str;
