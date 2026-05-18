@@ -40,5 +40,6 @@ tokio-util = "0.7"
 debversion = "0.4"
 starlark = "~0.13"
 minijinja = "2"
+toml = "0.8"
 fs4 = "0.13"
 chrono = { version = "0.4", features = ["clock"] }

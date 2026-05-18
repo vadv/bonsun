@@ -14,8 +14,17 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_norway = { workspace = true }
 thiserror = { workspace = true }
+anyhow = { workspace = true }
 semver = { workspace = true }
 tracing = { workspace = true }
 tokio-util = { workspace = true }
 chrono = { workspace = true }
 starlark = { workspace = true }
+toml = { workspace = true }
+minijinja = { workspace = true }
+allocative = "0.3"
+dupe = "0.9"
+starlark_derive = "~0.13"
+
+[dev-dependencies]
+tempfile = { workspace = true }
