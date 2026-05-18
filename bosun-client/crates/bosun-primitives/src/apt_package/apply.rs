@@ -45,9 +45,16 @@ pub fn run(
 
     let resource_deadline = compute_resource_deadline(ctx.deadline, spec.timeout_sec);
 
+    tracing::info!(
+        package = %spec.name,
+        version = ?spec.version,
+        "starting install",
+    );
     let install_result = install_attempt(runner, &spec, resource_deadline)?;
+    let outcome = analyze_install_result(&install_result);
+    tracing::debug!(outcome = ?outcome, exit = ?install_result.exit_code, "install attempt result");
 
-    match analyze_install_result(&install_result) {
+    match outcome {
         InstallOutcome::Success => {
             // stderr может содержать предупреждения даже при exit 0 — пишем
             // в файл для трассировки. Это best-effort: ошибка записи в
@@ -58,17 +65,32 @@ pub fn run(
             Ok(ChangeReport::changed(install_success_message(&spec)))
         }
         InstallOutcome::DpkgInterrupted => {
+            tracing::warn!(
+                package = %spec.name,
+                "dpkg interrupted, running dpkg --configure -a",
+            );
             recover_dpkg_then_retry(runner, &spec, resource_deadline, ctx, &install_result)
         }
         InstallOutcome::CandidateMissing => {
+            tracing::warn!(
+                package = %spec.name,
+                "candidate missing, running apt-get update",
+            );
             recover_apt_update_then_retry(runner, &spec, resource_deadline, ctx, &install_result)
         }
         InstallOutcome::OtherFailure => {
+            let excerpt = stderr_excerpt(&install_result.stderr);
+            tracing::error!(
+                package = %spec.name,
+                exit = ?install_result.exit_code,
+                stderr_excerpt = %excerpt,
+                "install failed",
+            );
             let _ = write_log(&ctx.log_dir, "install", &install_result.stderr);
             Err(PrimitiveError::Exec {
                 reason: format!("apt-get install {} failed", &spec.name),
                 exit: install_result.exit_code,
-                stderr_excerpt: stderr_excerpt(&install_result.stderr),
+                stderr_excerpt: excerpt,
             })
         }
     }
@@ -621,5 +643,30 @@ mod tests {
         // spec=600s но ctx=5s → вернёт ctx.
         let d = compute_resource_deadline(ctx_dl, 600);
         assert_eq!(d, ctx_dl);
+    }
+
+    #[test]
+    fn apply_emits_starting_install_event() {
+        use bosun_core::tracing_test_util::{install_global_router, record_events};
+
+        install_global_router();
+        let runner = MockRunner::new(vec![cmdres(Some(0), "")]);
+        let r = resource("nginx", Some("1.18.0"));
+        let tmp = tempfile::tempdir().unwrap();
+        let (_d, lock_path) = free_lock_path();
+        let ctx = make_ctx(tmp.path().to_path_buf());
+        let diff = Diff::Add {
+            description: "install".into(),
+            payload: r.payload.clone(),
+        };
+
+        let events = record_events(|| {
+            run(&runner, &lock_path, &r, &diff, &ctx).unwrap();
+        });
+
+        assert!(
+            events.iter().any(|e| e.contains("starting install")),
+            "expected 'starting install' event; got: {events:?}",
+        );
     }
 }

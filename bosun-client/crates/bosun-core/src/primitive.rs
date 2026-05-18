@@ -123,6 +123,21 @@ pub enum PrimitiveError {
     Panic { context: String, message: String },
 }
 
+impl PrimitiveError {
+    /// Returns true для ошибок, которые означают «попробуй на следующем
+    /// цикле, это не настоящий провал». Пример — `DpkgLocked`: пока
+    /// `unattended-upgrades` или другой apt-инструмент держит lock-frontend,
+    /// ресурс apt.package не может ничего сделать. Это транзиентное
+    /// состояние, метрика `bosun_resources_total{outcome="failed"}` не должна
+    /// флапать каждые 30 секунд при таком сценарии.
+    pub fn is_deferrable(&self) -> bool {
+        matches!(
+            self,
+            PrimitiveError::DpkgLocked { .. } | PrimitiveError::Cancelled
+        )
+    }
+}
+
 /// Trait для FactsSource — read-only доступ к фактам.
 /// Объявляется здесь, реализуется в bosun-facts.
 /// Send/Sync не требуется: apply однопоточный, см. модульный комментарий.
@@ -182,5 +197,32 @@ mod tests {
             cancel: CancellationToken::new(),
         };
         assert!(ctx.cancelled_or_past_deadline());
+    }
+
+    #[test]
+    fn is_deferrable_for_dpkg_locked_and_cancelled() {
+        assert!(PrimitiveError::DpkgLocked { holder_pid: None }.is_deferrable());
+        assert!(PrimitiveError::DpkgLocked {
+            holder_pid: Some(42)
+        }
+        .is_deferrable());
+        assert!(PrimitiveError::Cancelled.is_deferrable());
+    }
+
+    #[test]
+    fn is_deferrable_false_for_real_failures() {
+        assert!(!PrimitiveError::InvalidPayload("boom".into()).is_deferrable());
+        assert!(!PrimitiveError::InvalidTarget.is_deferrable());
+        assert!(!PrimitiveError::Exec {
+            reason: "x".into(),
+            exit: Some(1),
+            stderr_excerpt: String::new(),
+        }
+        .is_deferrable());
+        assert!(!PrimitiveError::ChownNotPermitted {
+            requested: "uid=0".into(),
+            actual: "uid=1000".into(),
+        }
+        .is_deferrable());
     }
 }

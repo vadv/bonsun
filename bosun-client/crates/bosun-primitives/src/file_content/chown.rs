@@ -105,14 +105,20 @@ pub fn chown_if_needed(
     let actual_gid = meta.gid();
 
     if actual_uid == want_uid && actual_gid == want_gid {
+        tracing::debug!(path = %path.display(), "chown unchanged, skipping");
         return Ok(());
     }
 
     if !is_root {
-        return Err(PrimitiveError::ChownNotPermitted {
-            requested: format!("uid={want_uid} gid={want_gid}"),
-            actual: format!("uid={actual_uid} gid={actual_gid}"),
-        });
+        let requested = format!("uid={want_uid} gid={want_gid}");
+        let actual = format!("uid={actual_uid} gid={actual_gid}");
+        tracing::warn!(
+            path = %path.display(),
+            requested = %requested,
+            actual = %actual,
+            "chown not permitted",
+        );
+        return Err(PrimitiveError::ChownNotPermitted { requested, actual });
     }
 
     let cpath = CString::new(path.as_os_str().as_encoded_bytes()).map_err(|e: NulError| {

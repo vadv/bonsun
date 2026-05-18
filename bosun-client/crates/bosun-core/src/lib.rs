@@ -13,6 +13,12 @@ pub mod registry;
 pub mod resource;
 pub mod sensitive;
 pub mod starlark_glue;
+// Тестовая утилита для tracing-recording. Не должна попадать в
+// production-сборку, но крайне нужна в `#[cfg(test)]` соседних крейтов
+// — там примитивы прогоняют apply под per-thread recorder'ом. Поэтому
+// модуль виден всегда, но прямого API там нет — только тесты импортируют.
+#[doc(hidden)]
+pub mod tracing_test_util;
 
 pub use bundle::{Bundle, BundleError, BundleMetadata};
 pub use call_args::{ArgValue, CallArgs, CallArgsError};

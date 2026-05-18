@@ -74,6 +74,26 @@ pub fn run(args: &ApplyArgs) -> i32 {
                 "bosun: another bosun instance holds {}, skipping",
                 args.lock_path.display(),
             );
+            // Метрика пишется даже при flock=Held: иначе оператор не отличит
+            // «бинарь сейчас стоит и работает» от «бинарь умер давно». Серия
+            // bosun_last_attempt_timestamp_seconds обновляется в любом
+            // запуске, поэтому алерт на её staleness ловит реально завис-
+            // шие cron-таймеры.
+            let snapshot = MetricSnapshot {
+                version,
+                exit_code: exit_code::SUCCESS,
+                duration_sec: 0.0,
+                started_at_utc: 0,
+                attempted_at_utc: started_utc,
+                resources_changed: 0,
+                resources_unchanged: 0,
+                resources_failed: 0,
+                resources_deferred: 0,
+                fact_states: Vec::new(),
+            };
+            if let Err(e) = metric::write_atomic(&args.metric_file, &snapshot) {
+                eprintln!("bosun: failed to write skip metric file: {e}");
+            }
             return exit_code::SUCCESS;
         }
         Err(e) => {
@@ -173,7 +193,7 @@ pub fn run(args: &ApplyArgs) -> i32 {
     );
 
     let view = facts.view();
-    let (exit, changed, unchanged, failed) = if args.dry_run {
+    let (exit, changed, unchanged, failed, deferred) = if args.dry_run {
         match orchestrator.plan_only(&registry, &view, &plan_ctx) {
             Ok(report) => {
                 print_plan(&report, args.format);
@@ -189,6 +209,7 @@ pub fn run(args: &ApplyArgs) -> i32 {
                     changed_count,
                     report.summary.no_change,
                     report.errors.len(),
+                    0_usize,
                 )
             }
             Err(e) => {
@@ -205,6 +226,9 @@ pub fn run(args: &ApplyArgs) -> i32 {
         match orchestrator.apply(&registry, &view, &mark_dirty, &plan_ctx, &apply_ctx, opts) {
             Ok(report) => {
                 print_apply(&report, args.format);
+                // has_failures смотрит только на failed: Deferred сюда не
+                // попадает, exit-код остаётся SUCCESS при чисто транзиентных
+                // отказах.
                 let code = if report.has_failures() {
                     exit_code::APPLY_PARTIAL_FAILURE
                 } else {
@@ -215,6 +239,7 @@ pub fn run(args: &ApplyArgs) -> i32 {
                     report.summary.changed,
                     report.summary.no_change,
                     report.summary.failed,
+                    report.summary.deferred,
                 )
             }
             Err(e) => {
@@ -232,9 +257,11 @@ pub fn run(args: &ApplyArgs) -> i32 {
         exit_code: exit,
         duration_sec: duration,
         started_at_utc: started_utc,
+        attempted_at_utc: started_utc,
         resources_changed: changed,
         resources_unchanged: unchanged,
         resources_failed: failed,
+        resources_deferred: deferred,
         fact_states,
     };
     if let Err(e) = metric::write_atomic(&args.metric_file, &snapshot) {
@@ -417,6 +444,7 @@ fn print_apply(report: &ApplyReport, format: ReportFormat) {
                     Outcome::Changed => "+ ",
                     Outcome::Failed { .. } => "x ",
                     Outcome::Skipped => "- ",
+                    Outcome::Deferred { .. } => "~ ",
                     _ => "? ",
                 };
                 let label = match &r.outcome {
@@ -424,6 +452,7 @@ fn print_apply(report: &ApplyReport, format: ReportFormat) {
                     Outcome::Changed => r.message.clone(),
                     Outcome::Failed { error } => format!("failed: {error}"),
                     Outcome::Skipped => r.message.clone(),
+                    Outcome::Deferred { reason } => format!("deferred: {reason}"),
                     _ => r.message.clone(),
                 };
                 let _ = writeln!(out, "  {marker}{kind} {id}", kind = r.kind, id = r.id);
@@ -433,11 +462,12 @@ fn print_apply(report: &ApplyReport, format: ReportFormat) {
             }
             let _ = writeln!(
                 out,
-                "\nSummary: {changed} changed, {nc} no-change, {failed} failed, {skipped} skipped.",
+                "\nSummary: {changed} changed, {nc} no-change, {failed} failed, {skipped} skipped, {deferred} deferred.",
                 changed = report.summary.changed,
                 nc = report.summary.no_change,
                 failed = report.summary.failed,
                 skipped = report.summary.skipped,
+                deferred = report.summary.deferred,
             );
         }
     }

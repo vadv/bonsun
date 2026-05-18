@@ -16,21 +16,39 @@ pub struct FactStateEntry {
 }
 
 /// Все данные одного прогона, которые публикуются в Prometheus.
+///
+/// Разделение `attempted_at_utc` и `started_at_utc` нужно, чтобы оператор
+/// мог отличить «бинарь даже не запустился» от «запустился, но flock не
+/// взял»: `attempted_at_utc` пишется на каждую попытку, включая skipped
+/// по flock=Held; `started_at_utc` — только при попадании в полный flow.
+/// Алерт на staleness ставится на `attempted_at_utc`, иначе зависший
+/// держатель lock'а маскируется свежей нагрузкой.
 #[derive(Debug, Clone)]
 pub struct MetricSnapshot {
     pub version: String,
     pub exit_code: i32,
     pub duration_sec: f64,
     pub started_at_utc: i64,
+    pub attempted_at_utc: i64,
     pub resources_changed: usize,
     pub resources_unchanged: usize,
     pub resources_failed: usize,
+    pub resources_deferred: usize,
     pub fact_states: Vec<FactStateEntry>,
 }
 
 /// Сформировать содержимое .prom-файла. Чистая функция — её удобно тестировать.
 pub fn format(snapshot: &MetricSnapshot) -> String {
     let mut out = String::new();
+
+    out.push_str("# HELP bosun_last_attempt_timestamp_seconds UTC timestamp of last bosun invocation; alert on staleness here, not on bosun_last_run_timestamp_seconds\n");
+    out.push_str("# TYPE bosun_last_attempt_timestamp_seconds gauge\n");
+    out.push_str(&format!(
+        "bosun_last_attempt_timestamp_seconds{{version=\"{version}\"}} {ts}\n",
+        version = escape_label(&snapshot.version),
+        ts = snapshot.attempted_at_utc,
+    ));
+    out.push('\n');
 
     out.push_str("# HELP bosun_last_run_timestamp_seconds UTC timestamp of last completed run\n");
     out.push_str("# TYPE bosun_last_run_timestamp_seconds gauge\n");
@@ -70,6 +88,10 @@ pub fn format(snapshot: &MetricSnapshot) -> String {
     out.push_str(&format!(
         "bosun_resources_total{{outcome=\"failed\"}} {}\n",
         snapshot.resources_failed,
+    ));
+    out.push_str(&format!(
+        "bosun_resources_total{{outcome=\"deferred\"}} {}\n",
+        snapshot.resources_deferred,
     ));
     out.push('\n');
 
@@ -146,9 +168,11 @@ mod tests {
             exit_code: 0,
             duration_sec: 12.34,
             started_at_utc: 1_747_567_200,
+            attempted_at_utc: 1_747_567_210,
             resources_changed: 2,
             resources_unchanged: 47,
             resources_failed: 0,
+            resources_deferred: 0,
             fact_states: vec![
                 FactStateEntry {
                     name: "hostname".to_string(),
@@ -170,6 +194,7 @@ mod tests {
     fn format_contains_all_metric_families() {
         let s = format(&sample());
         for needle in [
+            "bosun_last_attempt_timestamp_seconds",
             "bosun_last_run_timestamp_seconds",
             "bosun_last_run_exit_code",
             "bosun_last_run_duration_seconds",
@@ -183,14 +208,23 @@ mod tests {
     #[test]
     fn format_emits_each_help_and_type_pair() {
         let s = format(&sample());
-        assert_eq!(s.matches("# HELP ").count(), 5);
-        assert_eq!(s.matches("# TYPE ").count(), 5);
+        assert_eq!(s.matches("# HELP ").count(), 6);
+        assert_eq!(s.matches("# TYPE ").count(), 6);
     }
 
     #[test]
     fn format_includes_version_label_and_timestamp() {
         let s = format(&sample());
         assert!(s.contains("bosun_last_run_timestamp_seconds{version=\"0.1.0\"} 1747567200"));
+    }
+
+    #[test]
+    fn format_emits_attempt_timestamp() {
+        let s = format(&sample());
+        assert!(
+            s.contains("bosun_last_attempt_timestamp_seconds{version=\"0.1.0\"} 1747567210"),
+            "expected attempt timestamp series; got:\n{s}"
+        );
     }
 
     #[test]
@@ -209,10 +243,13 @@ mod tests {
 
     #[test]
     fn format_emits_all_resource_outcomes() {
-        let s = format(&sample());
+        let mut sn = sample();
+        sn.resources_deferred = 3;
+        let s = format(&sn);
         assert!(s.contains("bosun_resources_total{outcome=\"changed\"} 2"));
         assert!(s.contains("bosun_resources_total{outcome=\"unchanged\"} 47"));
         assert!(s.contains("bosun_resources_total{outcome=\"failed\"} 0"));
+        assert!(s.contains("bosun_resources_total{outcome=\"deferred\"} 3"));
     }
 
     #[test]

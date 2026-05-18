@@ -115,6 +115,12 @@ pub fn run_apt_update_with_policy(
                     .copied()
                     .or_else(|| policy.backoffs.last().copied())
                     .unwrap_or(Duration::ZERO);
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    max = policy.max_attempts,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "apt-get update transient failure, retrying",
+                );
                 // Если global_deadline уже истёк — выходим заранее, без
                 // следующей попытки. Тонкость: при `backoff == ZERO`
                 // и валидном (будущем) deadline'е разница между двумя
@@ -446,5 +452,24 @@ mod tests {
         let b = now + Duration::from_secs(5);
         assert_eq!(min_deadline(a, b), b);
         assert_eq!(min_deadline(b, a), b);
+    }
+
+    #[test]
+    fn apt_update_emits_retry_event_on_transient_failure() {
+        use bosun_core::tracing_test_util::{install_global_router, record_events};
+
+        install_global_router();
+        // Первая попытка падает с retriable ошибкой → ждём backoff →
+        // вторая успешна. Между ними должен пройти retry-event.
+        let runner = MockRunner::new(vec![cmdres(Some(1), "timed out"), cmdres(Some(0), "")]);
+
+        let events = record_events(|| {
+            run_apt_update_with_policy(&runner, deadline(), &zero_backoff_policy(3)).unwrap();
+        });
+
+        assert!(
+            events.iter().any(|e| e.contains("transient failure")),
+            "expected retry event; got: {events:?}",
+        );
     }
 }

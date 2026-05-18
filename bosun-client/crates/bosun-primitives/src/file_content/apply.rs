@@ -88,7 +88,12 @@ pub fn apply(
 
     // Backup при Update — до записи. При Add бэкапить нечего.
     if is_update {
-        backup_with_rotation(target, &ctx.backup_root, KEEP_BACKUPS)?;
+        let backup_path = backup_with_rotation(target, &ctx.backup_root, KEEP_BACKUPS)?;
+        tracing::debug!(
+            path = %target.display(),
+            backup = %backup_path.display(),
+            "backup created",
+        );
     }
 
     // Diff используется только для лог-сообщения — на этом шаге мы уже
@@ -96,6 +101,7 @@ pub fn apply(
     // в сигнатуре, потому что Primitive::apply требует это.
     let _ = diff;
 
+    tracing::info!(path = %target.display(), "writing file");
     write_atomic(target, contents.as_bytes(), &spec)?;
 
     Ok(ChangeReport::changed(format!(
@@ -427,6 +433,32 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, PrimitiveError::ChownNotPermitted { .. }));
+    }
+
+    #[test]
+    fn apply_emits_writing_file_event() {
+        use bosun_core::tracing_test_util::{install_global_router, record_events};
+
+        install_global_router();
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("conf");
+        let (resource, _sha) = make_resource(target.to_str().unwrap(), "x", 0o644);
+        let store = Arc::new(SensitiveStore::new());
+        store.put(resource.id.clone(), SensitivePayload::new("x".into()));
+        let ctx = ctx_with_store_and_backup(Arc::clone(&store), tmp.path().join("backup"));
+        let diff = Diff::Add {
+            description: "x".into(),
+            payload: resource.payload.clone(),
+        };
+
+        let events = record_events(|| {
+            apply(&resource, &diff, &ctx).unwrap();
+        });
+
+        assert!(
+            events.iter().any(|e| e.contains("writing file")),
+            "expected 'writing file' event; got: {events:?}",
+        );
     }
 
     #[test]

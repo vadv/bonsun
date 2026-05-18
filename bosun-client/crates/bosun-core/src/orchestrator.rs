@@ -101,6 +101,13 @@ pub enum Outcome {
     /// Ресурс пропущен, потому что предыдущий apply упал и
     /// `continue_on_error == false`.
     Skipped,
+    /// Транзиентный отказ: ресурс не применили, потому что внешний фактор
+    /// (например, дpkg-lock держит unattended-upgrades) сейчас блокирует
+    /// операцию. Следующий цикл попробует снова. В отличие от `Failed`,
+    /// это не настоящий провал и не валит exit-код и не флапает метрику.
+    Deferred {
+        reason: String,
+    },
 }
 
 /// Результат apply одного ресурса.
@@ -121,6 +128,7 @@ pub struct ApplySummary {
     pub no_change: usize,
     pub failed: usize,
     pub skipped: usize,
+    pub deferred: usize,
 }
 
 /// Отчёт о apply прогоне.
@@ -158,7 +166,10 @@ impl Orchestrator {
         plan_ctx: &PlanCtx,
     ) -> Result<PlanReport, RegistryError> {
         let order = registry.topological_order()?;
-        let mut resources = Vec::with_capacity(order.len());
+        let total = order.len();
+        tracing::info!(phase = "plan_only", resources = total, "starting plan",);
+
+        let mut resources = Vec::with_capacity(total);
         let mut summary = PlanSummary::default();
         let mut errors = Vec::new();
 
@@ -184,8 +195,12 @@ impl Orchestrator {
                 continue;
             };
 
+            let resource_span = tracing::info_span!("resource", id = %resource.id, kind = %kind);
+            let _enter = resource_span.enter();
+
             match primitive.plan(resource, facts, plan_ctx) {
                 Ok(diff) => {
+                    tracing::debug!(diff = ?diff, "plan computed");
                     match &diff {
                         Diff::NoChange => summary.no_change += 1,
                         Diff::Add { .. } => summary.add += 1,
@@ -199,6 +214,7 @@ impl Orchestrator {
                     });
                 }
                 Err(e) => {
+                    tracing::warn!(error = %e, "plan failed");
                     errors.push(PlanFailure {
                         id,
                         kind,
@@ -207,6 +223,14 @@ impl Orchestrator {
                 }
             }
         }
+
+        tracing::info!(
+            add = summary.add,
+            update = summary.update,
+            no_change = summary.no_change,
+            errors = errors.len(),
+            "plan complete",
+        );
 
         Ok(PlanReport {
             resources,
@@ -231,7 +255,10 @@ impl Orchestrator {
         opts: ApplyOpts,
     ) -> Result<ApplyReport, RegistryError> {
         let order = registry.topological_order()?;
-        let mut resources = Vec::with_capacity(order.len());
+        let total = order.len();
+        tracing::info!(phase = "apply", resources = total, "starting apply",);
+
+        let mut resources = Vec::with_capacity(total);
         let mut summary = ApplySummary::default();
         let mut aborted = false;
 
@@ -289,11 +316,18 @@ impl Orchestrator {
                 continue;
             };
 
+            let resource_span = tracing::info_span!("resource", id = %resource.id, kind = %kind);
+            let _enter = resource_span.enter();
+
             // Step 1: plan.
             let diff = match primitive.plan(resource, facts, plan_ctx) {
-                Ok(d) => d,
+                Ok(d) => {
+                    tracing::debug!(diff = ?d, "plan computed");
+                    d
+                }
                 Err(e) => {
                     let message = format!("plan failed: {e}");
+                    tracing::warn!(error = %e, "plan failed");
                     resources.push(ResourceApplyOutcome {
                         id: id.clone(),
                         kind: kind.clone(),
@@ -312,6 +346,7 @@ impl Orchestrator {
 
             // Step 2: NoChange → выход без apply.
             if matches!(diff, Diff::NoChange) {
+                tracing::debug!("no change");
                 resources.push(ResourceApplyOutcome {
                     id,
                     kind,
@@ -331,6 +366,9 @@ impl Orchestrator {
             match primitive.apply(resource, &diff, apply_ctx) {
                 Ok(report) => {
                     if report.changed {
+                        // `summary` поле, а не `message`: вместе с format-msg
+                        // "applied with change" даёт явное сообщение события.
+                        tracing::info!(summary = %report.message, "applied with change");
                         resources.push(ResourceApplyOutcome {
                             id,
                             kind,
@@ -343,6 +381,7 @@ impl Orchestrator {
                         // Такое бывает: convergent apply увидел, что система
                         // уже в желаемом состоянии (race с другим оператором,
                         // например). Засчитываем как NoChange.
+                        tracing::debug!("no change");
                         resources.push(ResourceApplyOutcome {
                             id,
                             kind,
@@ -352,8 +391,25 @@ impl Orchestrator {
                         summary.no_change += 1;
                     }
                 }
+                Err(e) if e.is_deferrable() => {
+                    let reason = format!("{e}");
+                    tracing::info!(reason = %reason, "apply deferred");
+                    resources.push(ResourceApplyOutcome {
+                        id,
+                        kind,
+                        outcome: Outcome::Deferred {
+                            reason: reason.clone(),
+                        },
+                        message: reason,
+                    });
+                    summary.deferred += 1;
+                    // Deferred НЕ прерывает прогон даже при
+                    // continue_on_error=false: транзиентный отказ — не
+                    // настоящий провал, следующие ресурсы пытаются apply.
+                }
                 Err(e) => {
                     let (message, error_text) = describe_primitive_error(&e);
+                    tracing::warn!(error = %e, "apply failed");
                     resources.push(ResourceApplyOutcome {
                         id,
                         kind,
@@ -367,6 +423,15 @@ impl Orchestrator {
                 }
             }
         }
+
+        tracing::info!(
+            changed = summary.changed,
+            no_change = summary.no_change,
+            failed = summary.failed,
+            skipped = summary.skipped,
+            deferred = summary.deferred,
+            "apply complete",
+        );
 
         Ok(ApplyReport { resources, summary })
     }
@@ -988,6 +1053,264 @@ mod tests {
         assert_eq!(plan_ids[0], "plan:apt.package:a");
         assert_eq!(plan_ids[1], "plan:apt.package:b");
         assert_eq!(plan_ids[2], "plan:apt.package:c");
+    }
+
+    #[test]
+    fn apply_dpkg_locked_is_deferred_not_failed() {
+        // mock-примитив, который возвращает DpkgLocked. Ожидаем:
+        // outcome = Deferred, summary.deferred = 1, summary.failed = 0,
+        // прогон НЕ прерывается даже при continue_on_error=false.
+        let mut reg = Registry::new();
+        let a = reg.add(resource("apt.package", "nginx", vec![])).unwrap();
+        reg.add(resource("apt.package", "curl", vec![a])).unwrap();
+
+        struct LockedPrimitive {
+            kind: ResourceKind,
+            apply_calls: std::sync::Mutex<u32>,
+        }
+        impl Primitive for LockedPrimitive {
+            fn type_name(&self) -> ResourceKind {
+                self.kind.clone()
+            }
+            fn identity_keys(&self) -> &'static [&'static str] {
+                &["name"]
+            }
+            fn build_payload(
+                &self,
+                _: &CallArgs,
+                _: &PlanCtx,
+            ) -> Result<serde_json::Value, PrimitiveError> {
+                Ok(serde_json::json!({}))
+            }
+            fn plan(
+                &self,
+                _: &Resource,
+                _: &dyn FactsSource,
+                _: &PlanCtx,
+            ) -> Result<Diff, PrimitiveError> {
+                Ok(Diff::Add {
+                    description: "install".into(),
+                    payload: serde_json::json!({}),
+                })
+            }
+            fn apply(
+                &self,
+                _: &Resource,
+                _: &Diff,
+                _: &ApplyCtx,
+            ) -> Result<ChangeReport, PrimitiveError> {
+                *self.apply_calls.lock().unwrap() += 1;
+                Err(PrimitiveError::DpkgLocked {
+                    holder_pid: Some(123),
+                })
+            }
+        }
+
+        let primitive = LockedPrimitive {
+            kind: kind("apt.package"),
+            apply_calls: std::sync::Mutex::new(0),
+        };
+        let calls_handle = Arc::new(std::sync::Mutex::new(0));
+        // Передаём primitive напрямую в HashMap; владение перехватит Box.
+        // Счётчик не делим через Arc, чтобы остаться в простой схеме.
+        let _ = calls_handle;
+
+        let mut primitives: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
+        primitives.insert(kind("apt.package"), Box::new(primitive));
+
+        let orchestrator = Orchestrator::new(primitives);
+        let mark_dirty = |_: &ResourceKind| {};
+        let report = orchestrator
+            .apply(
+                &reg,
+                &NoFacts,
+                &mark_dirty,
+                &plan_ctx(),
+                &apply_ctx(),
+                ApplyOpts {
+                    continue_on_error: false,
+                },
+            )
+            .unwrap();
+
+        // Оба ресурса apply'нулись (не упёрлись в abort после первого).
+        assert_eq!(report.resources.len(), 2);
+        assert_eq!(report.summary.deferred, 2);
+        assert_eq!(report.summary.failed, 0);
+        assert_eq!(report.summary.skipped, 0);
+        assert!(!report.has_failures());
+        for r in &report.resources {
+            match &r.outcome {
+                Outcome::Deferred { reason } => {
+                    assert!(reason.contains("dpkg locked"));
+                }
+                other => panic!("expected Deferred, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn apply_deferred_does_not_block_subsequent_resources() {
+        // Resource A → DpkgLocked (Deferred). Resource B (depends on A) —
+        // тоже apply'ится, потому что Deferred не прерывает поток.
+        let mut reg = Registry::new();
+        let a = reg.add(resource("apt.package", "a", vec![])).unwrap();
+        reg.add(resource("apt.package", "b", vec![a])).unwrap();
+
+        let apply_call_log = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        struct DeferThenSucceedPrimitive {
+            kind: ResourceKind,
+            log: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+        impl Primitive for DeferThenSucceedPrimitive {
+            fn type_name(&self) -> ResourceKind {
+                self.kind.clone()
+            }
+            fn identity_keys(&self) -> &'static [&'static str] {
+                &["name"]
+            }
+            fn build_payload(
+                &self,
+                _: &CallArgs,
+                _: &PlanCtx,
+            ) -> Result<serde_json::Value, PrimitiveError> {
+                Ok(serde_json::json!({}))
+            }
+            fn plan(
+                &self,
+                _: &Resource,
+                _: &dyn FactsSource,
+                _: &PlanCtx,
+            ) -> Result<Diff, PrimitiveError> {
+                Ok(Diff::Add {
+                    description: "x".into(),
+                    payload: serde_json::json!({}),
+                })
+            }
+            fn apply(
+                &self,
+                resource: &Resource,
+                _: &Diff,
+                _: &ApplyCtx,
+            ) -> Result<ChangeReport, PrimitiveError> {
+                self.log
+                    .lock()
+                    .unwrap()
+                    .push(format!("apply:{}", resource.id));
+                Err(PrimitiveError::DpkgLocked { holder_pid: None })
+            }
+        }
+
+        let mut primitives: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
+        primitives.insert(
+            kind("apt.package"),
+            Box::new(DeferThenSucceedPrimitive {
+                kind: kind("apt.package"),
+                log: Arc::clone(&apply_call_log),
+            }),
+        );
+
+        let orchestrator = Orchestrator::new(primitives);
+        let mark_dirty = |_: &ResourceKind| {};
+        let report = orchestrator
+            .apply(
+                &reg,
+                &NoFacts,
+                &mark_dirty,
+                &plan_ctx(),
+                &apply_ctx(),
+                ApplyOpts::default(),
+            )
+            .unwrap();
+
+        // Оба ресурса дошли до apply.
+        let log = apply_call_log.lock().unwrap().clone();
+        assert_eq!(log.len(), 2);
+        assert_eq!(report.summary.deferred, 2);
+        assert_eq!(report.summary.failed, 0);
+    }
+
+    use crate::tracing_test_util::{install_global_router, record_events};
+
+    #[test]
+    fn plan_only_emits_start_and_complete_events() {
+        install_global_router();
+        let mut reg = Registry::new();
+        reg.add(resource("apt.package", "nginx", vec![])).unwrap();
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut primitives: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
+        primitives.insert(
+            kind("apt.package"),
+            Box::new(RecordingPrimitive::new(
+                kind("apt.package"),
+                Arc::clone(&log),
+                vec![PlanResult::Add("install nginx")],
+                vec![],
+            )),
+        );
+
+        let orchestrator = Orchestrator::new(primitives);
+        let events = record_events(|| {
+            orchestrator.plan_only(&reg, &NoFacts, &plan_ctx()).unwrap();
+        });
+
+        assert!(
+            events.iter().any(|e| e.contains("starting plan")),
+            "expected 'starting plan' event; got: {events:?}",
+        );
+        assert!(
+            events.iter().any(|e| e.contains("plan complete")),
+            "expected 'plan complete' event; got: {events:?}",
+        );
+    }
+
+    #[test]
+    fn apply_emits_apply_complete_event() {
+        install_global_router();
+        let mut reg = Registry::new();
+        reg.add(resource("apt.package", "nginx", vec![])).unwrap();
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut primitives: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
+        primitives.insert(
+            kind("apt.package"),
+            Box::new(RecordingPrimitive::new(
+                kind("apt.package"),
+                Arc::clone(&log),
+                vec![PlanResult::Add("install nginx")],
+                vec![ApplyResult::Ok("installed nginx")],
+            )),
+        );
+
+        let orchestrator = Orchestrator::new(primitives);
+        let mark_dirty = |_: &ResourceKind| {};
+        let events = record_events(|| {
+            orchestrator
+                .apply(
+                    &reg,
+                    &NoFacts,
+                    &mark_dirty,
+                    &plan_ctx(),
+                    &apply_ctx(),
+                    ApplyOpts::default(),
+                )
+                .unwrap();
+        });
+
+        assert!(
+            events.iter().any(|e| e.contains("starting apply")),
+            "expected 'starting apply' event; got: {events:?}",
+        );
+        assert!(
+            events.iter().any(|e| e.contains("apply complete")),
+            "expected 'apply complete' event; got: {events:?}",
+        );
+        // Plus per-resource event when applied.
+        assert!(
+            events.iter().any(|e| e.contains("applied with change")),
+            "expected per-resource 'applied with change' event; got: {events:?}",
+        );
     }
 
     #[test]

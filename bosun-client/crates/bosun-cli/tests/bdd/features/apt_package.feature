@@ -40,7 +40,10 @@ Feature: apt.package primitive
     Then exit code is 0
     And stdout contains "no-change"
 
-  Scenario: Held dpkg lock blocks apply with exit 1
+  Scenario: Held dpkg lock defers apt.package without failing the run
+    # dpkg-lock — транзиентное состояние (unattended-upgrades, ручной apt и
+    # т.п.). bosun не должен валить exit-код и флапать метрику failed —
+    # ресурс уходит в Deferred, следующий цикл попробует снова.
     Given a fresh container
     When I run "( flock -x 9 ; sleep 60 ) 9>/var/lib/dpkg/lock-frontend & sleep 1" inside the container
     Then exit code is 0
@@ -49,7 +52,8 @@ Feature: apt.package primitive
       apt.package(name = "curl")
       """
     When I apply the bundle
-    Then exit code is 1
+    Then exit code is 0
+    And stdout contains "deferred"
 
   @todo-skip @dpkg-interrupted
   Scenario: Half-configured dpkg state triggers `dpkg --configure -a` recovery

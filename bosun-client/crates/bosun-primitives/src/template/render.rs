@@ -52,18 +52,23 @@ pub fn render_template(
     inv: &serde_json::Value,
     facts: &serde_json::Value,
 ) -> Result<String, TemplateError> {
+    tracing::debug!(template = %relative_path, "rendering template");
     let absolute_path = resolve_path(templates_root, relative_path)?;
 
     let source = match std::fs::read_to_string(&absolute_path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(TemplateError::FileNotFound(relative_path.to_string()));
+            let err = TemplateError::FileNotFound(relative_path.to_string());
+            tracing::warn!(template = %relative_path, error = %err, "render failed");
+            return Err(err);
         }
         Err(e) => {
-            return Err(TemplateError::Io {
+            let err = TemplateError::Io {
                 path: absolute_path.to_string_lossy().into_owned(),
                 source: e,
-            });
+            };
+            tracing::warn!(template = %relative_path, error = %err, "render failed");
+            return Err(err);
         }
     };
 
@@ -73,7 +78,11 @@ pub fn render_template(
     let template_name = relative_path.to_string();
     let template = env
         .template_from_named_str(&template_name, &source)
-        .map_err(|e| classify_error(&template_name, e))?;
+        .map_err(|e| classify_error(&template_name, e))
+        .map_err(|err| {
+            tracing::warn!(template = %relative_path, error = %err, "render failed");
+            err
+        })?;
 
     // Контекст рендера: `inv` с инжектированным `facts`. Если `inv` сам по себе
     // не объект — оставляем как есть (например, root-level null допустимо
@@ -83,6 +92,10 @@ pub fn render_template(
     template
         .render(context)
         .map_err(|e| classify_error(&template_name, e))
+        .map_err(|err| {
+            tracing::warn!(template = %relative_path, error = %err, "render failed");
+            err
+        })
 }
 
 /// Резолв пути: defense-in-depth от `../` в relative_path.
@@ -319,5 +332,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, "a;b;c;");
+    }
+
+    #[test]
+    fn render_emits_rendering_template_event() {
+        use bosun_core::tracing_test_util::{install_global_router, record_events};
+
+        install_global_router();
+        let tmp = tempfile::tempdir().unwrap();
+        write_template(tmp.path(), "x.j2", "ok");
+
+        let events = record_events(|| {
+            let _ = render_template(
+                tmp.path(),
+                "x.j2",
+                &serde_json::json!({}),
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        });
+
+        assert!(
+            events.iter().any(|e| e.contains("rendering template")),
+            "expected 'rendering template' event; got: {events:?}",
+        );
     }
 }
