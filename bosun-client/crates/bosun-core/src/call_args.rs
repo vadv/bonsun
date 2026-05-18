@@ -42,6 +42,19 @@ impl CallArgs {
         Self { inner: args }
     }
 
+    /// Извлечь значение по имени, удалив его из CallArgs. Используется
+    /// Starlark-glue для side-channel'ов: например, `file.content.contents`
+    /// перехватывается из args до того, как они попадут в `build_payload`.
+    pub fn take_raw(&mut self, name: &str) -> Option<ArgValue> {
+        self.inner.remove(name)
+    }
+
+    /// Положить значение по имени. Используется Starlark-glue для замены
+    /// `contents` на `content_sha256`+`content_size` перед `build_payload`.
+    pub fn put_raw(&mut self, name: &str, value: ArgValue) {
+        self.inner.insert(name.to_string(), value);
+    }
+
     pub fn required_str(&self, name: &str) -> Result<String, CallArgsError> {
         match self.inner.get(name) {
             Some(ArgValue::Str(s)) => Ok(s.clone()),
@@ -76,6 +89,28 @@ impl CallArgs {
                     name: name.into(),
                     value: *i,
                     target: "u32",
+                })?;
+                Ok(Some(value))
+            }
+            Some(other) => Err(CallArgsError::WrongType {
+                name: name.into(),
+                expected: "int",
+                actual: type_name(other),
+            }),
+            None => Ok(None),
+        }
+    }
+
+    /// Аналог `optional_u32`, но допускает значения до `i64::MAX` — нужен,
+    /// например, для `file.content.content_size`, где спека требует u64.
+    /// Отрицательные значения возвращают `OutOfRange`.
+    pub fn optional_u64(&self, name: &str) -> Result<Option<u64>, CallArgsError> {
+        match self.inner.get(name) {
+            Some(ArgValue::Int(i)) => {
+                let value = u64::try_from(*i).map_err(|_| CallArgsError::OutOfRange {
+                    name: name.into(),
+                    value: *i,
+                    target: "u64",
                 })?;
                 Ok(Some(value))
             }
@@ -167,5 +202,51 @@ mod tests {
     fn optional_handle_list_default_empty() {
         let args = make(&[]);
         assert!(args.optional_handle_list("reload_on").unwrap().is_empty());
+    }
+
+    #[test]
+    fn optional_u64_accepts_value_above_u32_max() {
+        // 5 GB не помещается в u32, должно работать в u64.
+        let value: i64 = (u32::MAX as i64) + 1;
+        let args = make(&[("size", ArgValue::Int(value))]);
+        assert_eq!(args.optional_u64("size").unwrap(), Some(value as u64));
+    }
+
+    #[test]
+    fn optional_u64_rejects_negative() {
+        let args = make(&[("size", ArgValue::Int(-1))]);
+        let err = args.optional_u64("size").unwrap_err();
+        assert!(matches!(err, CallArgsError::OutOfRange { .. }));
+    }
+
+    #[test]
+    fn optional_u64_absent_returns_none() {
+        let args = make(&[]);
+        assert!(args.optional_u64("size").unwrap().is_none());
+    }
+
+    #[test]
+    fn take_raw_removes_value() {
+        let mut args = make(&[("k", ArgValue::Str("v".into()))]);
+        let taken = args.take_raw("k");
+        assert!(matches!(taken, Some(ArgValue::Str(s)) if s == "v"));
+        // Второй take даёт None.
+        assert!(args.take_raw("k").is_none());
+    }
+
+    #[test]
+    fn put_raw_inserts_value() {
+        let mut args = make(&[]);
+        args.put_raw("k", ArgValue::Int(42));
+        let taken = args.take_raw("k");
+        assert!(matches!(taken, Some(ArgValue::Int(42))));
+    }
+
+    #[test]
+    fn put_raw_overwrites_existing() {
+        let mut args = make(&[("k", ArgValue::Str("old".into()))]);
+        args.put_raw("k", ArgValue::Str("new".into()));
+        let taken = args.take_raw("k");
+        assert!(matches!(taken, Some(ArgValue::Str(s)) if s == "new"));
     }
 }

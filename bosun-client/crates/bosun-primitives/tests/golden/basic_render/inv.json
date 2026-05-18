@@ -1,0 +1,5 @@
+{
+  "name": "nginx",
+  "port": 8080,
+  "debug": false
+}

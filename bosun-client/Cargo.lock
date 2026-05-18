@@ -225,11 +225,11 @@ dependencies = [
  "anyhow",
  "chrono",
  "dupe",
- "minijinja",
  "semver",
  "serde",
  "serde_json",
  "serde_norway",
+ "sha2",
  "starlark",
  "starlark_derive",
  "tempfile",
@@ -259,12 +259,14 @@ name = "bosun-primitives"
 version = "0.1.0"
 dependencies = [
  "bosun-core",
+ "chrono",
+ "libc",
  "minijinja",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "thiserror",
+ "tokio-util",
  "tracing",
 ]
 

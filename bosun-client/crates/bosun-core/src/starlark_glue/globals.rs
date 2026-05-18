@@ -19,7 +19,9 @@ use starlark::values::{FreezeResult, Value, ValueLike};
 use starlark_derive::starlark_module;
 
 use crate::call_args::{ArgValue, CallArgs};
+use crate::digest::sha256_hex;
 use crate::resource::{Resource, ResourceId, ResourceKind};
+use crate::sensitive::SensitivePayload;
 use crate::starlark_glue::inv_object::InvObject;
 use crate::starlark_glue::{with_state, StarlarkGlueError};
 
@@ -58,13 +60,20 @@ fn file_namespace(builder: &mut GlobalsBuilder) {
 
 #[starlark_module]
 fn template_fn(builder: &mut GlobalsBuilder) {
-    /// `template(path)` — заглушка в Phase 5. Возвращает sentinel-строку.
-    /// Phase 6.1 заменит на реальный рендер minijinja с inv+facts.
+    /// `template(path)` рендерит шаблон `<bundle>/templates/<path>` через
+    /// инжектируемый closure из `EvalState`. CLI собирает closure с
+    /// забэканным templates_root, inv-копией и materialized-фактами.
     fn template<'v>(
         #[starlark(require = pos)] path: &str,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
-        Ok(eval.heap().alloc(format!("<template stub: {path}>")))
+        let rendered: Result<String, anyhow::Error> = with_state(|state| (state.template_fn)(path))
+            .ok_or_else(|| {
+                anyhow::anyhow!("internal: no eval state in thread-local during template()")
+            })?;
+        let rendered = rendered
+            .map_err(|e| starlark::Error::new_other(anyhow::anyhow!("template('{path}'): {e}")))?;
+        Ok(eval.heap().alloc(rendered))
     }
 }
 
@@ -169,7 +178,7 @@ fn register_primitive_call<'v>(
 ) -> starlark::Result<Value<'v>> {
     // Все обращения к state сгруппированы внутри `with_state` —
     // вне него thread-local не trapped.
-    let call_args = kwargs_to_call_args(kwargs, eval)?;
+    let mut call_args = kwargs_to_call_args(kwargs, eval)?;
 
     let kind = match kind_str {
         "apt.package" => ResourceKind::from_static("apt.package"),
@@ -177,6 +186,20 @@ fn register_primitive_call<'v>(
         other => ResourceKind::try_new(other).map_err(|e| {
             starlark::Error::new_other(anyhow::anyhow!("invalid resource kind '{other}': {e}"))
         })?,
+    };
+
+    // Side-channel для file.content.contents — секреты не лежат в Resource.payload.
+    // Извлекаем contents из args, считаем sha256+size, заменяем contents на
+    // content_sha256+content_size, сам тело кладём в SensitiveStore.
+    let pending_sensitive = if kind_str == "file.content" {
+        Some(
+            extract_sensitive_contents(&mut call_args).map_err(|reason| {
+                with_state(|state| record_invalid_call_in(state, kind_str, &reason))
+                    .unwrap_or_else(|| starlark::Error::new_other(anyhow::anyhow!("{reason}")))
+            })?,
+        )
+    } else {
+        None
     };
 
     let (identity, payload, reload_on, depends_on) =
@@ -209,6 +232,25 @@ fn register_primitive_call<'v>(
         })??;
 
     let id = ResourceId::new(&kind, &identity);
+
+    // Положить sensitive contents в store ровно один раз, когда у нас уже
+    // вычислен ResourceId. Если registry.add ниже упадёт (дубликат), запись
+    // в store останется — это не утечка, потому что store очищается вместе
+    // с EvalState. Чисто в плане «не положили лишнего» — alternative было
+    // бы откатывать put на ошибке, что усложняет инвариант.
+    if let Some(contents) = pending_sensitive {
+        with_state(|state| {
+            state
+                .sensitive
+                .put(id.clone(), SensitivePayload::new(contents));
+        })
+        .ok_or_else(|| {
+            starlark::Error::new_other(anyhow::anyhow!(
+                "internal: no eval state during sensitive.put"
+            ))
+        })?;
+    }
+
     let resource = Resource {
         id: id.clone(),
         kind: kind.clone(),
@@ -232,6 +274,41 @@ fn register_primitive_call<'v>(
     })??;
 
     Ok(eval.heap().alloc(HandleObject { id }))
+}
+
+/// Извлекает `contents: str` из `CallArgs`, заменяя на `content_sha256` и
+/// `content_size`. Возвращает оригинальное тело, чтобы caller положил его в
+/// SensitiveStore.
+fn extract_sensitive_contents(args: &mut CallArgs) -> Result<String, String> {
+    let contents = match args.take_raw("contents") {
+        Some(ArgValue::Str(s)) => s,
+        Some(other) => {
+            return Err(format!(
+                "file.content: 'contents' must be str, got {}",
+                describe_arg(&other),
+            ));
+        }
+        None => {
+            return Err("file.content: missing required argument 'contents'".to_string());
+        }
+    };
+    let sha = sha256_hex(contents.as_bytes());
+    let size = i64::try_from(contents.len())
+        .map_err(|_| "file.content: contents too large for i64 size".to_string())?;
+    args.put_raw("content_sha256", ArgValue::Str(sha));
+    // CallArgs::optional_u64 принимает Int и проверяет range — поэтому кладём как Int.
+    args.put_raw("content_size", ArgValue::Int(size));
+    Ok(contents)
+}
+
+fn describe_arg(v: &ArgValue) -> &'static str {
+    match v {
+        ArgValue::Str(_) => "str",
+        ArgValue::Int(_) => "int",
+        ArgValue::Bool(_) => "bool",
+        ArgValue::HandleList(_) => "list[Handle]",
+        ArgValue::Other(_) => "other",
+    }
 }
 
 fn record_invalid_call_in(
@@ -323,5 +400,54 @@ mod tests {
     #[test]
     fn build_globals_compiles() {
         let _g = build_globals();
+    }
+
+    #[test]
+    fn extract_sensitive_contents_pulls_str_and_injects_sha_size() {
+        let mut map = HashMap::new();
+        map.insert("path".to_string(), ArgValue::Str("/etc/x".into()));
+        map.insert("contents".to_string(), ArgValue::Str("hello".into()));
+        let mut args = CallArgs::new(map);
+        let body = extract_sensitive_contents(&mut args).unwrap();
+        assert_eq!(body, "hello");
+        // contents удалён, sha и size добавлены.
+        assert!(args.take_raw("contents").is_none());
+        assert_eq!(
+            args.required_str("content_sha256").unwrap(),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
+        );
+        assert_eq!(args.optional_u64("content_size").unwrap(), Some(5));
+    }
+
+    #[test]
+    fn extract_sensitive_contents_missing_is_error() {
+        let mut args = CallArgs::new(HashMap::new());
+        let err = extract_sensitive_contents(&mut args).unwrap_err();
+        assert!(err.contains("missing"));
+        assert!(err.contains("contents"));
+    }
+
+    #[test]
+    fn extract_sensitive_contents_wrong_type_is_error() {
+        let mut map = HashMap::new();
+        map.insert("contents".to_string(), ArgValue::Int(42));
+        let mut args = CallArgs::new(map);
+        let err = extract_sensitive_contents(&mut args).unwrap_err();
+        assert!(err.contains("must be str"));
+    }
+
+    #[test]
+    fn extract_sensitive_contents_empty_string_ok() {
+        let mut map = HashMap::new();
+        map.insert("contents".to_string(), ArgValue::Str(String::new()));
+        let mut args = CallArgs::new(map);
+        let body = extract_sensitive_contents(&mut args).unwrap();
+        assert_eq!(body, "");
+        // Пустая строка → sha256 пустой строки, size = 0.
+        assert_eq!(
+            args.required_str("content_sha256").unwrap(),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        );
+        assert_eq!(args.optional_u64("content_size").unwrap(), Some(0));
     }
 }

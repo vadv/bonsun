@@ -1,0 +1,5 @@
+{
+  "hostname": "node-01",
+  "cpu_count": 4,
+  "memory_mb": 2048
+}

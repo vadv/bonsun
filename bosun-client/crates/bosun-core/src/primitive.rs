@@ -16,6 +16,7 @@
 //! параллельная плоскость apply (per-namespace pool) потребует, чтобы их
 //! можно было держать в Arc и звать из любого worker'а.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -43,15 +44,43 @@ pub struct ApplyCtx {
     pub cancel: CancellationToken,
     pub log_span: tracing::Span,
     pub sensitive: Arc<SensitiveStore>,
+    /// Корень дерева для бэкапов file.content. Бэкап-путь строится как
+    /// `{backup_root}{target}.{utc_ts}` — например `/etc/nginx/nginx.conf`
+    /// под `backup_root = /var/backups/bosun` даёт
+    /// `/var/backups/bosun/etc/nginx/nginx.conf.YYYYMMDDTHHMMSSZ`.
+    pub backup_root: PathBuf,
 }
 
 impl PlanCtx {
+    /// Конструктор для случаев, когда нужно создать PlanCtx из внешнего крейта.
+    /// Структура `#[non_exhaustive]`, поэтому struct-литерал снаружи запрещён.
+    pub fn new(deadline: Instant, cancel: CancellationToken) -> Self {
+        Self { deadline, cancel }
+    }
+
     pub fn cancelled_or_past_deadline(&self) -> bool {
         self.cancel.is_cancelled() || Instant::now() >= self.deadline
     }
 }
 
 impl ApplyCtx {
+    /// Конструктор для внешних крейтов; см. `PlanCtx::new`.
+    pub fn new(
+        deadline: Instant,
+        cancel: CancellationToken,
+        log_span: tracing::Span,
+        sensitive: Arc<SensitiveStore>,
+        backup_root: PathBuf,
+    ) -> Self {
+        Self {
+            deadline,
+            cancel,
+            log_span,
+            sensitive,
+            backup_root,
+        }
+    }
+
     pub fn cancelled_or_past_deadline(&self) -> bool {
         self.cancel.is_cancelled() || Instant::now() >= self.deadline
     }

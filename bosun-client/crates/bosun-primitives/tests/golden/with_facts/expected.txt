@@ -1,0 +1,4 @@
+hostname=node-01
+cpus=4
+mem_mb=2048
+service=demo-api

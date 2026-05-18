@@ -15,8 +15,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-sha2 = { workspace = true }
 # tempfile нужен в Phase 6.1 для atomic-write (NamedTempFile + persist) в file.content::apply.
 # Tests внутри крейта получают его транзитивно через [dependencies], дубль в [dev-dependencies] не нужен.
 tempfile = { workspace = true }
 minijinja = { workspace = true }
+libc = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+# CancellationToken нужен для конструирования PlanCtx/ApplyCtx в unit-тестах
+# file.content::apply. В production-коде это поле приходит из CLI через
+# `tokio::signal`, не из bosun-primitives.
+tokio-util = { workspace = true }

@@ -39,6 +39,18 @@ use crate::sensitive::SensitiveStore;
 pub use globals::{build_builtins_module, build_globals};
 pub use load_resolver::BundleLoader;
 
+/// Closure для рендера шаблона из Starlark-глобала `template(path)`.
+///
+/// Вынесена в инжектируемый closure, потому что реальный рендер
+/// (`render_template`) живёт в `bosun-primitives` — он зависит от
+/// `bosun-core`, и обратная зависимость замкнула бы цикл крейтов. CLI
+/// в Phase 8 строит этот closure через `bosun-primitives::render_template`
+/// с забэканным templates_root, inv-копией и materialized-фактами.
+///
+/// Тип `Rc<dyn Fn>`, потому что closure хранится в `Rc<EvalState>` и
+/// разделяется между вызовами native-функций — копия дешёвая.
+pub type TemplateFn = Rc<dyn Fn(&str) -> Result<String, anyhow::Error>>;
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum StarlarkGlueError {
@@ -62,15 +74,17 @@ pub enum StarlarkGlueError {
 pub(crate) struct EvalState {
     pub(crate) primitives: Rc<HashMap<ResourceKind, Box<dyn Primitive>>>,
     pub(crate) facts: Rc<dyn FactsSource>,
-    /// Хранилище секретов для file.content.contents (Phase 6.1). Phase 5
-    /// его не использует — глобал `template` пока возвращает stub. Поле
-    /// держится в state, чтобы API `evaluate_manifest` не пришлось менять
-    /// при добавлении реальных примитивов.
-    #[allow(dead_code)]
+    /// Хранилище секретов для file.content.contents. Native-функция
+    /// `file.content(...)` извлекает `contents`-аргумент и кладёт его сюда
+    /// под ключом ResourceId до того, как зовёт `Primitive::build_payload`.
     pub(crate) sensitive: Arc<SensitiveStore>,
     pub(crate) registry: Rc<RefCell<Registry>>,
     pub(crate) plan_ctx: PlanCtx,
     pub(crate) errors: RefCell<Vec<StarlarkGlueError>>,
+    /// Closure для рендера шаблонов. Инжектируется CLI в Phase 8; в
+    /// unit-тестах bosun-core может быть `default_template_fn`, который
+    /// сразу отдаёт ошибку «template rendering not configured».
+    pub(crate) template_fn: TemplateFn,
 }
 
 thread_local! {
@@ -116,6 +130,16 @@ pub(crate) fn with_state<R>(f: impl FnOnce(&EvalState) -> R) -> Option<R> {
     })
 }
 
+/// Default closure для тестов и контекстов, где template-рендеринг
+/// не сконфигурирован: всегда возвращает ошибку с понятным сообщением.
+pub fn default_template_fn() -> TemplateFn {
+    Rc::new(|path: &str| {
+        Err(anyhow::anyhow!(
+            "template('{path}') called but no template renderer configured for this evaluator",
+        ))
+    })
+}
+
 /// Запустить Starlark-evaluation для entry-манифеста bundle.
 ///
 /// Каждый вызов `apt.package(...)` / `file.content(...)` через native-globals
@@ -129,6 +153,7 @@ pub fn evaluate_manifest(
     sensitive: Arc<SensitiveStore>,
     registry: Rc<RefCell<Registry>>,
     plan_ctx: PlanCtx,
+    template_fn: TemplateFn,
 ) -> Result<(), StarlarkGlueError> {
     let entry_source = bundle.entry_manifest().ok_or_else(|| {
         BundleError::EntryNotFound(format!(
@@ -159,6 +184,7 @@ pub fn evaluate_manifest(
         registry,
         plan_ctx,
         errors: RefCell::new(Vec::new()),
+        template_fn,
     });
 
     let _guard = StateGuard::install(Rc::clone(&state));
@@ -266,6 +292,58 @@ mod tests {
         }
     }
 
+    /// Mock file.content: build_payload отражает имеющиеся аргументы как payload,
+    /// в том числе уже подменённые glue'ем `content_sha256` и `content_size`.
+    struct MockFile;
+
+    impl Primitive for MockFile {
+        fn type_name(&self) -> ResourceKind {
+            ResourceKind::from_static("file.content")
+        }
+        fn identity_keys(&self) -> &'static [&'static str] {
+            &["path"]
+        }
+        fn build_payload(
+            &self,
+            args: &CallArgs,
+            _ctx: &PlanCtx,
+        ) -> Result<serde_json::Value, PrimitiveError> {
+            let path = args
+                .required_str("path")
+                .map_err(|e| PrimitiveError::InvalidPayload(format!("file.content: {e}")))?;
+            let sha = args
+                .required_str("content_sha256")
+                .map_err(|e| PrimitiveError::InvalidPayload(format!("file.content: {e}")))?;
+            let size = args
+                .optional_u64("content_size")
+                .map_err(|e| PrimitiveError::InvalidPayload(format!("file.content: {e}")))?
+                .ok_or_else(|| {
+                    PrimitiveError::InvalidPayload("file.content: missing content_size".to_string())
+                })?;
+            Ok(serde_json::json!({
+                "path": path,
+                "content_sha256": sha,
+                "content_size": size,
+            }))
+        }
+        fn plan(
+            &self,
+            _resource: &Resource,
+            _facts: &dyn FactsSource,
+            _ctx: &PlanCtx,
+        ) -> Result<Diff, PrimitiveError> {
+            Ok(Diff::NoChange)
+        }
+        fn apply(
+            &self,
+            _resource: &Resource,
+            _diff: &Diff,
+            _ctx: &ApplyCtx,
+        ) -> Result<ChangeReport, PrimitiveError> {
+            Ok(ChangeReport::no_change())
+        }
+    }
+
     fn plan_ctx() -> PlanCtx {
         PlanCtx {
             deadline: Instant::now() + Duration::from_secs(60),
@@ -325,6 +403,7 @@ apt.package(name = "nginx")
             store,
             Rc::clone(&registry),
             ctx,
+            default_template_fn(),
         )
         .unwrap();
         let reg = registry.borrow();
@@ -360,6 +439,7 @@ apt.package(name = "nginx", version = inv.nginx_version)
             store,
             Rc::clone(&registry),
             ctx,
+            default_template_fn(),
         )
         .unwrap();
         let reg = registry.borrow();
@@ -388,6 +468,7 @@ load("//some/module", "apt")
             store,
             registry,
             ctx,
+            default_template_fn(),
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -420,6 +501,7 @@ file.content(path = "/tmp/x", contents = "x")
             store,
             registry,
             ctx,
+            default_template_fn(),
         )
         .unwrap_err();
         match err {
@@ -450,6 +532,7 @@ apt.package(name = inv.nonexistent_key)
             store,
             registry,
             ctx,
+            default_template_fn(),
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -482,6 +565,7 @@ apt.package(name = "nginx")
             store,
             registry,
             ctx,
+            default_template_fn(),
         )
         .unwrap_err();
         let msg = format!("{err}");
@@ -514,6 +598,7 @@ apt.package(name = "b", depends_on = [h])
             store,
             Rc::clone(&registry),
             ctx,
+            default_template_fn(),
         )
         .unwrap();
         let reg = registry.borrow();
@@ -527,6 +612,160 @@ apt.package(name = "b", depends_on = [h])
         assert_eq!(
             b.depends_on[0],
             ResourceId::new(&ResourceKind::from_static("apt.package"), "a")
+        );
+    }
+
+    fn primitives_with_mock_file() -> Rc<HashMap<ResourceKind, Box<dyn Primitive>>> {
+        let mut m: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
+        m.insert(
+            ResourceKind::from_static("file.content"),
+            Box::new(MockFile),
+        );
+        Rc::new(m)
+    }
+
+    #[test]
+    fn file_content_extracts_contents_into_sensitive_store() {
+        // file.content(contents="hello") должен:
+        // 1. убрать "contents" из аргументов до build_payload,
+        // 2. положить sha256+size в payload,
+        // 3. положить тело в SensitiveStore под ResourceId.
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "file")
+file.content(path = "/etc/conf", contents = "hello")
+"#,
+            serde_json::json!({}),
+        );
+        let primitives = primitives_with_mock_file();
+        let registry = Rc::new(RefCell::new(Registry::new()));
+        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
+        let store = Arc::new(SensitiveStore::new());
+        let ctx = plan_ctx();
+        evaluate_manifest(
+            &bundle,
+            primitives,
+            serde_json::json!({}),
+            facts,
+            Arc::clone(&store),
+            Rc::clone(&registry),
+            ctx,
+            default_template_fn(),
+        )
+        .unwrap();
+        let reg = registry.borrow();
+        assert_eq!(reg.all().len(), 1);
+        let r = &reg.all()[0];
+        assert_eq!(r.payload["path"], serde_json::json!("/etc/conf"));
+        // sha256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+        assert_eq!(
+            r.payload["content_sha256"],
+            serde_json::json!("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
+        );
+        assert_eq!(r.payload["content_size"], serde_json::json!(5));
+        // Контент НЕ в payload — только в store.
+        assert!(r.payload.get("contents").is_none());
+
+        let id = ResourceId::new(&ResourceKind::from_static("file.content"), "/etc/conf");
+        let sensitive = store.take(&id).unwrap();
+        assert_eq!(sensitive.into_inner(), "hello");
+    }
+
+    #[test]
+    fn file_content_missing_contents_is_error() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "file")
+file.content(path = "/etc/conf")
+"#,
+            serde_json::json!({}),
+        );
+        let primitives = primitives_with_mock_file();
+        let registry = Rc::new(RefCell::new(Registry::new()));
+        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
+        let store = Arc::new(SensitiveStore::new());
+        let ctx = plan_ctx();
+        let err = evaluate_manifest(
+            &bundle,
+            primitives,
+            serde_json::json!({}),
+            facts,
+            store,
+            registry,
+            ctx,
+            default_template_fn(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("contents"),
+            "expected contents-error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn template_closure_is_invoked_with_relative_path() {
+        // Подменяем template_fn: возвращает echo строку, проверяем результат.
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "file", "template")
+file.content(path = "/etc/conf", contents = template("hello.j2"))
+"#,
+            serde_json::json!({}),
+        );
+        let primitives = primitives_with_mock_file();
+        let registry = Rc::new(RefCell::new(Registry::new()));
+        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
+        let store = Arc::new(SensitiveStore::new());
+        let ctx = plan_ctx();
+        let template_fn: TemplateFn = Rc::new(|path: &str| Ok(format!("rendered:{path}")));
+        evaluate_manifest(
+            &bundle,
+            primitives,
+            serde_json::json!({}),
+            facts,
+            Arc::clone(&store),
+            Rc::clone(&registry),
+            ctx,
+            template_fn,
+        )
+        .unwrap();
+
+        let id = ResourceId::new(&ResourceKind::from_static("file.content"), "/etc/conf");
+        let sensitive = store.take(&id).unwrap();
+        assert_eq!(sensitive.into_inner(), "rendered:hello.j2");
+    }
+
+    #[test]
+    fn template_closure_error_propagates_as_starlark_eval_error() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "template")
+x = template("broken.j2")
+"#,
+            serde_json::json!({}),
+        );
+        let primitives: Rc<HashMap<ResourceKind, Box<dyn Primitive>>> = Rc::new(HashMap::new());
+        let registry = Rc::new(RefCell::new(Registry::new()));
+        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
+        let store = Arc::new(SensitiveStore::new());
+        let ctx = plan_ctx();
+        let template_fn: TemplateFn = Rc::new(|_| Err(anyhow::anyhow!("synthetic render failure")));
+        let err = evaluate_manifest(
+            &bundle,
+            primitives,
+            serde_json::json!({}),
+            facts,
+            store,
+            registry,
+            ctx,
+            template_fn,
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("synthetic render failure") || msg.contains("broken.j2"),
+            "expected template error to surface, got: {msg}"
         );
     }
 }
