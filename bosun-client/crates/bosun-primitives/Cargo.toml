@@ -26,6 +26,10 @@ chrono = { workspace = true }
 # для per-host bosun-lock; кросс-platform не нужно, но дублирование с std
 # было бы дороже сопровождать.
 fs4 = { workspace = true }
+# rand — джиттер backoff'ов в apt-get update retry-loop'е. На 60k нодах
+# фиксированный backoff пробивает mirror одинаковым залпом; ±25% jitter
+# размазывает retry'и по времени.
+rand = { workspace = true }
 
 [dev-dependencies]
 # CancellationToken нужен для конструирования PlanCtx/ApplyCtx в unit-тестах

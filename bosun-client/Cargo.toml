@@ -47,3 +47,4 @@ fs4 = "0.13"
 chrono = { version = "0.4", features = ["clock"] }
 signal-hook = "0.3"
 cucumber = "0.21"
+rand = "0.8"

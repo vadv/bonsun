@@ -7,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bosun_core::PrimitiveError;
+use rand::Rng;
 
 use super::exec::CommandRunner;
 
@@ -23,6 +24,12 @@ pub struct AptUpdatePolicy {
     /// `backoffs[i]` — пауза между attempt `i` и attempt `i+1`. Если `i`
     /// выходит за длину массива, используется последнее значение.
     pub backoffs: &'static [Duration],
+    /// Размер jitter'а в процентах от базового backoff'а. Фактическая
+    /// пауза — `base * (1 + uniform(-jitter, +jitter))` с верхним
+    /// зажимом на `base * 2`. На 60k нод фиксированный backoff пробивает
+    /// mirror одной волной retry'ев; ±25% размазывает их по 25%-секундному
+    /// окну. `jitter_pct=0` отключает рандом (используется в тестах).
+    pub jitter_pct: u32,
 }
 
 /// Production-конфигурация backoff'ов: 5s → 10s → 20s по spec'у.
@@ -32,14 +39,38 @@ const DEFAULT_APT_UPDATE_BACKOFFS: &[Duration] = &[
     Duration::from_secs(20),
 ];
 
+/// Дефолтный jitter — ±25% от базового backoff'а.
+const DEFAULT_JITTER_PCT: u32 = 25;
+
 impl Default for AptUpdatePolicy {
     fn default() -> Self {
         Self {
             per_attempt_timeout: Duration::from_secs(30),
             max_attempts: 3,
             backoffs: DEFAULT_APT_UPDATE_BACKOFFS,
+            jitter_pct: DEFAULT_JITTER_PCT,
         }
     }
+}
+
+/// Применить jitter к backoff'у: `base * (1 + jitter * uniform(-1, +1))`,
+/// зажимая результат сверху на `base * 2`. Если `jitter_pct == 0` или
+/// `base == 0`, возвращаем `base` как есть — это важно для тестов и для
+/// последней попытки.
+fn jittered_backoff(base: Duration, jitter_pct: u32) -> Duration {
+    if jitter_pct == 0 || base.is_zero() {
+        return base;
+    }
+    let mut rng = rand::thread_rng();
+    let r: f64 = rng.gen_range(-1.0..=1.0);
+    let factor = 1.0 + r * (f64::from(jitter_pct) / 100.0);
+    let base_secs = base.as_secs_f64();
+    let scaled = base_secs * factor;
+    // Зажимаем сверху на base*2: убегающее значение от случайной
+    // выборки не должно перевешивать сам backoff.
+    let max_secs = base_secs * 2.0;
+    let bounded = scaled.clamp(0.0, max_secs);
+    Duration::from_secs_f64(bounded)
 }
 
 /// Выполнить `dpkg --configure -a`. Per-attempt deadline = 60s или
@@ -109,12 +140,13 @@ pub fn run_apt_update_with_policy(
                 if attempt + 1 >= policy.max_attempts {
                     break;
                 }
-                let backoff = policy
+                let base_backoff = policy
                     .backoffs
                     .get(attempt as usize)
                     .copied()
                     .or_else(|| policy.backoffs.last().copied())
                     .unwrap_or(Duration::ZERO);
+                let backoff = jittered_backoff(base_backoff, policy.jitter_pct);
                 tracing::warn!(
                     attempt = attempt + 1,
                     max = policy.max_attempts,
@@ -274,11 +306,13 @@ mod tests {
     const ZERO_BACKOFFS: &[Duration] = &[Duration::ZERO, Duration::ZERO, Duration::ZERO];
 
     /// Policy без задержек — для тестов retry-логики без реального ожидания.
+    /// `jitter_pct=0` отключает рандом: тесты должны быть детерминированы.
     fn zero_backoff_policy(attempts: u32) -> AptUpdatePolicy {
         AptUpdatePolicy {
             per_attempt_timeout: Duration::from_secs(30),
             max_attempts: attempts,
             backoffs: ZERO_BACKOFFS,
+            jitter_pct: 0,
         }
     }
 
@@ -452,6 +486,43 @@ mod tests {
         let b = now + Duration::from_secs(5);
         assert_eq!(min_deadline(a, b), b);
         assert_eq!(min_deadline(b, a), b);
+    }
+
+    #[test]
+    fn jittered_backoff_zero_pct_returns_base() {
+        let base = Duration::from_secs(10);
+        assert_eq!(jittered_backoff(base, 0), base);
+    }
+
+    #[test]
+    fn jittered_backoff_zero_base_returns_zero() {
+        // jitter * 0 = 0, не должно стать negative или Inf.
+        assert_eq!(jittered_backoff(Duration::ZERO, 25), Duration::ZERO);
+    }
+
+    #[test]
+    fn jittered_backoff_within_25pct_window_over_many_samples() {
+        let base = Duration::from_secs(10);
+        let base_ms = base.as_millis() as i64;
+        let low = base_ms * 75 / 100;
+        let high = base_ms * 125 / 100;
+        for _ in 0..200 {
+            let actual = jittered_backoff(base, 25).as_millis() as i64;
+            assert!(
+                actual >= low && actual <= high,
+                "jitter out of ±25% window: actual={actual}, low={low}, high={high}",
+            );
+        }
+    }
+
+    #[test]
+    fn jittered_backoff_never_exceeds_double_base() {
+        let base = Duration::from_millis(100);
+        // Даже с пикантным jitter_pct сверху зажат на base*2.
+        for _ in 0..200 {
+            let actual = jittered_backoff(base, 500).as_millis();
+            assert!(actual <= base.as_millis() * 2);
+        }
     }
 
     #[test]
