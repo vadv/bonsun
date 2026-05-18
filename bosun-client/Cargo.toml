@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bosun-core",
+    "crates/bosun-facts",
+    "crates/bosun-primitives",
+    "crates/bosun-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.84"
+license = "Proprietary"
+publish = false
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_norway = "0.9"
+thiserror = "1"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+semver = "1"
+sha2 = "0.10"
+tempfile = "3"
+clap = { version = "4", features = ["derive"] }
+procfs = "=0.16"
+num_cpus = "1"
+tokio-util = "0.7"
+debversion = "0.4"
+starlark = "~0.13"
+minijinja = "2"
+fs4 = "0.13"
+chrono = { version = "0.4", features = ["clock"] }
