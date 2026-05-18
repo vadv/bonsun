@@ -13,9 +13,9 @@
 //! Когда сценарий задаёт `Given a bundle with inventory:`, мы пишем yaml
 //! и в `defaults/main.yaml` (для merge с bundle.defaults), и одновременно
 //! материализуем `/work/inv.yaml`, который передаём через `--inventory`.
-//! Это обходит тот факт, что в текущем bosun-core merge_inventory(Null)
-//! затирает defaults: если override-yaml задан, defaults становятся видны
-//! через override-канал. См. Phase 10 follow-up.
+//! Исторически это обходило баг merge_inventory(Null), затиравшего
+//! defaults; после фикса в bosun-core оба канала равноправны и дублирование
+//! безвредно — оставлено как тестовое страхование от регрессии.
 
 use std::fs;
 use std::path::Path;
