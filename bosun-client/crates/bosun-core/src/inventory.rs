@@ -11,7 +11,9 @@ pub enum InventoryError {
     },
 }
 
-pub trait InventorySource: Send + Sync {
+/// Read-only доступ к inventory из манифеста (`inv.foo`, `inv.nested.bar`).
+/// Send/Sync не требуется: apply однопоточный, см. комментарий в `primitive.rs`.
+pub trait InventorySource {
     /// Получить значение по dotted-path (например "nginx.workers"). None → KeyNotFound.
     fn get(&self, dotted_path: &str) -> Result<&serde_json::Value, InventoryError>;
 }

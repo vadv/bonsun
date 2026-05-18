@@ -1,3 +1,21 @@
+//! Контракты примитива.
+//!
+//! ## Почему `FactsSource` без `Send + Sync`
+//!
+//! Apply-фаза однопоточная: один Worker последовательно прогоняет ресурсы
+//! из топологического порядка. FactsCollector держит локальный кэш в
+//! `RefCell<HashMap<...>>` для interior mutability — это даёт дешёвый
+//! lazy refresh без блокировок. `RefCell: !Sync`, поэтому требовать `Sync`
+//! от `FactsSource` означало бы запретить такую реализацию ради воображаемой
+//! многопоточности, которой в MVP нет.
+//!
+//! Симметрично `InventorySource`: тоже read-only single-threaded, тех же
+//! ограничений нет смысла навязывать.
+//!
+//! `Primitive` остаётся `Send + Sync` — примитивы stateless, в будущем
+//! параллельная плоскость apply (per-namespace pool) потребует, чтобы их
+//! можно было держать в Arc и звать из любого worker'а.
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -71,7 +89,8 @@ pub enum PrimitiveError {
 
 /// Trait для FactsSource — read-only доступ к фактам.
 /// Объявляется здесь, реализуется в bosun-facts.
-pub trait FactsSource: Send + Sync {
+/// Send/Sync не требуется: apply однопоточный, см. модульный комментарий.
+pub trait FactsSource {
     fn get(&self, name: &str) -> crate::facts::FactValue;
 }
 
