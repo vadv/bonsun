@@ -80,19 +80,24 @@ impl FactsCollector {
 
     /// Сборка всех `AtStart` фактов. Каждая сборка обёрнута
     /// в `catch_unwind` — паника не валит весь процесс.
+    /// `collect()` запускается БЕЗ удержания borrow на кеш — это
+    /// исключает re-entrant борроу-конфликт, если факт сам полезет
+    /// читать другие факты через FactsView.
     pub fn collect_at_start(&self) {
         let ctx = FactCollectCtx::new(self.root_fs.clone());
-        let mut cache = self.cache.borrow_mut();
         for fact in &self.facts {
             if !matches!(fact.refresh_policy(), RefreshPolicy::AtStart) {
                 continue;
             }
+            let name = fact.name().to_string();
             let value = collect_with_panic_guard(fact.as_ref(), &ctx);
-            cache.insert(
-                fact.name().to_string(),
+            let now = Instant::now();
+            // borrow_mut держим только на момент мутации.
+            self.cache.borrow_mut().insert(
+                name,
                 CachedFact {
                     value,
-                    collected_at: Instant::now(),
+                    collected_at: now,
                     dirty: false,
                 },
             );
@@ -101,17 +106,22 @@ impl FactsCollector {
 
     /// Помечает все факты с политикой `AfterApply` и `applied_kind`
     /// в `triggers` как dirty. Реальная пересборка ленивая.
+    /// Сначала собираем список имён вне borrow, потом единым
+    /// `borrow_mut` обновляем флаги — это исключает re-entrant борроу.
     pub fn mark_dirty_after_apply(&self, applied_kind: &ResourceKind) {
+        let to_dirty: Vec<String> = self
+            .facts
+            .iter()
+            .filter_map(|fact| match fact.refresh_policy() {
+                RefreshPolicy::AfterApply { triggers } if triggers.contains(applied_kind) => {
+                    Some(fact.name().to_string())
+                }
+                _ => None,
+            })
+            .collect();
         let mut cache = self.cache.borrow_mut();
-        for fact in &self.facts {
-            let RefreshPolicy::AfterApply { triggers } = fact.refresh_policy() else {
-                continue;
-            };
-            if !triggers.contains(applied_kind) {
-                continue;
-            }
-            let name = fact.name();
-            if let Some(entry) = cache.get_mut(name) {
+        for name in to_dirty {
+            if let Some(entry) = cache.get_mut(&name) {
                 entry.dirty = true;
                 tracing::debug!(fact = name, kind = %applied_kind, "marked fact dirty");
             } else {

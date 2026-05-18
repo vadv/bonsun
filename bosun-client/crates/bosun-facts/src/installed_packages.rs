@@ -153,12 +153,25 @@ fn parse_fields(section: &str) -> BTreeMap<String, String> {
     fields
 }
 
-/// Конвертирует Priority-токен в числовое значение. APT принимает
-/// нечисловые имена (`important`, `required`, `standard`, `optional`,
-/// `extra`), но в `Packages` обычно лежит число. Для нечисловых имён
-/// возвращаем None — это означает «использовать debversion-сравнение».
+/// Конвертирует Priority-токен в числовое значение. В реальных
+/// `Packages` файлах Debian/Ubuntu чаще встречаются именованные приоритеты
+/// (`Priority: optional`, `Priority: standard`); числовые встречаются
+/// преимущественно в кастомных репозиториях. Чтобы оба варианта влияли
+/// на выбор candidate_version, маппим стандартные имена по таблице
+/// Debian Policy. Неизвестные токены — None (использовать debversion).
 fn priority_value(s: &str) -> Option<i32> {
-    s.trim().parse().ok()
+    let trimmed = s.trim();
+    if let Ok(n) = trimmed.parse() {
+        return Some(n);
+    }
+    match trimmed {
+        "required" => Some(1000),
+        "important" => Some(800),
+        "standard" => Some(600),
+        "optional" => Some(500),
+        "extra" => Some(100),
+        _ => None,
+    }
 }
 
 /// Выбирает установленные пакеты из текста status-файла.
