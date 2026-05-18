@@ -2,4 +2,4 @@
 
 pub mod resource;
 
-pub use resource::{ResourceKind, ResourceKindError};
+pub use resource::{Handle, Resource, ResourceId, ResourceKind, ResourceKindError};

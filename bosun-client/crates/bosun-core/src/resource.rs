@@ -52,6 +52,46 @@ impl std::fmt::Display for ResourceKind {
     }
 }
 
+/// Глобально уникальный идентификатор ресурса. Хранится как Arc<str>.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ResourceId(Arc<str>);
+
+impl ResourceId {
+    /// Сконструировать ResourceId из kind и identity-segment.
+    /// Формат: "<kind>:<identity>". Например, "apt.package:nginx".
+    pub fn new(kind: &ResourceKind, identity: &str) -> Self {
+        let s = format!("{}:{}", kind.as_str(), identity);
+        Self(Arc::from(s))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for ResourceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Handle — opaque newtype над ResourceId, используется в Starlark для
+/// связей `reload_on=[...]`, `depends_on=[...]`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Handle(pub ResourceId);
+
+/// Зарегистрированный ресурс в Registry. Payload type-erased через JSON,
+/// каждый примитив десериализует payload в собственный Spec через serde.
+#[derive(Clone, Debug)]
+pub struct Resource {
+    pub id: ResourceId,
+    pub kind: ResourceKind,
+    pub spec_version: u16,
+    pub payload: serde_json::Value,
+    pub reload_on: Vec<ResourceId>,
+    pub depends_on: Vec<ResourceId>,
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -96,5 +136,28 @@ mod tests {
         let mut set: HashSet<ResourceKind> = HashSet::new();
         set.insert(a);
         assert!(set.contains(&b));
+    }
+
+    #[test]
+    fn resource_id_format_matches_kind_colon_identity() {
+        let kind = ResourceKind::from_static("apt.package");
+        let id = ResourceId::new(&kind, "nginx");
+        assert_eq!(id.as_str(), "apt.package:nginx");
+    }
+
+    #[test]
+    fn resource_id_equal_when_same_kind_and_identity() {
+        let kind = ResourceKind::from_static("file.content");
+        let a = ResourceId::new(&kind, "/etc/nginx/nginx.conf");
+        let b = ResourceId::new(&kind, "/etc/nginx/nginx.conf");
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn handle_wraps_resource_id() {
+        let kind = ResourceKind::from_static("apt.package");
+        let id = ResourceId::new(&kind, "nginx");
+        let h = Handle(id.clone());
+        assert_eq!(h.0, id);
     }
 }
