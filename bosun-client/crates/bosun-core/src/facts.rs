@@ -5,7 +5,7 @@ use serde::Serialize;
 use crate::resource::ResourceKind;
 
 #[derive(Clone, Debug, Serialize)]
-#[serde(tag = "state", rename_all = "snake_case")]
+#[serde(tag = "state", content = "value", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum FactValue {
     Known(serde_json::Value),
@@ -92,15 +92,52 @@ mod tests {
     }
 
     #[test]
-    fn fact_value_serializes_with_state_tag() {
-        // Внутренне-тегированный enum в serde требует, чтобы newtype-вариант
-        // содержал map-подобное значение — иначе тег некуда внедрить. Поэтому
-        // оборачиваем в объект {hostname: "x"}; для serialization-тестов это
-        // достаточно, а scalar-факты при необходимости диагностики дампятся
-        // через value() и не через сам enum.
-        let v = FactValue::Known(serde_json::json!({"hostname": "x"}));
-        let j = serde_json::to_value(&v).unwrap();
-        assert_eq!(j["state"], "known");
-        assert_eq!(j["hostname"], "x");
+    fn fact_value_serializes_known_variants() {
+        // Adjacently-tagged enum: {"state": "...", "value": ...}.
+        // Тег вынесен в отдельное поле, поэтому value может быть любым
+        // JSON-типом — null, bool, число, строка, массив, объект.
+        let cases: Vec<serde_json::Value> = vec![
+            serde_json::Value::Null,
+            serde_json::json!(true),
+            serde_json::json!(42),
+            serde_json::json!("hostname-abc"),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!({"key": "val"}),
+        ];
+        for case in cases {
+            let fact = FactValue::Known(case.clone());
+            let serialized = serde_json::to_string(&fact).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(parsed["state"], "known", "input={case}");
+            assert_eq!(parsed["value"], case, "input={case}");
+        }
+    }
+
+    #[test]
+    fn fact_value_serializes_stale_variants() {
+        let cases: Vec<serde_json::Value> = vec![serde_json::json!(42), serde_json::json!("x")];
+        for case in cases {
+            let fact = FactValue::Stale {
+                value: case.clone(),
+                age_ms: 1000,
+            };
+            let serialized = serde_json::to_string(&fact).unwrap();
+            let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(parsed["state"], "stale", "input={case}");
+            // Поля struct-варианта при adjacent tagging вложены в value.
+            assert_eq!(parsed["value"]["value"], case, "input={case}");
+            assert_eq!(parsed["value"]["age_ms"], 1000, "input={case}");
+        }
+    }
+
+    #[test]
+    fn fact_value_serializes_unknown_variant() {
+        let fact = FactValue::Unknown {
+            reason: "io error".into(),
+        };
+        let serialized = serde_json::to_string(&fact).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed["state"], "unknown");
+        assert_eq!(parsed["value"]["reason"], "io error");
     }
 }
