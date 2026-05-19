@@ -98,17 +98,20 @@ thread_local! {
 struct StateGuard;
 
 impl StateGuard {
-    fn install(state: Rc<EvalState>) -> Self {
-        CURRENT_STATE.with(|cell| {
-            let mut slot = cell.borrow_mut();
+    fn install(state: Rc<EvalState>) -> Result<Self, StarlarkGlueError> {
+        let already_installed = CURRENT_STATE.with(|cell| cell.borrow().is_some());
+        if already_installed {
             // Re-entrant evaluate_manifest на том же thread запрещён: вложенный
-            // bosun-evaluation потерял бы parent state. На практике не должно
-            // случаться — Phase 5 не имеет custom loaders, рекурсивно
-            // evaluator не запускается.
-            debug_assert!(slot.is_none(), "nested evaluate_manifest not supported");
-            *slot = Some(state);
+            // bosun-evaluation потерял бы parent state. В release-build раньше
+            // это был silent debug_assert; теперь — явная ошибка.
+            return Err(StarlarkGlueError::Eval(
+                "nested evaluate_manifest is not supported on the same thread".to_string(),
+            ));
+        }
+        CURRENT_STATE.with(|cell| {
+            *cell.borrow_mut() = Some(state);
         });
-        Self
+        Ok(Self)
     }
 }
 
@@ -117,6 +120,35 @@ impl Drop for StateGuard {
         CURRENT_STATE.with(|cell| {
             cell.borrow_mut().take();
         });
+    }
+}
+
+/// Хук-функция для starlark-evaluator'а: выставляется через
+/// `before_stmt_for_dap` и вызывается перед каждым bytecode-statement'ом.
+/// Проверяет `plan_ctx.deadline` и `cancel`; при превышении/отмене
+/// возвращает `Err`, и evaluator прерывает eval_module с этой ошибкой.
+struct DeadlineChecker {
+    deadline: std::time::Instant,
+    cancel: tokio_util::sync::CancellationToken,
+}
+
+impl<'a, 'e: 'a> starlark::eval::BeforeStmtFuncDyn<'a, 'e> for DeadlineChecker {
+    fn call<'v>(
+        &mut self,
+        _span: starlark::codemap::FileSpanRef,
+        _eval: &mut starlark::eval::Evaluator<'v, 'a, 'e>,
+    ) -> starlark::Result<()> {
+        if self.cancel.is_cancelled() {
+            return Err(starlark::Error::new_other(anyhow::anyhow!(
+                "starlark evaluation cancelled"
+            )));
+        }
+        if std::time::Instant::now() >= self.deadline {
+            return Err(starlark::Error::new_other(anyhow::anyhow!(
+                "starlark evaluation exceeded deadline"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -177,6 +209,10 @@ pub fn evaluate_manifest(
         StarlarkGlueError::Eval(format!("failed to build @bosun/builtins module: {e}"))
     })?;
 
+    // Снимок plan_ctx до перемещения в EvalState — нужен для DeadlineChecker.
+    let deadline = plan_ctx.deadline;
+    let cancel = plan_ctx.cancel.clone();
+
     let state = Rc::new(EvalState {
         primitives,
         facts,
@@ -187,7 +223,7 @@ pub fn evaluate_manifest(
         template_fn,
     });
 
-    let _guard = StateGuard::install(Rc::clone(&state));
+    let _guard = StateGuard::install(Rc::clone(&state))?;
 
     let module = Module::new();
 
@@ -199,6 +235,15 @@ pub fn evaluate_manifest(
     let eval_result = {
         let mut eval = Evaluator::new(&module);
         eval.set_loader(&loader);
+        // F06: перед каждым bytecode-statement'ом DeadlineChecker проверяет
+        // deadline/cancel; при превышении prevents бесконечный/тяжёлый
+        // манифест от блокировки CLI. Хук вызывается из starlark-runtime,
+        // не из нашего кода — отсюда `BeforeStmtFuncDyn` через `from`.
+        let checker: Box<dyn starlark::eval::BeforeStmtFuncDyn> = Box::new(DeadlineChecker {
+            deadline,
+            cancel: cancel.clone(),
+        });
+        eval.before_stmt_for_dap(checker.into());
         eval.eval_module(ast, &globals)
     };
 
@@ -766,6 +811,215 @@ x = template("broken.j2")
         assert!(
             msg.contains("synthetic render failure") || msg.contains("broken.j2"),
             "expected template error to surface, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn evaluation_aborts_on_deadline_for_heavy_manifest() {
+        // F06 regression: for-цикл с большим range — легальная starlark
+        // конструкция (без before_stmt-hook'а eval работает до полного
+        // завершения). С deadline через DeadlineChecker eval прерывается
+        // между statement'ами тела цикла.
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "apt")
+def heavy():
+    acc = 0
+    for i in range(10000000):
+        acc = acc + i
+        acc = acc - 1
+    return acc
+_ = heavy()
+apt.package(name = "nginx")
+"#,
+            serde_json::json!({}),
+        );
+        let primitives = primitives_with_mock_apt();
+        let registry = Rc::new(RefCell::new(Registry::new()));
+        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
+        let store = Arc::new(SensitiveStore::new());
+
+        // Очень короткий дедлайн: 50ms.
+        let ctx = PlanCtx {
+            deadline: Instant::now() + Duration::from_millis(50),
+            cancel: CancellationToken::new(),
+        };
+
+        let started = Instant::now();
+        let err = evaluate_manifest(
+            &bundle,
+            primitives,
+            serde_json::json!({}),
+            facts,
+            store,
+            registry,
+            ctx,
+            default_template_fn(),
+        )
+        .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "elapsed: {:?}",
+            started.elapsed()
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("deadline") || msg.contains("cancel"),
+            "expected deadline-related error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn evaluation_aborts_on_cancel_token() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "apt")
+def heavy():
+    acc = 0
+    for i in range(10000000):
+        acc = acc + i
+        acc = acc - 1
+    return acc
+_ = heavy()
+apt.package(name = "nginx")
+"#,
+            serde_json::json!({}),
+        );
+        let primitives = primitives_with_mock_apt();
+        let registry = Rc::new(RefCell::new(Registry::new()));
+        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
+        let store = Arc::new(SensitiveStore::new());
+
+        let cancel = CancellationToken::new();
+        let cancel_for_thread = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            cancel_for_thread.cancel();
+        });
+        let ctx = PlanCtx {
+            deadline: Instant::now() + Duration::from_secs(60),
+            cancel,
+        };
+
+        let started = Instant::now();
+        let err = evaluate_manifest(
+            &bundle,
+            primitives,
+            serde_json::json!({}),
+            facts,
+            store,
+            registry,
+            ctx,
+            default_template_fn(),
+        )
+        .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "elapsed: {:?}",
+            started.elapsed()
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("cancel") || msg.contains("deadline"),
+            "expected cancel-related error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn nested_evaluate_manifest_on_same_thread_returns_error() {
+        // F06 secondary: re-entrant evaluate_manifest должен явно отказать,
+        // не молча тратить state predecessor'а (раньше — debug_assert,
+        // в release-build silent UB).
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "apt")
+apt.package(name = "outer")
+"#,
+            serde_json::json!({}),
+        );
+        let primitives = primitives_with_mock_apt();
+        let registry = Rc::new(RefCell::new(Registry::new()));
+        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
+        let store = Arc::new(SensitiveStore::new());
+
+        // Эмулируем «вложенность» через прямую установку state в
+        // thread-local поверх ещё одного вызова. Самый простой способ —
+        // запустить evaluate_manifest изнутри template_fn.
+        let inner_bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "apt")
+apt.package(name = "inner")
+"#,
+            serde_json::json!({}),
+        );
+        let primitives_for_inner = primitives_with_mock_apt();
+        let inner_state = std::cell::RefCell::new(Some(inner_bundle));
+        let inner_primitives = std::cell::RefCell::new(Some(primitives_for_inner));
+        let inner_called = std::rc::Rc::new(std::cell::RefCell::new(false));
+        let inner_err = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
+
+        let inner_called_clone = std::rc::Rc::clone(&inner_called);
+        let inner_err_clone = std::rc::Rc::clone(&inner_err);
+        let template_fn: TemplateFn = std::rc::Rc::new(move |_path: &str| {
+            *inner_called_clone.borrow_mut() = true;
+            // Пытаемся запустить evaluate_manifest внутри template-функции.
+            // Должны получить StarlarkGlueError::Eval("nested...").
+            let b = inner_state.borrow_mut().take().unwrap();
+            let p = inner_primitives.borrow_mut().take().unwrap();
+            let inner_reg = std::rc::Rc::new(std::cell::RefCell::new(Registry::new()));
+            let inner_facts: std::rc::Rc<dyn FactsSource> = std::rc::Rc::new(NoFacts);
+            let inner_store = std::sync::Arc::new(SensitiveStore::new());
+            let result = evaluate_manifest(
+                &b,
+                p,
+                serde_json::json!({}),
+                inner_facts,
+                inner_store,
+                inner_reg,
+                PlanCtx {
+                    deadline: Instant::now() + Duration::from_secs(60),
+                    cancel: CancellationToken::new(),
+                },
+                default_template_fn(),
+            );
+            match result {
+                Err(StarlarkGlueError::Eval(msg)) if msg.contains("nested") => {
+                    *inner_err_clone.borrow_mut() = Some(msg);
+                    Ok(String::new())
+                }
+                Err(other) => Err(anyhow::anyhow!("expected nested error, got: {other}")),
+                Ok(()) => Err(anyhow::anyhow!("expected nested error, got Ok")),
+            }
+        });
+
+        let bundle_with_template = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "apt", "template")
+x = template("dummy.j2")
+apt.package(name = "outer")
+"#,
+            serde_json::json!({}),
+        );
+        let _ = bundle;
+        let ctx = plan_ctx();
+        evaluate_manifest(
+            &bundle_with_template,
+            primitives,
+            serde_json::json!({}),
+            facts,
+            store,
+            registry,
+            ctx,
+            template_fn,
+        )
+        .unwrap();
+        assert!(
+            *inner_called.borrow(),
+            "template-fn должна была быть вызвана"
+        );
+        assert!(
+            inner_err.borrow().as_ref().is_some(),
+            "ожидаем nested-эрор из inner evaluate_manifest"
         );
     }
 }
