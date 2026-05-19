@@ -6,6 +6,7 @@ members = [
     "crates/bosun-primitives",
     "crates/bosun-cli",
     "crates/bosun-systemd-client",
+    "crates/bosun-runr-client",
 ]
 
 [workspace.package]
@@ -53,3 +54,5 @@ chrono = { version = "0.4", features = ["clock"] }
 signal-hook = "0.3"
 cucumber = "0.21"
 rand = "0.8"
+ureq = { version = "2", default-features = false, features = ["json"] }
+wiremock = "0.6"
