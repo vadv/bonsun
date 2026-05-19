@@ -5,11 +5,13 @@
 //! 3. Check cancel/deadline.
 //! 4. Probe `/var/lib/dpkg/lock-frontend` — `DpkgLocked` если занят.
 //! 5. Per-resource deadline = min(ctx.deadline, now + spec.timeout_sec).
-//! 6. `apt-get install …` → analyze:
-//!    - Success → `ChangeReport::changed`. Если stderr непустой — пишем в log_dir.
-//!    - DpkgInterrupted → `dpkg --configure -a` + один retry install.
-//!    - CandidateMissing → `apt-get update` с retries + один retry install.
-//!    - OtherFailure → `Exec` с stderr_excerpt; полный stderr — в файл.
+//! 6. По `spec.state`:
+//!    - `Present` → `apt-get install …` со старой recovery-цепочкой.
+//!    - `Absent` → `apt-get remove -y <pkg>`. ENOENT-семантика через
+//!      `dpkg-query`: если пакет в `not-installed` или `config-files`-state
+//!      — NoChange (для Absent конфиги в `config-files`-state допустимы).
+//!    - `Purged` → `apt-get purge -y <pkg>`. NoChange если `dpkg-query`
+//!      возвращает `not-installed` (ни конфигов, ни бинарей).
 
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -19,7 +21,7 @@ use bosun_core::{ApplyCtx, ChangeReport, Diff, PrimitiveError, Resource};
 use super::exec::{analyze_install_result, CommandResult, CommandRunner, InstallOutcome};
 use super::lock_probe::probe_dpkg_lock;
 use super::recovery::{run_apt_update_with_retries, run_dpkg_configure_a, stderr_excerpt};
-use super::spec::AptPackageSpec;
+use super::spec::{AptPackageSpec, AptPackageState};
 
 /// Главный entry-point apply'я. Принимает trait-объект `CommandRunner`,
 /// чтобы пользоваться mock'ом в unit-тестах. В production `AptPrimitive`
@@ -45,12 +47,27 @@ pub fn run(
 
     let resource_deadline = compute_resource_deadline(ctx.deadline, spec.timeout_sec);
 
+    match spec.state {
+        AptPackageState::Present => run_install(runner, &spec, resource_deadline, ctx),
+        AptPackageState::Absent => run_remove(runner, &spec, resource_deadline, ctx, false),
+        AptPackageState::Purged => run_remove(runner, &spec, resource_deadline, ctx, true),
+    }
+}
+
+/// Install-flow (Present): сохранён один-в-один из Phase A, чтобы не сломать
+/// 948 существующих тестов.
+fn run_install(
+    runner: &dyn CommandRunner,
+    spec: &AptPackageSpec,
+    resource_deadline: Instant,
+    ctx: &ApplyCtx,
+) -> Result<ChangeReport, PrimitiveError> {
     tracing::info!(
         package = %spec.name,
         version = ?spec.version,
         "starting install",
     );
-    let install_result = install_attempt(runner, &spec, resource_deadline, &ctx.cancel)?;
+    let install_result = install_attempt(runner, spec, resource_deadline, &ctx.cancel)?;
     let outcome = analyze_install_result(&install_result);
     tracing::debug!(outcome = ?outcome, exit = ?install_result.exit_code, "install attempt result");
 
@@ -62,21 +79,21 @@ pub fn run(
             if !install_result.stderr.is_empty() {
                 let _ = write_log(&ctx.log_dir, "install", &install_result.stderr);
             }
-            Ok(ChangeReport::changed(install_success_message(&spec)))
+            Ok(ChangeReport::changed(install_success_message(spec)))
         }
         InstallOutcome::DpkgInterrupted => {
             tracing::warn!(
                 package = %spec.name,
                 "dpkg interrupted, running dpkg --configure -a",
             );
-            recover_dpkg_then_retry(runner, &spec, resource_deadline, ctx, &install_result)
+            recover_dpkg_then_retry(runner, spec, resource_deadline, ctx, &install_result)
         }
         InstallOutcome::CandidateMissing => {
             tracing::warn!(
                 package = %spec.name,
                 "candidate missing, running apt-get update",
             );
-            recover_apt_update_then_retry(runner, &spec, resource_deadline, ctx, &install_result)
+            recover_apt_update_then_retry(runner, spec, resource_deadline, ctx, &install_result)
         }
         InstallOutcome::OtherFailure => {
             let excerpt = stderr_excerpt(&install_result.stderr);
@@ -93,6 +110,152 @@ pub fn run(
                 stderr_excerpt: excerpt,
             })
         }
+    }
+}
+
+/// Remove/Purge flow.
+///
+/// `purge=true` — `apt-get purge`, иначе `apt-get remove`. Перед вызовом
+/// идёт `dpkg-query`, чтобы определить, есть ли что снимать:
+/// - `not-installed` → NoChange всегда.
+/// - `config-files` → для Purge надо чистить, для Absent — NoChange
+///   (конфиги допустимы).
+/// - что-то ещё (например, `installed`, `half-installed`,
+///   `half-configured`, `unpacked`) → выполняем команду.
+/// - `dpkg-query` exit=1 (пакет неизвестен) → NoChange.
+fn run_remove(
+    runner: &dyn CommandRunner,
+    spec: &AptPackageSpec,
+    resource_deadline: Instant,
+    ctx: &ApplyCtx,
+    purge: bool,
+) -> Result<ChangeReport, PrimitiveError> {
+    let status = query_dpkg_status(runner, spec, resource_deadline, &ctx.cancel)?;
+    if !needs_action_for_state(&status, purge) {
+        tracing::info!(
+            package = %spec.name,
+            ?status,
+            purge,
+            "no apt action needed (already in target state)",
+        );
+        return Ok(ChangeReport::no_change());
+    }
+
+    let action_word = if purge { "purge" } else { "remove" };
+    tracing::info!(
+        package = %spec.name,
+        action = action_word,
+        "starting apt remove/purge",
+    );
+
+    let cmd_result = remove_or_purge_attempt(runner, spec, resource_deadline, &ctx.cancel, purge)?;
+    if cmd_result.exit_code == Some(0) {
+        if !cmd_result.stderr.is_empty() {
+            let _ = write_log(&ctx.log_dir, action_word, &cmd_result.stderr);
+        }
+        return Ok(ChangeReport::changed(remove_success_message(spec, purge)));
+    }
+
+    let excerpt = stderr_excerpt(&cmd_result.stderr);
+    tracing::error!(
+        package = %spec.name,
+        action = action_word,
+        exit = ?cmd_result.exit_code,
+        stderr_excerpt = %excerpt,
+        "apt remove/purge failed",
+    );
+    let _ = write_log(&ctx.log_dir, action_word, &cmd_result.stderr);
+    Err(PrimitiveError::Exec {
+        reason: format!("apt-get {action_word} {} failed", spec.name),
+        exit: cmd_result.exit_code,
+        stderr_excerpt: excerpt,
+    })
+}
+
+/// Статус пакета по dpkg-query. Парсится из `db:Status-Status` (та же
+/// колонка, что у `dpkg -s`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum DpkgStatus {
+    /// Пакет полностью отсутствует (`dpkg-query` exit=1 либо
+    /// `not-installed`).
+    NotInstalled,
+    /// Пакет удалён, но конфиги остались.
+    ConfigFiles,
+    /// Пакет установлен/half-installed/half-configured/unpacked — любое
+    /// «что-то лежит на диске».
+    Other(String),
+}
+
+fn query_dpkg_status(
+    runner: &dyn CommandRunner,
+    spec: &AptPackageSpec,
+    deadline: Instant,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<DpkgStatus, PrimitiveError> {
+    // `db:Status-Status` отдаёт ровно текущую секцию статуса (Selection State
+    // мы не используем). На неизвестный пакет dpkg-query вернёт exit=1.
+    let result = runner.run(
+        "dpkg-query",
+        &["-W", "-f=${db:Status-Status}\n", &spec.name],
+        deadline,
+        cancel,
+    )?;
+    if result.exit_code != Some(0) {
+        // Не отличаем «пакета вообще нет» от иной dpkg-query ошибки —
+        // практика chiit: исходим из того, что снимать нечего, дальше
+        // remove/purge будут no-op'ом и без нашей помощи. Но чтобы не
+        // получить ложного `Exec` на каком-нибудь EPERM, возвращаем
+        // NotInstalled и пускаем команду — `apt-get remove` сам решит.
+        return Ok(DpkgStatus::NotInstalled);
+    }
+    let status_word = result.stdout.trim();
+    Ok(match status_word {
+        "not-installed" => DpkgStatus::NotInstalled,
+        "config-files" => DpkgStatus::ConfigFiles,
+        other => DpkgStatus::Other(other.to_string()),
+    })
+}
+
+fn needs_action_for_state(status: &DpkgStatus, purge: bool) -> bool {
+    match status {
+        DpkgStatus::NotInstalled => false,
+        DpkgStatus::ConfigFiles => purge,
+        DpkgStatus::Other(_) => true,
+    }
+}
+
+fn remove_or_purge_attempt(
+    runner: &dyn CommandRunner,
+    spec: &AptPackageSpec,
+    deadline: Instant,
+    cancel: &tokio_util::sync::CancellationToken,
+    purge: bool,
+) -> Result<CommandResult, PrimitiveError> {
+    let action = if purge { "purge" } else { "remove" };
+    // `-q -y -oDPkg::Lock::Timeout=30` — те же базовые флаги, что и у
+    // install-flow. `--allow-change-held-packages` не уместен (apt
+    // отказывает removing hold-пакеты, но bundle/оператор явно требуют
+    // снять, поэтому пропускаем), однако `--allow-change-held-packages`
+    // полезен и тут — иначе при наличии hold будет immediate fail.
+    let mut args: Vec<&str> = vec![
+        action,
+        "-qy",
+        "-oDPkg::Options::=--force-confdef",
+        "-oDPkg::Options::=--force-confold",
+        "-oDPkg::Lock::Timeout=30",
+    ];
+    if spec.allow_change_held {
+        args.push("--allow-change-held-packages");
+    }
+    args.push(&spec.name);
+    runner.run("apt-get", &args, deadline, cancel)
+}
+
+fn remove_success_message(spec: &AptPackageSpec, purge: bool) -> String {
+    if purge {
+        format!("purged {}", spec.name)
+    } else {
+        format!("removed {}", spec.name)
     }
 }
 
@@ -728,6 +891,7 @@ mod tests {
         let s = AptPackageSpec {
             name: "nginx".into(),
             version: Some("1.0".into()),
+            state: AptPackageState::Present,
             timeout_sec: 600,
             allow_downgrade: false,
             allow_change_held: false,
@@ -740,6 +904,7 @@ mod tests {
         let s = AptPackageSpec {
             name: "curl".into(),
             version: None,
+            state: AptPackageState::Present,
             timeout_sec: 600,
             allow_downgrade: false,
             allow_change_held: false,
@@ -789,5 +954,240 @@ mod tests {
             events.iter().any(|e| e.contains("starting install")),
             "expected 'starting install' event; got: {events:?}",
         );
+    }
+
+    /// Resource с явным state. Используется тестами Phase N.
+    fn resource_with_state(name: &str, state: &str) -> Resource {
+        let kind = ResourceKind::from_static("apt.package");
+        let id = ResourceId::new(&kind, name);
+        Resource {
+            id,
+            kind,
+            spec_version: 1,
+            payload: serde_json::json!({
+                "name": name,
+                "state": state,
+                "timeout_sec": 600_u32,
+                "allow_downgrade": false,
+                "allow_change_held": false,
+            }),
+            reload_on: Vec::new(),
+            restart_on: Vec::new(),
+            depends_on: Vec::new(),
+        }
+    }
+
+    fn cmdres_with_stdout(exit: Option<i32>, stdout: &str) -> CommandResult {
+        CommandResult {
+            exit_code: exit,
+            stdout: stdout.into(),
+            stderr: String::new(),
+        }
+    }
+
+    fn update_diff() -> Diff {
+        Diff::Update {
+            from: serde_json::json!({}),
+            to: serde_json::json!({}),
+            description: "x".into(),
+        }
+    }
+
+    #[test]
+    fn apply_absent_when_installed_invokes_apt_get_remove() {
+        let runner = MockRunner::new(vec![
+            cmdres_with_stdout(Some(0), "installed\n"), // dpkg-query
+            cmdres(Some(0), ""),                        // apt-get remove
+        ]);
+        let r = resource_with_state("snapd", "absent");
+        let tmp = tempfile::tempdir().unwrap();
+        let (_d, lock_path) = free_lock_path();
+        let ctx = make_ctx(tmp.path().to_path_buf());
+        let report = run(&runner, &lock_path, &r, &update_diff(), &ctx).unwrap();
+        assert!(report.changed);
+        assert!(report.message.contains("removed snapd"));
+        assert_eq!(runner.count_calls_to("dpkg-query", "-W"), 1);
+        assert_eq!(runner.count_calls_to("apt-get", "remove"), 1);
+        let argv = &runner.calls()[1].1;
+        assert!(argv.iter().any(|a| a == "snapd"));
+        assert!(argv.iter().any(|a| a == "-qy"));
+    }
+
+    #[test]
+    fn apply_absent_when_not_installed_no_action() {
+        let runner = MockRunner::new(vec![cmdres_with_stdout(Some(0), "not-installed\n")]);
+        let r = resource_with_state("snapd", "absent");
+        let tmp = tempfile::tempdir().unwrap();
+        let (_d, lock_path) = free_lock_path();
+        let ctx = make_ctx(tmp.path().to_path_buf());
+        let report = run(&runner, &lock_path, &r, &update_diff(), &ctx).unwrap();
+        assert!(!report.changed);
+        assert_eq!(runner.count_calls_to("dpkg-query", "-W"), 1);
+        assert_eq!(runner.count_calls_to("apt-get", "remove"), 0);
+    }
+
+    #[test]
+    fn apply_absent_when_config_files_no_action() {
+        // Конфиги остались, бинаря нет — для Absent это уже OK.
+        let runner = MockRunner::new(vec![cmdres_with_stdout(Some(0), "config-files\n")]);
+        let r = resource_with_state("snapd", "absent");
+        let tmp = tempfile::tempdir().unwrap();
+        let (_d, lock_path) = free_lock_path();
+        let ctx = make_ctx(tmp.path().to_path_buf());
+        let report = run(&runner, &lock_path, &r, &update_diff(), &ctx).unwrap();
+        assert!(!report.changed);
+        assert_eq!(runner.count_calls_to("apt-get", "remove"), 0);
+    }
+
+    #[test]
+    fn apply_purged_when_installed_invokes_apt_get_purge() {
+        let runner = MockRunner::new(vec![
+            cmdres_with_stdout(Some(0), "installed\n"),
+            cmdres(Some(0), ""),
+        ]);
+        let r = resource_with_state("needrestart", "purged");
+        let tmp = tempfile::tempdir().unwrap();
+        let (_d, lock_path) = free_lock_path();
+        let ctx = make_ctx(tmp.path().to_path_buf());
+        let report = run(&runner, &lock_path, &r, &update_diff(), &ctx).unwrap();
+        assert!(report.changed);
+        assert!(report.message.contains("purged needrestart"));
+        assert_eq!(runner.count_calls_to("apt-get", "purge"), 1);
+        assert_eq!(runner.count_calls_to("apt-get", "remove"), 0);
+    }
+
+    #[test]
+    fn apply_purged_when_config_files_invokes_purge() {
+        // Для Purge конфиги в `config-files`-state — это «остались» и
+        // надо чистить.
+        let runner = MockRunner::new(vec![
+            cmdres_with_stdout(Some(0), "config-files\n"),
+            cmdres(Some(0), ""),
+        ]);
+        let r = resource_with_state("update-notifier-common", "purged");
+        let tmp = tempfile::tempdir().unwrap();
+        let (_d, lock_path) = free_lock_path();
+        let ctx = make_ctx(tmp.path().to_path_buf());
+        let report = run(&runner, &lock_path, &r, &update_diff(), &ctx).unwrap();
+        assert!(report.changed);
+        assert_eq!(runner.count_calls_to("apt-get", "purge"), 1);
+    }
+
+    #[test]
+    fn apply_purged_when_not_installed_no_action() {
+        let runner = MockRunner::new(vec![cmdres_with_stdout(Some(0), "not-installed\n")]);
+        let r = resource_with_state("needrestart", "purged");
+        let tmp = tempfile::tempdir().unwrap();
+        let (_d, lock_path) = free_lock_path();
+        let ctx = make_ctx(tmp.path().to_path_buf());
+        let report = run(&runner, &lock_path, &r, &update_diff(), &ctx).unwrap();
+        assert!(!report.changed);
+        assert_eq!(runner.count_calls_to("apt-get", "purge"), 0);
+    }
+
+    #[test]
+    fn apply_purged_dpkg_query_unknown_pkg_no_action() {
+        // dpkg-query exit=1 → пакет неизвестен dpkg → NotInstalled →
+        // нет действия.
+        let runner = MockRunner::new(vec![cmdres_with_stdout(Some(1), "")]);
+        let r = resource_with_state("ghost-package", "purged");
+        let tmp = tempfile::tempdir().unwrap();
+        let (_d, lock_path) = free_lock_path();
+        let ctx = make_ctx(tmp.path().to_path_buf());
+        let report = run(&runner, &lock_path, &r, &update_diff(), &ctx).unwrap();
+        assert!(!report.changed);
+        assert_eq!(runner.count_calls_to("apt-get", "purge"), 0);
+    }
+
+    #[test]
+    fn apply_remove_failure_returns_exec_error() {
+        let runner = MockRunner::new(vec![
+            cmdres_with_stdout(Some(0), "installed\n"),
+            cmdres(Some(100), "E: dependency conflict"),
+        ]);
+        let r = resource_with_state("essential-pkg", "absent");
+        let tmp = tempfile::tempdir().unwrap();
+        let (_d, lock_path) = free_lock_path();
+        let ctx = make_ctx(tmp.path().to_path_buf());
+        let err = run(&runner, &lock_path, &r, &update_diff(), &ctx).unwrap_err();
+        match err {
+            PrimitiveError::Exec {
+                reason,
+                exit,
+                stderr_excerpt,
+            } => {
+                assert!(reason.contains("apt-get remove"));
+                assert_eq!(exit, Some(100));
+                assert!(stderr_excerpt.contains("dependency"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_purged_dpkg_status_other_state_invokes_purge() {
+        // Half-installed или half-configured: «что-то лежит на диске» —
+        // нужна команда.
+        let runner = MockRunner::new(vec![
+            cmdres_with_stdout(Some(0), "half-installed\n"),
+            cmdres(Some(0), ""),
+        ]);
+        let r = resource_with_state("broken-pkg", "purged");
+        let tmp = tempfile::tempdir().unwrap();
+        let (_d, lock_path) = free_lock_path();
+        let ctx = make_ctx(tmp.path().to_path_buf());
+        let report = run(&runner, &lock_path, &r, &update_diff(), &ctx).unwrap();
+        assert!(report.changed);
+        assert_eq!(runner.count_calls_to("apt-get", "purge"), 1);
+    }
+
+    #[test]
+    fn apply_remove_argv_has_no_install_flags() {
+        // Защитный тест: argv апт-апт remove не должен случайно нести
+        // --allow-downgrades (это install-only флаг).
+        let runner = MockRunner::new(vec![
+            cmdres_with_stdout(Some(0), "installed\n"),
+            cmdres(Some(0), ""),
+        ]);
+        let r = resource_with_state("snapd", "absent");
+        let tmp = tempfile::tempdir().unwrap();
+        let (_d, lock_path) = free_lock_path();
+        let ctx = make_ctx(tmp.path().to_path_buf());
+        run(&runner, &lock_path, &r, &update_diff(), &ctx).unwrap();
+        let argv = &runner.calls()[1].1;
+        assert!(!argv.iter().any(|a| a == "--allow-downgrades"));
+        assert_eq!(argv[0], "remove");
+    }
+
+    #[test]
+    fn needs_action_truth_table() {
+        // Pure-table проверка: NotInstalled → никогда. ConfigFiles → только
+        // для purge. Other → всегда.
+        assert!(!needs_action_for_state(&DpkgStatus::NotInstalled, false));
+        assert!(!needs_action_for_state(&DpkgStatus::NotInstalled, true));
+        assert!(!needs_action_for_state(&DpkgStatus::ConfigFiles, false));
+        assert!(needs_action_for_state(&DpkgStatus::ConfigFiles, true));
+        assert!(needs_action_for_state(
+            &DpkgStatus::Other("installed".into()),
+            false,
+        ));
+        assert!(needs_action_for_state(
+            &DpkgStatus::Other("half-installed".into()),
+            true,
+        ));
+    }
+
+    #[test]
+    fn remove_success_message_format() {
+        let s = AptPackageSpec {
+            name: "snapd".into(),
+            version: None,
+            state: AptPackageState::Absent,
+            timeout_sec: 600,
+            allow_downgrade: false,
+            allow_change_held: false,
+        };
+        assert_eq!(remove_success_message(&s, false), "removed snapd");
+        assert_eq!(remove_success_message(&s, true), "purged snapd");
     }
 }

@@ -2,11 +2,14 @@
 //! template(), Phase D набор runr-примитивов
 //! (`runr.service`/`runr.timer`/`runr.cgroup`), Phase E набор
 //! systemd-примитивов (`systemd.service`/`systemd.timer`), Phase G
-//! `process.signal` и Phase M `users.user`/`users.group`.
+//! `process.signal`, Phase M `users.user`/`users.group` и Phase N
+//! `file.delete`/`file.symlink` (+ `apt.package` state=absent/purged).
 
 pub mod apt_package;
 pub mod dispatch;
 pub mod file_content;
+pub mod file_delete;
+pub mod file_symlink;
 pub mod health_check;
 pub mod process_signal;
 pub mod runr_cgroup;
@@ -18,9 +21,16 @@ pub mod template;
 pub mod users_group;
 pub mod users_user;
 
-pub use apt_package::{AptPackageSpec, AptPrimitive};
+pub use apt_package::{AptPackageSpec, AptPackageState, AptPrimitive};
 pub use dispatch::RealDispatchClient;
 pub use file_content::{sha256_hex, FileContentSpec, FilePrimitive};
+pub use file_delete::{
+    decide_action_delete, Action as FileDeleteAction, FileDeletePrimitive, FileDeleteSpec,
+};
+pub use file_symlink::{
+    decide_action_symlink, Action as FileSymlinkAction, FileSymlinkPrimitive, FileSymlinkSpec,
+    SymlinkState,
+};
 pub use health_check::RealHealthCheckRunner;
 pub use process_signal::{
     build_signal_argv, ProcessSignalPrimitive, ProcessSignalRunner, ProcessSignalSpec,

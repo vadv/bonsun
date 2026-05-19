@@ -66,6 +66,31 @@ fn file_namespace(builder: &mut GlobalsBuilder) {
     ) -> starlark::Result<Value<'v>> {
         register_primitive_call("file.content", kwargs, eval)
     }
+
+    /// `file.delete(path=, recursive=False, follow_symlinks=False)` —
+    /// снять файл, симлинк или директорию. По умолчанию отказывается
+    /// удалять непустую директорию: для этого нужно `recursive=True`.
+    /// Симлинки удаляются как символические ссылки, без следования за
+    /// ними (определение типа через `symlink_metadata`).
+    fn delete<'v>(
+        #[starlark(kwargs)] kwargs: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        register_primitive_call("file.delete", kwargs, eval)
+    }
+
+    /// `file.symlink(path=, target=, state="present", force=False)` —
+    /// управление симлинком. По умолчанию `state="present"`. `force=True`
+    /// разрешает заменить существующий файл/директорию по `path`. Сама
+    /// цель `target` может указывать на несуществующий путь — chiit
+    /// сценарий pg-симлинков создаёт их до раскатки реального
+    /// дистрибутива.
+    fn symlink<'v>(
+        #[starlark(kwargs)] kwargs: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        register_primitive_call("file.symlink", kwargs, eval)
+    }
 }
 
 #[starlark_module]
@@ -685,6 +710,8 @@ fn register_primitive_call<'v>(
     let kind = match kind_str {
         "apt.package" => ResourceKind::from_static("apt.package"),
         "file.content" => ResourceKind::from_static("file.content"),
+        "file.delete" => ResourceKind::from_static("file.delete"),
+        "file.symlink" => ResourceKind::from_static("file.symlink"),
         "runr.service" => ResourceKind::from_static("runr.service"),
         "systemd.service" => ResourceKind::from_static("systemd.service"),
         "process.signal" => ResourceKind::from_static("process.signal"),

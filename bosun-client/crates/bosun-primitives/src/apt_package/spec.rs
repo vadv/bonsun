@@ -5,6 +5,25 @@
 
 use serde::Deserialize;
 
+/// Желаемое состояние пакета. Default — `Present`, чтобы существующие
+/// bundle'ы продолжали работать без явного `state`.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AptPackageState {
+    /// Пакет должен быть установлен (опционально — конкретной версии).
+    #[default]
+    Present,
+    /// Пакет должен отсутствовать (`apt-get remove -y`). Конфиги
+    /// сохраняются — для полной зачистки нужен `Purged`.
+    Absent,
+    /// Пакет должен быть полностью удалён вместе с конфигами
+    /// (`apt-get purge -y`). Соответствует chiit-кейсам
+    /// `roles/repos/repos.go` (purge update-notifier-common, snapd и т.п.)
+    /// и `roles/repos/risk.go` (purge needrestart).
+    Purged,
+}
+
 /// Спека `apt.package`, как она лежит в `Resource.payload`.
 #[derive(Deserialize, Debug, Clone)]
 pub struct AptPackageSpec {
@@ -14,6 +33,10 @@ pub struct AptPackageSpec {
     /// её через `name=version`. Если None — последнюю кандидатную.
     #[serde(default)]
     pub version: Option<String>,
+    /// Желаемое состояние. По умолчанию `Present` (backward-compat с
+    /// bundle'ами до Phase N, где `state` отсутствовал).
+    #[serde(default)]
+    pub state: AptPackageState,
     /// Per-resource дедлайн на весь install (вместе с recovery). 600 секунд
     /// хватает на тяжёлые пакеты (`postgresql`, `mariadb`, `linux-headers-*`)
     /// при медленных зеркалах.
@@ -106,5 +129,35 @@ mod tests {
         let json = serde_json::json!({ "name": "nginx", "version": serde_json::Value::Null });
         let spec: AptPackageSpec = serde_json::from_value(json).unwrap();
         assert!(spec.version.is_none());
+    }
+
+    #[test]
+    fn deserialize_default_state_is_present() {
+        // Backward-compat: bundle'ы из Phase A-M не указывают `state`, дефолт
+        // должен оставаться "установить".
+        let json = serde_json::json!({"name": "nginx"});
+        let spec: AptPackageSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec.state, AptPackageState::Present);
+    }
+
+    #[test]
+    fn deserialize_state_absent() {
+        let json = serde_json::json!({"name": "snapd", "state": "absent"});
+        let spec: AptPackageSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec.state, AptPackageState::Absent);
+    }
+
+    #[test]
+    fn deserialize_state_purged() {
+        let json = serde_json::json!({"name": "needrestart", "state": "purged"});
+        let spec: AptPackageSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(spec.state, AptPackageState::Purged);
+    }
+
+    #[test]
+    fn deserialize_state_unknown_is_error() {
+        let json = serde_json::json!({"name": "x", "state": "vanished"});
+        let err = serde_json::from_value::<AptPackageSpec>(json).unwrap_err();
+        assert!(err.to_string().contains("unknown variant"), "got: {err}");
     }
 }

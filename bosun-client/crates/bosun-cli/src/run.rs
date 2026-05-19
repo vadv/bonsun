@@ -23,10 +23,10 @@ use bosun_core::{
 use bosun_facts::FactsCollector;
 use bosun_handles::{RunrHandle, SystemdHandle};
 use bosun_primitives::{
-    dispatch::RealDispatchClient, template::render_template, AptPrimitive, FilePrimitive,
-    GroupPrimitive, ProcessSignalPrimitive, RealHealthCheckRunner, RunrCgroupPrimitive,
-    RunrServicePrimitive, RunrTimerPrimitive, SystemdServicePrimitive, SystemdTimerPrimitive,
-    UserPrimitive,
+    dispatch::RealDispatchClient, template::render_template, AptPrimitive, FileDeletePrimitive,
+    FilePrimitive, FileSymlinkPrimitive, GroupPrimitive, ProcessSignalPrimitive,
+    RealHealthCheckRunner, RunrCgroupPrimitive, RunrServicePrimitive, RunrTimerPrimitive,
+    SystemdServicePrimitive, SystemdTimerPrimitive, UserPrimitive,
 };
 use bosun_runr_client::Client as RunrClient;
 use bosun_systemd_client::BlockingSystemdManager;
@@ -424,6 +424,14 @@ fn build_primitives() -> HashMap<ResourceKind, Box<dyn Primitive>> {
         Box::new(FilePrimitive),
     );
     m.insert(
+        ResourceKind::from_static("file.delete"),
+        Box::new(FileDeletePrimitive),
+    );
+    m.insert(
+        ResourceKind::from_static("file.symlink"),
+        Box::new(FileSymlinkPrimitive),
+    );
+    m.insert(
         ResourceKind::from_static("process.signal"),
         Box::new(ProcessSignalPrimitive::with_real_runner()),
     );
@@ -689,6 +697,8 @@ mod tests {
         for kind in [
             "apt.package",
             "file.content",
+            "file.delete",
+            "file.symlink",
             "process.signal",
             "runr.service",
             "runr.timer",
@@ -703,7 +713,7 @@ mod tests {
                 "primitive {kind} not registered",
             );
         }
-        assert_eq!(m.len(), 10);
+        assert_eq!(m.len(), 12);
     }
 
     #[test]

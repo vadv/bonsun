@@ -27,7 +27,7 @@ use bosun_core::{
 pub use exec::{
     analyze_install_result, CommandResult, CommandRunner, InstallOutcome, RealCommandRunner,
 };
-pub use spec::AptPackageSpec;
+pub use spec::{AptPackageSpec, AptPackageState};
 
 /// Реализация Primitive для `apt.package`.
 ///
