@@ -151,10 +151,14 @@ impl Drop for ModuleStackGuard {
     }
 }
 
-/// Хук-функция для starlark-evaluator'а.
-struct DeadlineChecker {
-    deadline: std::time::Instant,
-    cancel: tokio_util::sync::CancellationToken,
+/// Хук-функция для starlark-evaluator'а. Срабатывает перед каждым
+/// statement'ом и прерывает выполнение, если истёк deadline или
+/// сработал cancellation token. Применяется ко всем evaluator'ам —
+/// и для entry-манифеста, и для loaded role/lib модулей; см.
+/// `install_deadline_checker`.
+pub(crate) struct DeadlineChecker {
+    pub(crate) deadline: std::time::Instant,
+    pub(crate) cancel: tokio_util::sync::CancellationToken,
 }
 
 impl<'a, 'e: 'a> starlark::eval::BeforeStmtFuncDyn<'a, 'e> for DeadlineChecker {
@@ -175,6 +179,20 @@ impl<'a, 'e: 'a> starlark::eval::BeforeStmtFuncDyn<'a, 'e> for DeadlineChecker {
         }
         Ok(())
     }
+}
+
+/// Устанавливает `DeadlineChecker` в evaluator'е. Один общий helper для
+/// entry-манифеста и для loaded модулей через `BundleLoader::parse_and_eval`:
+/// раньше loaded-модули создавались без чекера, и infinite loop в
+/// `_lib/foo.star` мог повесить run, игнорируя --deadline-sec.
+pub(crate) fn install_deadline_checker<'a, 'e>(
+    eval: &mut Evaluator<'_, 'a, 'e>,
+    deadline: std::time::Instant,
+    cancel: tokio_util::sync::CancellationToken,
+) {
+    let checker: Box<dyn starlark::eval::BeforeStmtFuncDyn> =
+        Box::new(DeadlineChecker { deadline, cancel });
+    eval.before_stmt_for_dap(checker.into());
 }
 
 /// Прочитать текущий state.
@@ -277,11 +295,7 @@ pub fn evaluate_manifest(config: EvaluatorConfig) -> Result<(), StarlarkGlueErro
     let eval_result = {
         let mut eval = Evaluator::new(&module);
         eval.set_loader(&loader);
-        let checker: Box<dyn starlark::eval::BeforeStmtFuncDyn> = Box::new(DeadlineChecker {
-            deadline,
-            cancel: cancel.clone(),
-        });
-        eval.before_stmt_for_dap(checker.into());
+        install_deadline_checker(&mut eval, deadline, cancel.clone());
         eval.eval_module(ast, &globals)
     };
 

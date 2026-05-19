@@ -219,4 +219,119 @@ apt.package(name = "curl")
             StarlarkGlueError::Syntax { .. } | StarlarkGlueError::Eval(_)
         ));
     }
+
+    /// Сборка bundle с lib-модулем под `_lib/<name>/main.star`. Используется
+    /// для проверки, что deadline-чекер применяется к loaded модулям так же,
+    /// как и к entry-манифесту.
+    fn make_bundle_with_lib(manifest_source: &str, lib_name: &str, lib_source: &str) -> Bundle {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.keep();
+        std::fs::write(
+            root.join("bundle.toml"),
+            r#"
+[bundle]
+name = "test"
+version = "0.1.0"
+requires_bosun = "^0.1"
+entry = "main.star"
+"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("main.star"), manifest_source).unwrap();
+        let lib_dir = root.join("_lib").join(lib_name);
+        std::fs::create_dir_all(&lib_dir).unwrap();
+        std::fs::write(lib_dir.join("main.star"), lib_source).unwrap();
+        Bundle::load_dir(&root).unwrap()
+    }
+
+    #[test]
+    fn deadline_aborts_infinite_loop_in_loaded_lib_module() {
+        // Регрессия H2: loaded модули раньше создавались без
+        // DeadlineChecker — бесконечный цикл в _lib/X/main.star висел
+        // вечно и игнорировал --deadline-sec.
+        //
+        // Сценарий: main.star делает `load("@lib/loopy", ...)`, lib
+        // содержит while True: pass. Ставим deadline=200ms. Ожидаем
+        // ошибку eval в пределах разумного времени.
+        let bundle = make_bundle_with_lib(
+            r#"
+load("@lib/loopy", "x")
+"#,
+            "loopy",
+            // Top-level for-loop ходит больше шагов чем before_stmt
+            // успевает увидеть, и проверяется до выхода. Используем
+            // явный «бесконечный» цикл через counter, который заведомо
+            // не завершится до deadline.
+            r#"
+x = 1
+for i in range(1000000000):
+    x = x + i
+"#,
+        );
+        let mut primitives: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
+        primitives.insert(ResourceKind::from_static("apt.package"), Box::new(MockApt));
+        let evaluator = Evaluator::new(bundle, primitives);
+        let store = Arc::new(SensitiveStore::new());
+
+        // Очень близкий deadline: 200мс с запасом на сборку.
+        let plan = PlanCtx {
+            deadline: Instant::now() + Duration::from_millis(200),
+            cancel: CancellationToken::new(),
+        };
+        let start = Instant::now();
+        let err = evaluator
+            .evaluate(NoFacts, store, default_template_fn(), plan, HashSet::new())
+            .unwrap_err();
+        let elapsed = start.elapsed();
+
+        // Должны прерваться задолго до условного «навсегда».
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "loaded module took {elapsed:?} — deadline checker не применился",
+        );
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("deadline") || msg.contains("cancelled"),
+            "expected deadline error, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn cancel_token_aborts_loaded_lib_module() {
+        // Симметричная проверка: cancellation token, как и deadline,
+        // должен прерывать loaded модуль. Заранее cancel'им и запускаем.
+        let bundle = make_bundle_with_lib(
+            r#"
+load("@lib/loopy", "x")
+"#,
+            "loopy",
+            r#"
+x = 1
+for i in range(1000000000):
+    x = x + i
+"#,
+        );
+        let mut primitives: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
+        primitives.insert(ResourceKind::from_static("apt.package"), Box::new(MockApt));
+        let evaluator = Evaluator::new(bundle, primitives);
+        let store = Arc::new(SensitiveStore::new());
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let plan = PlanCtx {
+            deadline: Instant::now() + Duration::from_secs(60),
+            cancel,
+        };
+        let start = Instant::now();
+        let err = evaluator
+            .evaluate(NoFacts, store, default_template_fn(), plan, HashSet::new())
+            .unwrap_err();
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_secs(5), "cancel не применился");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("cancelled") || msg.contains("deadline"),
+            "expected cancel error, got: {msg}",
+        );
+    }
 }

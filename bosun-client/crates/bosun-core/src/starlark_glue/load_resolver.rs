@@ -24,7 +24,8 @@ use starlark::syntax::AstModule;
 
 use crate::bundle::BundleError;
 use crate::starlark_glue::{
-    build_globals, bundle_dialect, EvalState, ModuleStackGuard, StarlarkGlueError,
+    build_globals, bundle_dialect, install_deadline_checker, EvalState, ModuleStackGuard,
+    StarlarkGlueError,
 };
 
 /// FileLoader для bundle: знает `@bosun/builtins` + `@roles/<name>` + `@lib/<name>`.
@@ -117,6 +118,14 @@ impl BundleLoader<'_> {
         {
             let mut eval = Evaluator::new(&module);
             eval.set_loader(&inner_loader);
+            // DeadlineChecker применяется и здесь — иначе бесконечный
+            // цикл в loaded `_lib/foo.star` или `roles/<r>/main.star`
+            // игнорировал бы --deadline-sec и SIGTERM, повесив весь run.
+            install_deadline_checker(
+                &mut eval,
+                self.state.plan_ctx.deadline,
+                self.state.plan_ctx.cancel.clone(),
+            );
             eval.eval_module(ast, &globals)
                 .map_err(|e| StarlarkGlueError::Eval(format!("{e}")))?;
         }
