@@ -1080,7 +1080,7 @@ impl<'v> starlark::values::StarlarkValue<'v> for HandleObject {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use super::*;
 
@@ -1122,5 +1122,288 @@ mod tests {
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
         );
         assert_eq!(args.optional_u64("content_size").unwrap(), Some(5));
+    }
+
+    // ---- yaml_to_json ----
+
+    #[test]
+    fn yaml_to_json_handles_null() {
+        // Y::Null → JSON null.
+        let v: serde_norway::Value = serde_norway::from_str("null").unwrap();
+        let out = yaml_to_json(v).unwrap();
+        assert_eq!(out, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn yaml_to_json_handles_object() {
+        // Mapping со строковыми ключами → JSON object.
+        let v: serde_norway::Value = serde_norway::from_str("a: 1\nb: two\n").unwrap();
+        let out = yaml_to_json(v).unwrap();
+        let Some(obj) = out.as_object() else {
+            panic!("expected JSON object, got {out:?}");
+        };
+        assert_eq!(obj.len(), 2);
+        assert_eq!(obj.get("a").unwrap().as_i64(), Some(1));
+        assert_eq!(obj.get("b").unwrap().as_str(), Some("two"));
+    }
+
+    #[test]
+    fn yaml_to_json_handles_array() {
+        // Sequence → JSON array, элементы рекурсивно конвертируются.
+        let v: serde_norway::Value = serde_norway::from_str("- 1\n- two\n- null\n").unwrap();
+        let out = yaml_to_json(v).unwrap();
+        let Some(arr) = out.as_array() else {
+            panic!("expected JSON array, got {out:?}");
+        };
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0].as_i64(), Some(1));
+        assert_eq!(arr[1].as_str(), Some("two"));
+        assert_eq!(arr[2], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn yaml_to_json_handles_nested_structure() {
+        // Глубина 3: map → list → map. Проверяем, что рекурсия идёт.
+        let yaml = "\
+outer:\n  - inner:\n      leaf: 42\n";
+        let v: serde_norway::Value = serde_norway::from_str(yaml).unwrap();
+        let out = yaml_to_json(v).unwrap();
+        let leaf = out
+            .get("outer")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.get("inner"))
+            .and_then(|v| v.get("leaf"))
+            .and_then(|v| v.as_i64());
+        assert_eq!(leaf, Some(42));
+    }
+
+    #[test]
+    fn yaml_to_json_handles_bool() {
+        // Y::Bool → JSON bool.
+        let v_true: serde_norway::Value = serde_norway::from_str("true").unwrap();
+        let v_false: serde_norway::Value = serde_norway::from_str("false").unwrap();
+        assert_eq!(yaml_to_json(v_true).unwrap(), serde_json::Value::Bool(true));
+        assert_eq!(
+            yaml_to_json(v_false).unwrap(),
+            serde_json::Value::Bool(false),
+        );
+    }
+
+    #[test]
+    fn yaml_to_json_non_string_key_returns_err() {
+        // Mapping с числовым ключом → Err, JSON-объекты требуют string keys.
+        let v: serde_norway::Value = serde_norway::from_str("1: foo\n").unwrap();
+        let err = yaml_to_json(v).unwrap_err();
+        assert!(
+            err.contains("must be a string"),
+            "expected error mention of string key requirement, got: {err}",
+        );
+    }
+
+    #[test]
+    fn yaml_to_json_tagged_value_returns_err() {
+        // !!Custom-теги YAML 1.1 не поддерживаются в bundle inventory.
+        let v: serde_norway::Value = serde_norway::from_str("!custom foo\n").unwrap();
+        let err = yaml_to_json(v).unwrap_err();
+        assert!(
+            err.contains("tagged"),
+            "expected error mention of tagged values, got: {err}",
+        );
+    }
+
+    // ---- resolve_service_unit_kind ----
+
+    /// Stub-FactsSource для тестов dispatcher'а: возвращает заранее
+    /// заданное `init_system` значение, всё остальное — Unknown.
+    struct StubInitFacts {
+        init_system: Option<serde_json::Value>,
+    }
+
+    impl crate::primitive::FactsSource for StubInitFacts {
+        fn get(&self, name: &str) -> crate::facts::FactValue {
+            if name == "init_system" {
+                match &self.init_system {
+                    Some(v) => crate::facts::FactValue::Known(v.clone()),
+                    None => crate::facts::FactValue::Unknown {
+                        reason: "stub: init_system unset".into(),
+                    },
+                }
+            } else {
+                crate::facts::FactValue::Unknown {
+                    reason: format!("stub: unknown '{name}'"),
+                }
+            }
+        }
+    }
+
+    /// Сборка минимального `EvalState`, в котором осмысленно только
+    /// поле `facts`. Остальные поля проинициализированы заглушками —
+    /// это нужно, чтобы тесты pure-функций не тащили реальный bundle.
+    fn make_state_with_init_system(value: Option<serde_json::Value>) -> std::rc::Rc<EvalState> {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use std::sync::Arc;
+        use tokio_util::sync::CancellationToken;
+
+        use crate::bundle::{Bundle, BundleMetadata};
+        use crate::primitive::PlanCtx;
+        use crate::registry::Registry;
+        use crate::sensitive::SensitiveStore;
+        use crate::starlark_glue::default_template_fn;
+
+        let bundle = Bundle {
+            metadata: BundleMetadata {
+                name: "test".into(),
+                version: "0.1.0".into(),
+                description: None,
+                requires_bosun: "^0.1".into(),
+                entry: "main.star".into(),
+                inventory: Default::default(),
+                tags: Default::default(),
+            },
+            root: PathBuf::from("/tmp/nonexistent"),
+            entry: PathBuf::from("/tmp/nonexistent/main.star"),
+        };
+        Rc::new(EvalState {
+            bundle: Rc::new(bundle),
+            primitives: Rc::new(HashMap::new()),
+            facts: Rc::new(StubInitFacts { init_system: value }),
+            sensitive: Arc::new(SensitiveStore::new()),
+            registry: Rc::new(RefCell::new(Registry::new())),
+            plan_ctx: PlanCtx {
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+                cancel: CancellationToken::new(),
+            },
+            errors: RefCell::new(Vec::new()),
+            template_fn: default_template_fn(),
+            tags: Default::default(),
+            current_module: RefCell::new(Vec::new()),
+            inventory_cache: RefCell::new(HashMap::new()),
+        })
+    }
+
+    #[test]
+    fn resolve_service_unit_kind_for_systemd_returns_systemd_service() {
+        let state = make_state_with_init_system(Some(serde_json::json!("systemd")));
+        let kind = resolve_service_unit_kind(&state).unwrap();
+        assert_eq!(kind, "systemd.service");
+    }
+
+    #[test]
+    fn resolve_service_unit_kind_for_mixed_returns_systemd_service() {
+        // На смешанной ноде `service.unit` идёт через systemd — это
+        // explicit правило mixed-systemd-runr fact value.
+        let state = make_state_with_init_system(Some(serde_json::json!("mixed-systemd-runr")));
+        let kind = resolve_service_unit_kind(&state).unwrap();
+        assert_eq!(kind, "systemd.service");
+    }
+
+    #[test]
+    fn resolve_service_unit_kind_for_runr_returns_runr_service() {
+        let state = make_state_with_init_system(Some(serde_json::json!("runr")));
+        let kind = resolve_service_unit_kind(&state).unwrap();
+        assert_eq!(kind, "runr.service");
+    }
+
+    #[test]
+    fn resolve_service_unit_kind_for_unknown_init_returns_err() {
+        // Любой непредусмотренный init → ошибка с упоминанием init-имени
+        // в сообщении (важно для оператора, который видит unsupported).
+        let state = make_state_with_init_system(Some(serde_json::json!("openrc")));
+        let err = resolve_service_unit_kind(&state).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("openrc"),
+            "expected unsupported init name in error, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn resolve_service_unit_kind_for_missing_fact_returns_err() {
+        // Если init_system не собран — ошибка с упоминанием fact-имени,
+        // чтобы оператор понял что починить (facts collector).
+        let state = make_state_with_init_system(None);
+        let err = resolve_service_unit_kind(&state).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("init_system"),
+            "expected fact name in error, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn resolve_service_unit_kind_for_non_string_fact_returns_err() {
+        // init_system как число — мисконфиг сборщика фактов, должен
+        // упасть с явным сообщением «not a string».
+        let state = make_state_with_init_system(Some(serde_json::json!(42)));
+        let err = resolve_service_unit_kind(&state).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("not a string"),
+            "expected 'not a string' in error, got: {msg}",
+        );
+    }
+
+    // ---- SERVICE_UNIT_ALLOWED_KWARGS ----
+    //
+    // Сам список покрыт реакцией dispatcher'а. Прямые тесты на
+    // reject_unexpected_service_unit_kwargs требуют Starlark heap для
+    // создания Value (Dict), что покрывается через интеграционный slot —
+    // ниже даны property-тесты на сам список ключей, чтобы regression
+    // в составе списка не прошла молча.
+
+    #[test]
+    fn service_unit_allowed_kwargs_contains_core_keys() {
+        // Ядро — что хотя бы name/state присутствуют, иначе dispatcher
+        // отвергнет все service.unit вызовы.
+        assert!(SERVICE_UNIT_ALLOWED_KWARGS.contains(&"name"));
+        assert!(SERVICE_UNIT_ALLOWED_KWARGS.contains(&"state"));
+    }
+
+    #[test]
+    fn service_unit_allowed_kwargs_does_not_contain_runr_specific() {
+        // runr-only флаги должны вызываться через runr.service(...)
+        // напрямую — dispatcher их не пропускает.
+        assert!(!SERVICE_UNIT_ALLOWED_KWARGS.contains(&"cgroup_procs_path"));
+    }
+
+    #[test]
+    fn service_unit_allowed_kwargs_does_not_contain_systemd_specific() {
+        // systemd-only флаги должны вызываться через systemd.service(...).
+        assert!(!SERVICE_UNIT_ALLOWED_KWARGS.contains(&"condition_path_exists"));
+        assert!(!SERVICE_UNIT_ALLOWED_KWARGS.contains(&"drop_in"));
+    }
+
+    // ---- resolve_merge_strategy ----
+
+    #[test]
+    fn resolve_merge_strategy_explicit_replace() {
+        // Explicit "replace" → MergeStrategy::Replace.
+        let strat = resolve_merge_strategy("replace").unwrap();
+        assert_eq!(strat, MergeStrategy::Replace);
+    }
+
+    #[test]
+    fn resolve_merge_strategy_explicit_deep_map_replace_list() {
+        let strat = resolve_merge_strategy("deep_map_replace_list").unwrap();
+        assert_eq!(strat, MergeStrategy::DeepMapReplaceList);
+    }
+
+    #[test]
+    fn resolve_merge_strategy_explicit_deep_map_append_list() {
+        let strat = resolve_merge_strategy("deep_map_append_list").unwrap();
+        assert_eq!(strat, MergeStrategy::DeepMapAppendList);
+    }
+
+    #[test]
+    fn resolve_merge_strategy_unknown_returns_err() {
+        // Опечатка в имени стратегии → Err, сообщение содержит имя.
+        let err = resolve_merge_strategy("deep_map_smart_merge").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("deep_map_smart_merge"),
+            "error should mention unknown strategy name, got: {msg}",
+        );
     }
 }
