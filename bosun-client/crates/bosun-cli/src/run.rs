@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bosun_core::{
-    defers::{replay_with_health_check, Journal, ReplayReport},
+    defers::{replay_with_health_check, DispatchClient, Journal, ReplayReport},
     ApplyCtxBuilder, ApplyOpts, ApplyReport, Bundle, Evaluator, FactValue, HealthCheckRunner,
     Orchestrator, Outcome, PlanCtx, PlanReport, Primitive, ResourceKind, SensitiveStore,
     TemplateFn,
@@ -229,10 +229,16 @@ pub fn run(args: &ApplyArgs) -> i32 {
     // Phase J: pre-replay по journal'у до evaluate. Так оператор
     // гарантированно получает успех на defer'ы, оставшиеся с прошлого
     // прогона, до того как evaluate/apply начнёт enqueue'ить новые.
+    //
+    // Под `--dry-run` replay не запускается: dry-run обещает оператору
+    // read-only inspection, а dispatcher реально дёргает runr/systemd и
+    // удаляет файлы из журнала. Pending defer'ы остаются нетронутыми и
+    // видны через `bosun status`.
     let dispatcher = RealDispatchClient::new(runr_handle.clone(), systemd_handle.clone());
     let mut replay_runs: u32 = 0;
     let mut replay_stats = DeferReplayStats::default();
-    if let Some(report) = run_replay_phase(
+    if let Some(report) = maybe_run_replay_phase(
+        args.dry_run,
         &defers,
         &dispatcher,
         health_check_runner.as_ref(),
@@ -348,7 +354,13 @@ pub fn run(args: &ApplyArgs) -> i32 {
     // которые сам apply enqueue'нул, если они теперь могут быть выполнены
     // (например, validate прошёл с предыдущего цикла, но сервис был
     // unavailable; теперь handle поднялся).
-    if let Some(report) = run_replay_phase(
+    //
+    // Под `--dry-run` post-replay тоже отключён: симметрия с pre-replay
+    // нужна, потому что апплай в этом режиме сводился к plan-only и не
+    // enqueue'ил ничего нового — выполнять старые defer'ы тем более
+    // нельзя без явного согласия оператора.
+    if let Some(report) = maybe_run_replay_phase(
+        args.dry_run,
         &defers,
         &dispatcher,
         health_check_runner.as_ref(),
@@ -639,16 +651,28 @@ fn init_system_requires_runr(value: Option<&str>) -> bool {
     matches!(value, Some("runr") | Some("mixed-systemd-runr"))
 }
 
-/// Прогон одной фазы replay. Возвращает `Some(report)` если list_sorted
-/// прошёл, `None` если journal недоступен (тогда метрики не двигаем —
+/// Запустить replay-фазу, если режим не dry-run. Под `--dry-run` пишет
+/// info-лог и возвращает `None`: журнал defers не читается на исполнение,
+/// никакой реальной мутации systemd/runr и журнала не происходит.
+///
+/// Возвращает `Some(report)` если list_sorted прошёл, `None` если фаза
+/// пропущена (dry-run) или journal недоступен (тогда метрики не двигаем —
 /// post-mortem из tracing-логов виднее).
-fn run_replay_phase(
+fn maybe_run_replay_phase<C: DispatchClient + ?Sized>(
+    dry_run: bool,
     journal: &Journal,
-    dispatcher: &RealDispatchClient,
+    dispatcher: &C,
     health: &dyn HealthCheckRunner,
     cancel: &CancellationToken,
     phase: &'static str,
 ) -> Option<ReplayReport> {
+    if dry_run {
+        tracing::info!(
+            phase = phase,
+            "dry-run: skipping defer replay (read-only inspection)",
+        );
+        return None;
+    }
     match replay_with_health_check(journal, dispatcher, health, cancel) {
         Ok(report) => {
             tracing::info!(
@@ -814,5 +838,136 @@ mod tests {
         // Unknown → init_system_value возвращает None.
         let v = init_system_value(&snapshot);
         assert_eq!(v, None);
+    }
+
+    /// Регрессия: `bosun apply --dry-run` не должен трогать журнал defers.
+    ///
+    /// До фикса pre-replay и post-replay фазы запускались независимо от
+    /// флага, поэтому dry-run мог реально дёрнуть systemd/runr и удалить
+    /// файл из журнала. Эти тесты прикрывают возврат к старому поведению.
+    mod dry_run_replay_gate {
+        use std::cell::Cell;
+
+        use bosun_core::defers::{
+            make_id, DeferAction, DeferEntry, DeferPriority, DispatchClient, DispatchError,
+            Journal, CURRENT_SPEC_VERSION,
+        };
+        use bosun_core::NoopHealthCheckRunner;
+        use chrono::Utc;
+        use tempfile::TempDir;
+        use tokio_util::sync::CancellationToken;
+
+        use super::*;
+
+        /// Диспатчер-счётчик: фиксирует попытки реального dispatch'а.
+        /// Возвращает Ok, чтобы при попадании в replay запись считалась
+        /// выполненной — тест явно ловит «вызов вообще произошёл».
+        struct CountingDispatcher {
+            calls: Cell<u32>,
+        }
+
+        impl CountingDispatcher {
+            fn new() -> Self {
+                Self {
+                    calls: Cell::new(0),
+                }
+            }
+            fn calls(&self) -> u32 {
+                self.calls.get()
+            }
+        }
+
+        impl DispatchClient for CountingDispatcher {
+            fn dispatch(&self, _entry: &DeferEntry) -> Result<(), DispatchError> {
+                self.calls.set(self.calls.get() + 1);
+                Ok(())
+            }
+        }
+
+        fn make_pending_entry() -> DeferEntry {
+            let action = DeferAction::Restart;
+            DeferEntry {
+                spec_version: CURRENT_SPEC_VERSION,
+                id: make_id("systemd", &action, "nginx.service"),
+                action,
+                init_system: "systemd".to_string(),
+                target: "nginx.service".to_string(),
+                validate_cmd: None,
+                health_check: None,
+                priority: DeferPriority::Restart,
+                enqueued_at: Utc::now(),
+                enqueued_by: vec![],
+                attempt_count: 0,
+                max_attempts: 3,
+            }
+        }
+
+        fn count_pending(journal: &Journal) -> usize {
+            journal.list_sorted().unwrap().len()
+        }
+
+        #[test]
+        fn dry_run_true_skips_replay_and_keeps_journal_intact() {
+            let tmp = TempDir::new().unwrap();
+            let journal = Journal::open(tmp.path()).unwrap();
+            journal.enqueue(make_pending_entry()).unwrap();
+            assert_eq!(
+                count_pending(&journal),
+                1,
+                "fixture: defer должен быть enqueue'нут",
+            );
+
+            let dispatcher = CountingDispatcher::new();
+            let cancel = CancellationToken::new();
+            let report = maybe_run_replay_phase(
+                true,
+                &journal,
+                &dispatcher,
+                &NoopHealthCheckRunner,
+                &cancel,
+                "pre",
+            );
+
+            assert!(
+                report.is_none(),
+                "dry-run должен возвращать None (фаза пропущена)",
+            );
+            assert_eq!(
+                dispatcher.calls(),
+                0,
+                "под --dry-run dispatch не должен вызываться",
+            );
+            assert_eq!(
+                count_pending(&journal),
+                1,
+                "файл defer'а должен остаться на месте",
+            );
+        }
+
+        #[test]
+        fn dry_run_false_executes_replay_and_consumes_journal() {
+            // Симметричный sanity-check: при выключенном dry-run путь
+            // прежний, dispatcher вызывается и файл удаляется. Защита от
+            // случайного «всегда пропускаем».
+            let tmp = TempDir::new().unwrap();
+            let journal = Journal::open(tmp.path()).unwrap();
+            journal.enqueue(make_pending_entry()).unwrap();
+
+            let dispatcher = CountingDispatcher::new();
+            let cancel = CancellationToken::new();
+            let report = maybe_run_replay_phase(
+                false,
+                &journal,
+                &dispatcher,
+                &NoopHealthCheckRunner,
+                &cancel,
+                "post",
+            );
+
+            let report = report.unwrap();
+            assert_eq!(report.executed, 1);
+            assert_eq!(dispatcher.calls(), 1);
+            assert_eq!(count_pending(&journal), 0, "запись должна быть удалена");
+        }
     }
 }
