@@ -129,12 +129,28 @@ pub fn run(args: &ApplyArgs) -> i32 {
         Ok(b) => b,
         Err(e) => {
             tracing::error!(error = %e, "bundle load failed");
+            write_failure_metric(
+                &args.metric_file,
+                &version,
+                started,
+                started_utc,
+                exit_code::EVAL_ERROR,
+                Vec::new(),
+            );
             return exit_code::EVAL_ERROR;
         }
     };
 
     if let Err(e) = bundle.check_compatibility(&version) {
         tracing::error!(error = %e, "bundle requires different bosun version");
+        write_failure_metric(
+            &args.metric_file,
+            &version,
+            started,
+            started_utc,
+            exit_code::EVAL_ERROR,
+            Vec::new(),
+        );
         return exit_code::EVAL_ERROR;
     }
 
@@ -181,6 +197,14 @@ pub fn run(args: &ApplyArgs) -> i32 {
         Ok(j) => Arc::new(j),
         Err(e) => {
             tracing::error!(error = %e, "failed to open defer journal");
+            write_failure_metric(
+                &args.metric_file,
+                &version,
+                started,
+                started_utc,
+                exit_code::CLI_ENV_ERROR,
+                build_fact_states(&facts),
+            );
             return exit_code::CLI_ENV_ERROR;
         }
     };
@@ -264,6 +288,14 @@ pub fn run(args: &ApplyArgs) -> i32 {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(error = %e, "manifest evaluation failed");
+            write_failure_metric(
+                &args.metric_file,
+                &version,
+                started,
+                started_utc,
+                exit_code::EVAL_ERROR,
+                build_fact_states(&facts),
+            );
             return exit_code::EVAL_ERROR;
         }
     };
@@ -311,6 +343,14 @@ pub fn run(args: &ApplyArgs) -> i32 {
             }
             Err(e) => {
                 tracing::error!(error = %e, "plan failed");
+                write_failure_metric(
+                    &args.metric_file,
+                    &version,
+                    started,
+                    started_utc,
+                    exit_code::EVAL_ERROR,
+                    build_fact_states(&facts),
+                );
                 return exit_code::EVAL_ERROR;
             }
         }
@@ -345,6 +385,14 @@ pub fn run(args: &ApplyArgs) -> i32 {
             }
             Err(e) => {
                 tracing::error!(error = %e, "apply failed");
+                write_failure_metric(
+                    &args.metric_file,
+                    &version,
+                    started,
+                    started_utc,
+                    exit_code::EVAL_ERROR,
+                    build_fact_states(&facts),
+                );
                 return exit_code::EVAL_ERROR;
             }
         }
@@ -480,6 +528,49 @@ fn build_primitives() -> HashMap<ResourceKind, Box<dyn Primitive>> {
         Box::new(GroupPrimitive::with_real_backend()),
     );
     m
+}
+
+/// Записать «провальный» снимок метрики на early-exit пути. Нужен после
+/// bootstrap (когда `metric_file` директория уже создана) и до того, как
+/// основной flow дойдёт до своего финального вызова `metric::write_atomic`.
+///
+/// Алертинг bosun ставится на `bosun_last_run_exit_code` и
+/// `bosun_last_attempt_timestamp_seconds`. Без этого helper'а early-return
+/// после bundle/version/journal/eval ошибки оставлял в textfile collector'е
+/// результат прошлого успешного прогона — alert молчал, оператор не видел
+/// поломки, пока следующий нормальный прогон не перезаписал бы файл.
+///
+/// `fact_states` принимаем извне: до создания `FactsCollector` (bundle load,
+/// version check) передаём `Vec::new()`, после — `build_fact_states(&facts)`.
+fn write_failure_metric(
+    metric_file: &Path,
+    version: &str,
+    started: Instant,
+    started_utc: i64,
+    exit: i32,
+    fact_states: Vec<FactStateEntry>,
+) {
+    let snapshot = MetricSnapshot {
+        version: version.to_string(),
+        exit_code: exit,
+        duration_sec: started.elapsed().as_secs_f64(),
+        started_at_utc: started_utc,
+        attempted_at_utc: chrono::Utc::now().timestamp(),
+        resources_changed: 0,
+        resources_unchanged: 0,
+        resources_failed: 0,
+        resources_deferred: 0,
+        resources_interrupted: 0,
+        fact_states,
+        defers_pending: 0,
+        defers_replay_stats: DeferReplayStats::default(),
+        defers_replay_runs: 0,
+        runr_reachable: None,
+        systemd_reachable: None,
+    };
+    if let Err(e) = metric::write_atomic(metric_file, &snapshot) {
+        tracing::warn!(error = %e, "failed to write failure metric file");
+    }
 }
 
 fn build_fact_states(collector: &FactsCollector) -> Vec<FactStateEntry> {
