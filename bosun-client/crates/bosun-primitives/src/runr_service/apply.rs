@@ -70,7 +70,16 @@ pub fn run(
         });
     };
 
-    // 1. Throttle daemon_reload.
+    // 1. Throttle daemon_reload — один вызов на apply.
+    //
+    // В отличие от systemd (где есть `Unit.NeedDaemonReload` property,
+    // см. `SystemdHandle::needs_daemon_reload`), runr HTTP API не
+    // экспонирует «нужен ли reload»: ни в `GET /api/v1/daemon/info`,
+    // ни на уровне отдельного unit'а. Поэтому read-before-write здесь
+    // ограничен throttle'ом: первый ресурс в apply'е вызывает reload,
+    // остальные пропускают. Дальнейшее снижение нагрузки требует
+    // расширения runr HTTP API (новый endpoint типа
+    // `GET /api/v1/units/needs-reload`).
     if !ctx.runr_daemon_reload_done.swap(true, Ordering::AcqRel) {
         tracing::debug!(unit = %spec.name, "calling runr.daemon_reload (first resource in apply)");
         match runr.daemon_reload() {
