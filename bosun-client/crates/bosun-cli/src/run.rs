@@ -24,7 +24,8 @@ use bosun_facts::FactsCollector;
 use bosun_handles::{RunrHandle, SystemdHandle};
 use bosun_primitives::{
     dispatch::RealDispatchClient, template::render_template, AptPrimitive, FilePrimitive,
-    ProcessSignalPrimitive, RealHealthCheckRunner,
+    ProcessSignalPrimitive, RealHealthCheckRunner, RunrCgroupPrimitive, RunrServicePrimitive,
+    RunrTimerPrimitive, SystemdServicePrimitive, SystemdTimerPrimitive,
 };
 use bosun_runr_client::Client as RunrClient;
 use bosun_systemd_client::BlockingSystemdManager;
@@ -425,6 +426,26 @@ fn build_primitives() -> HashMap<ResourceKind, Box<dyn Primitive>> {
         ResourceKind::from_static("process.signal"),
         Box::new(ProcessSignalPrimitive::with_real_runner()),
     );
+    m.insert(
+        ResourceKind::from_static("runr.service"),
+        Box::new(RunrServicePrimitive),
+    );
+    m.insert(
+        ResourceKind::from_static("runr.timer"),
+        Box::new(RunrTimerPrimitive),
+    );
+    m.insert(
+        ResourceKind::from_static("runr.cgroup"),
+        Box::new(RunrCgroupPrimitive),
+    );
+    m.insert(
+        ResourceKind::from_static("systemd.service"),
+        Box::new(SystemdServicePrimitive),
+    );
+    m.insert(
+        ResourceKind::from_static("systemd.timer"),
+        Box::new(SystemdTimerPrimitive),
+    );
     m
 }
 
@@ -654,12 +675,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_primitives_registers_apt_file_and_process_signal() {
+    fn build_primitives_registers_all_primitives() {
         let m = build_primitives();
-        assert!(m.contains_key(&ResourceKind::from_static("apt.package")));
-        assert!(m.contains_key(&ResourceKind::from_static("file.content")));
-        assert!(m.contains_key(&ResourceKind::from_static("process.signal")));
-        assert_eq!(m.len(), 3);
+        for kind in [
+            "apt.package",
+            "file.content",
+            "process.signal",
+            "runr.service",
+            "runr.timer",
+            "runr.cgroup",
+            "systemd.service",
+            "systemd.timer",
+        ] {
+            assert!(
+                m.contains_key(&ResourceKind::from_static(kind)),
+                "primitive {kind} not registered",
+            );
+        }
+        assert_eq!(m.len(), 8);
     }
 
     #[test]
