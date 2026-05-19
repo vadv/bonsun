@@ -6,7 +6,7 @@
 //! с design'ом из spec (секция «inv в Starlark») и упрощает миграцию между
 //! Starlark-evaluator'ом и шаблонами.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use minijinja::{Environment, UndefinedBehavior};
 
@@ -33,8 +33,17 @@ pub enum TemplateError {
     UndefinedVariable { file: String, message: String },
     #[error("render error in {file}: {message}")]
     Render { file: String, message: String },
-    #[error("path traversal denied: '{0}' escapes templates root")]
-    PathTraversal(String),
+    #[error("path traversal denied: '{path}' — {reason}")]
+    PathTraversal { path: String, reason: String },
+}
+
+impl TemplateError {
+    fn traversal(path: &str, reason: &'static str) -> Self {
+        Self::PathTraversal {
+            path: path.to_string(),
+            reason: reason.to_string(),
+        }
+    }
 }
 
 /// Отрендерить шаблон, лежащий по пути `templates_root + relative_path`.
@@ -98,41 +107,100 @@ pub fn render_template(
         })
 }
 
-/// Резолв пути: defense-in-depth от `../` в relative_path.
-/// После канонизации проверяем, что путь лежит под templates_root.
+/// Резолв пути: defense-in-depth против path-traversal и symlink-escape.
+///
+/// Проверки (по порядку):
+/// 1. relative_path не пустой, без NUL-байта.
+/// 2. relative_path не абсолютный — иначе `Path::join` отбросит templates_root.
+/// 3. Ни один сегмент не равен `..` — иначе можно выйти из templates_root
+///    через `Path::join` нормализацию.
+/// 4. После `canonicalize` обоих путей kандидат должен начинаться с
+///    canonical templates_root — это ловит хитрые случаи через `.` или
+///    повторные слэши.
+/// 5. `symlink_metadata` candidate'а: если запись — symlink, отказываем.
+///    Symlink'и в templates/ запрещены, чтобы манифест не мог через
+///    `templates/x → /etc/shadow` прочитать произвольный файл.
 fn resolve_path(templates_root: &Path, relative_path: &str) -> Result<PathBuf, TemplateError> {
-    let candidate = templates_root.join(relative_path);
-    // Если родителя нет, обрабатываем как FileNotFound — на этом уровне
-    // достаточно: open сам выдаст NotFound при read_to_string.
-
-    // Проверяем path-traversal без необходимости canonicalize (файла
-    // может ещё не быть; canonicalize упадёт). Достаточно того, что
-    // в relative_path не было `..` сверх templates_root.
-    let normalized = normalize_relative(relative_path);
-    if normalized.is_empty() {
-        return Err(TemplateError::PathTraversal(relative_path.to_string()));
+    if relative_path.is_empty() {
+        return Err(TemplateError::traversal(relative_path, "empty path"));
+    }
+    if relative_path.contains('\0') {
+        return Err(TemplateError::traversal(relative_path, "nul byte in path"));
     }
 
-    Ok(candidate)
-}
-
-/// Простая проверка: если relative_path после нормализации `..` сегментов
-/// не выходит за templates_root, возвращаем нормализованный путь как строку.
-/// Иначе — пустая строка (caller отдаёт PathTraversal).
-fn normalize_relative(rel: &str) -> String {
-    let mut stack: Vec<&str> = Vec::new();
-    for segment in rel.split('/') {
-        match segment {
-            "" | "." => {}
-            ".." => {
-                if stack.pop().is_none() {
-                    return String::new();
-                }
+    let rel = Path::new(relative_path);
+    if rel.is_absolute() {
+        return Err(TemplateError::traversal(
+            relative_path,
+            "absolute paths not allowed",
+        ));
+    }
+    for component in rel.components() {
+        match component {
+            Component::ParentDir => {
+                return Err(TemplateError::traversal(
+                    relative_path,
+                    "'..' segments not allowed",
+                ));
             }
-            other => stack.push(other),
+            Component::Prefix(_) | Component::RootDir => {
+                return Err(TemplateError::traversal(
+                    relative_path,
+                    "absolute path components not allowed",
+                ));
+            }
+            Component::CurDir | Component::Normal(_) => {}
         }
     }
-    stack.join("/")
+
+    let candidate = templates_root.join(rel);
+
+    // Канонизация позволит обнаружить «boundary escape» — например, если
+    // templates_root сам по себе содержит symlink и кандидат через него
+    // ведёт наружу. Канонизация требует существования файла; если файла
+    // нет — отдаём NotFound стандартным путём через read_to_string.
+    let canonical_candidate = match std::fs::canonicalize(&candidate) {
+        Ok(p) => p,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Файла нет — read_to_string выдаст FileNotFound. До этого
+            // ещё проверим, что symlink-родитель кандидата не уходит за
+            // templates_root. Для простоты: тут не делаем дополнительный
+            // partial-canonicalize; read_to_string сам вернёт ошибку.
+            return Ok(candidate);
+        }
+        Err(e) => {
+            return Err(TemplateError::Io {
+                path: candidate.to_string_lossy().into_owned(),
+                source: e,
+            });
+        }
+    };
+    let canonical_root = std::fs::canonicalize(templates_root).map_err(|e| TemplateError::Io {
+        path: templates_root.to_string_lossy().into_owned(),
+        source: e,
+    })?;
+    if !canonical_candidate.starts_with(&canonical_root) {
+        return Err(TemplateError::traversal(
+            relative_path,
+            "resolved path escapes templates root",
+        ));
+    }
+
+    // symlink_metadata на сам candidate, чтобы поймать симлинк именно в
+    // листовом узле. Промежуточные symlink'и уже отсечены сравнением
+    // canonical-путей выше.
+    let lmeta = std::fs::symlink_metadata(&candidate).map_err(|e| TemplateError::Io {
+        path: candidate.to_string_lossy().into_owned(),
+        source: e,
+    })?;
+    if lmeta.file_type().is_symlink() {
+        return Err(TemplateError::traversal(
+            relative_path,
+            "symlink in templates dir not allowed",
+        ));
+    }
+
+    Ok(canonical_candidate)
 }
 
 /// Построить контекст рендера: `{ "inv": inv_with_facts_merged_under_facts_key }`.
@@ -272,7 +340,129 @@ mod tests {
             &serde_json::json!({}),
         )
         .unwrap_err();
-        assert!(matches!(err, TemplateError::PathTraversal(_)));
+        assert!(matches!(err, TemplateError::PathTraversal { .. }));
+    }
+
+    #[test]
+    fn template_rejects_absolute_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = render_template(
+            tmp.path(),
+            "/etc/shadow",
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+        )
+        .unwrap_err();
+        match err {
+            TemplateError::PathTraversal { path, reason } => {
+                assert_eq!(path, "/etc/shadow");
+                assert!(reason.contains("absolute"));
+            }
+            other => panic!("expected PathTraversal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn template_rejects_parent_dir_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = render_template(
+            tmp.path(),
+            "../../etc/shadow",
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+        )
+        .unwrap_err();
+        match err {
+            TemplateError::PathTraversal { reason, .. } => {
+                assert!(reason.contains("'..'"));
+            }
+            other => panic!("expected PathTraversal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn template_rejects_nul_byte_in_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = render_template(
+            tmp.path(),
+            "a\0b.j2",
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+        )
+        .unwrap_err();
+        match err {
+            TemplateError::PathTraversal { reason, .. } => assert!(reason.contains("nul byte")),
+            other => panic!("expected PathTraversal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn template_rejects_symlink_at_leaf() {
+        // Symlink на файл ВНЕ templates root. canonical-сравнение должно
+        // отсечь это как «escapes templates root», даже без проверки
+        // is_symlink, потому что resolved path не под root.
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tmp.path().join("outside-secret");
+        std::fs::write(&outside, "secret data").unwrap();
+        let templates_root = tmp.path().join("templates");
+        std::fs::create_dir_all(&templates_root).unwrap();
+        let link = templates_root.join("alias.j2");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let err = render_template(
+            &templates_root,
+            "alias.j2",
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+        )
+        .unwrap_err();
+        match err {
+            TemplateError::PathTraversal { reason, .. } => {
+                assert!(
+                    reason.contains("symlink") || reason.contains("escapes"),
+                    "got: {reason}"
+                );
+            }
+            other => panic!("expected PathTraversal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn template_rejects_symlink_pointing_inside_root() {
+        // Symlink на файл ВНУТРИ templates root. canonical-проверка не
+        // поймает (resolved path под root), но is_symlink на leaf'е поймает.
+        // Гарантирует, что любой symlink в templates/ запрещён.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real.j2");
+        std::fs::write(&real, "real body").unwrap();
+        let link = tmp.path().join("link.j2");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let err = render_template(
+            tmp.path(),
+            "link.j2",
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+        )
+        .unwrap_err();
+        match err {
+            TemplateError::PathTraversal { reason, .. } => assert!(reason.contains("symlink")),
+            other => panic!("expected PathTraversal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn template_accepts_normal_relative() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_template(tmp.path(), "nginx.conf.j2", "ok");
+        let out = render_template(
+            tmp.path(),
+            "nginx.conf.j2",
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+        )
+        .unwrap();
+        assert_eq!(out, "ok");
     }
 
     #[test]
@@ -290,30 +480,19 @@ mod tests {
     }
 
     #[test]
-    fn normalize_relative_handles_dot_and_slash_segments() {
-        assert_eq!(normalize_relative("a/b"), "a/b");
-        assert_eq!(normalize_relative("./a/b"), "a/b");
-        assert_eq!(normalize_relative("a//b"), "a/b");
-        assert_eq!(normalize_relative("a/./b"), "a/b");
-    }
-
-    #[test]
-    fn normalize_relative_pops_dotdot_within_root() {
-        assert_eq!(normalize_relative("a/../b"), "b");
-        assert_eq!(normalize_relative("a/b/../c"), "a/c");
-    }
-
-    #[test]
-    fn normalize_relative_returns_empty_on_escape() {
-        assert!(normalize_relative("..").is_empty());
-        assert!(normalize_relative("../a").is_empty());
-        assert!(normalize_relative("a/../../b").is_empty());
-    }
-
-    #[test]
-    fn normalize_relative_empty_input_is_empty() {
-        // Пустая строка тоже трактуется как path-traversal: рендерить нечего.
-        assert!(normalize_relative("").is_empty());
+    fn template_empty_relative_path_is_traversal_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = render_template(
+            tmp.path(),
+            "",
+            &serde_json::json!({}),
+            &serde_json::json!({}),
+        )
+        .unwrap_err();
+        match err {
+            TemplateError::PathTraversal { reason, .. } => assert!(reason.contains("empty")),
+            other => panic!("expected PathTraversal, got {other:?}"),
+        }
     }
 
     #[test]

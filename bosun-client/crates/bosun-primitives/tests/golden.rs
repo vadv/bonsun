@@ -72,7 +72,7 @@ fn error_variant(e: &TemplateError) -> &'static str {
         TemplateError::Syntax { .. } => "Syntax",
         TemplateError::UndefinedVariable { .. } => "UndefinedVariable",
         TemplateError::Render { .. } => "Render",
-        TemplateError::PathTraversal(_) => "PathTraversal",
+        TemplateError::PathTraversal { .. } => "PathTraversal",
         // non_exhaustive: будущие варианты упадут в тесте, не молча совпадая
         // с произвольным variant'ом из expected_kind.
         _ => "Unknown",
