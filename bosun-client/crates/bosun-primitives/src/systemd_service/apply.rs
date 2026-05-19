@@ -287,9 +287,23 @@ fn collect_notify_sources(
     out
 }
 
-/// Маппинг `SystemdError` → `PrimitiveError`. Transport/bus/io-ошибки —
-/// deferrable; semantic-ошибки systemd (NoSuchUnit, AuthorizationDenied,
-/// JobFailed, RestartNotObserved) — non-deferrable.
+/// Маппинг `SystemdError` → `PrimitiveError`. Таблица решает, попадёт ли
+/// ресурс в `Outcome::Deferred` (retry на следующем цикле) или сразу в
+/// `Outcome::Failed`:
+///
+/// | SystemdError          | PrimitiveError                 | is_deferrable |
+/// |-----------------------|--------------------------------|---------------|
+/// | BusUnavailable        | SystemdUnavailable             | true          |
+/// | Dbus                  | SystemdUnavailable             | true          |
+/// | Timeout               | SystemdUnavailable             | true          |
+/// | NoSuchUnit            | Apply                          | false         |
+/// | AuthorizationDenied   | Apply                          | false         |
+/// | JobFailed             | Apply                          | false         |
+/// | RestartNotObserved    | Apply                          | false         |
+/// | Io                    | Io (отдельный вариант)         | false         |
+///
+/// Io не deferrable: повторный цикл не починит сломанный сокет dbus или
+/// упавший файл бэкенда — это сигнал «нода в нештатном состоянии».
 fn map_systemd_error(err: SystemdError, op: &str) -> PrimitiveError {
     match err {
         SystemdError::BusUnavailable { reason, .. } => PrimitiveError::SystemdUnavailable {

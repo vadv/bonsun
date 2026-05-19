@@ -1,6 +1,6 @@
 //! Apply-фаза `systemd.timer`.
 //!
-//! Логика проще, чем у service: notify-семантики нет (taimer обычно не
+//! Логика проще, чем у service: notify-семантики нет (таймер обычно не
 //! «рестартят», а пересоздают через `file.content` + `daemon-reload`).
 //! Все действия enable/disable/start/stop синхронные.
 
@@ -78,8 +78,9 @@ pub fn run(
     }
 }
 
-/// Маппинг идентичен `systemd_service::apply::map_systemd_error`,
-/// дублирован чтобы не плодить pub-exposure.
+/// Маппинг идентичен `systemd_service::apply::map_systemd_error` (см. там
+/// таблицу deferrable/non-deferrable). Дублирован, чтобы не плодить
+/// pub-exposure через crate-boundary.
 fn map_systemd_error(err: SystemdError, op: &str) -> PrimitiveError {
     match err {
         SystemdError::BusUnavailable { reason, .. } => PrimitiveError::SystemdUnavailable {
