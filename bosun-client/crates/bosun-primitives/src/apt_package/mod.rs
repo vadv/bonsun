@@ -93,16 +93,17 @@ impl<R: CommandRunner> Primitive for AptPrimitive<R> {
             .optional_u32("timeout_sec")
             .map_err(|e| PrimitiveError::InvalidPayload(format!("apt.package: {e}")))?
             .unwrap_or(600);
-        // F08: opt-in флаги; по умолчанию false — apt отказывает в
-        // downgrade и не трогает hold'ы.
+        // По умолчанию оба true — bundle декларирует точную версию,
+        // поэтому downgrade при rollback и обход ручного hold'а ожидаемы.
+        // Выставить false явно, если для этого ресурса нужно блокировать.
         let allow_downgrade = args
             .optional_bool("allow_downgrade")
             .map_err(|e| PrimitiveError::InvalidPayload(format!("apt.package: {e}")))?
-            .unwrap_or(false);
+            .unwrap_or(true);
         let allow_change_held = args
             .optional_bool("allow_change_held")
             .map_err(|e| PrimitiveError::InvalidPayload(format!("apt.package: {e}")))?
-            .unwrap_or(false);
+            .unwrap_or(true);
 
         Ok(serde_json::json!({
             "name": name,
@@ -176,9 +177,9 @@ mod tests {
         assert_eq!(payload["name"], "nginx");
         assert_eq!(payload["version"], "1.18.0");
         assert_eq!(payload["timeout_sec"], 1800);
-        // F08: дефолтные значения allow_*-флагов.
-        assert_eq!(payload["allow_downgrade"], false);
-        assert_eq!(payload["allow_change_held"], false);
+        // Дефолтные значения allow_*-флагов — true.
+        assert_eq!(payload["allow_downgrade"], true);
+        assert_eq!(payload["allow_change_held"], true);
     }
 
     #[test]
@@ -191,8 +192,8 @@ mod tests {
             .unwrap();
         assert_eq!(payload["timeout_sec"], 600);
         assert_eq!(payload["version"], serde_json::Value::Null);
-        assert_eq!(payload["allow_downgrade"], false);
-        assert_eq!(payload["allow_change_held"], false);
+        assert_eq!(payload["allow_downgrade"], true);
+        assert_eq!(payload["allow_change_held"], true);
     }
 
     #[test]

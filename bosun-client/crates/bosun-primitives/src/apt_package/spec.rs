@@ -20,20 +20,26 @@ pub struct AptPackageSpec {
     #[serde(default = "default_timeout_sec")]
     pub timeout_sec: u32,
     /// Разрешить apt-get понизить версию пакета (`--allow-downgrades`).
-    /// По умолчанию false — downgrade'ы критичных пакетов (postgresql,
-    /// nginx, openssl и т.п.) могут сломать ABI/extension'ы и потребовать
-    /// маинтенанс-окна. Если оператору всё-таки нужно — выставить явно.
-    #[serde(default)]
+    /// По умолчанию true — chiit-стиль: bundle декларирует точную версию,
+    /// downgrade требуется при canary-rollback и при штатных переездах
+    /// между ветками пакета. Выставить false явно, если этот ресурс
+    /// должен заблокировать downgrade.
+    #[serde(default = "default_true")]
     pub allow_downgrade: bool,
     /// Разрешить apt-get менять `apt-mark hold` пакеты
-    /// (`--allow-change-held-packages`). По умолчанию false — hold
-    /// ставится оператором сознательно, bosun не должен его обходить.
-    #[serde(default)]
+    /// (`--allow-change-held-packages`). По умолчанию true — bundle —
+    /// источник правды о версии. Если на ноде стоит hold вручную, bosun
+    /// обходит его, чтобы привести систему в состояние bundle'а.
+    #[serde(default = "default_true")]
     pub allow_change_held: bool,
 }
 
 const fn default_timeout_sec() -> u32 {
     600
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -49,29 +55,29 @@ mod tests {
         assert!(spec.version.is_none());
         assert_eq!(spec.timeout_sec, 600);
         assert!(
-            !spec.allow_downgrade,
-            "downgrade должен быть false по умолчанию"
+            spec.allow_downgrade,
+            "downgrade должен быть true по умолчанию (bundle — источник правды о версии)"
         );
         assert!(
-            !spec.allow_change_held,
-            "held-change должен быть false по умолчанию"
+            spec.allow_change_held,
+            "held-change должен быть true по умолчанию (bundle обходит ручной hold)"
         );
     }
 
     #[test]
-    fn deserialize_with_allow_downgrade_true() {
-        let json = serde_json::json!({ "name": "nginx", "allow_downgrade": true });
-        let spec: AptPackageSpec = serde_json::from_value(json).unwrap();
-        assert!(spec.allow_downgrade);
-        assert!(!spec.allow_change_held);
-    }
-
-    #[test]
-    fn deserialize_with_allow_change_held_true() {
-        let json = serde_json::json!({ "name": "nginx", "allow_change_held": true });
+    fn deserialize_with_allow_downgrade_false() {
+        let json = serde_json::json!({ "name": "nginx", "allow_downgrade": false });
         let spec: AptPackageSpec = serde_json::from_value(json).unwrap();
         assert!(!spec.allow_downgrade);
         assert!(spec.allow_change_held);
+    }
+
+    #[test]
+    fn deserialize_with_allow_change_held_false() {
+        let json = serde_json::json!({ "name": "nginx", "allow_change_held": false });
+        let spec: AptPackageSpec = serde_json::from_value(json).unwrap();
+        assert!(spec.allow_downgrade);
+        assert!(!spec.allow_change_held);
     }
 
     #[test]
