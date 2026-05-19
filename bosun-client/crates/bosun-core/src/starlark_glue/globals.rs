@@ -33,7 +33,7 @@ use crate::starlark_glue::inv_object::json_scalar_to_value;
 use crate::starlark_glue::{current_state, with_state, EvalState, StarlarkGlueError};
 
 /// Globals для bosun-манифеста. Включает namespaces `apt`, `file`, `inventory`,
-/// `tags`, `service`, `process` и функцию `template`, плюс стандартную
+/// `tags`, `service`, `process`, `users` и функцию `template`, плюс стандартную
 /// библиотеку starlark.
 pub fn build_globals() -> Globals {
     GlobalsBuilder::standard()
@@ -43,6 +43,7 @@ pub fn build_globals() -> Globals {
         .with_namespace("tags", tags_namespace)
         .with_namespace("service", service_namespace)
         .with_namespace("process", process_namespace)
+        .with_namespace("users", users_namespace)
         .with(template_fn)
         .build()
 }
@@ -233,6 +234,33 @@ fn process_namespace(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         register_primitive_call("process.signal", kwargs, eval)
+    }
+}
+
+#[starlark_module]
+fn users_namespace(builder: &mut GlobalsBuilder) {
+    /// `users.user(name=, state=, ...)` — декларативный системный пользователь.
+    ///
+    /// state — обязательный, "present" или "absent". Опциональные поля:
+    /// `uid`, `group`, `shell`, `home`, `no_create_home`, `system`,
+    /// `comment`. Если pользователь существует и spec совпадает с фактом
+    /// — ничего не делает. Иначе вызывает `useradd`/`usermod`/`userdel`
+    /// под капотом (требует root).
+    fn user<'v>(
+        #[starlark(kwargs)] kwargs: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        register_primitive_call("users.user", kwargs, eval)
+    }
+
+    /// `users.group(name=, state=, ...)` — декларативная системная группа.
+    /// state — "present" или "absent"; опциональные `gid`, `system`. При
+    /// расхождении GID вызывает `groupmod --gid`.
+    fn group<'v>(
+        #[starlark(kwargs)] kwargs: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        register_primitive_call("users.group", kwargs, eval)
     }
 }
 
@@ -660,6 +688,8 @@ fn register_primitive_call<'v>(
         "runr.service" => ResourceKind::from_static("runr.service"),
         "systemd.service" => ResourceKind::from_static("systemd.service"),
         "process.signal" => ResourceKind::from_static("process.signal"),
+        "users.user" => ResourceKind::from_static("users.user"),
+        "users.group" => ResourceKind::from_static("users.group"),
         other => ResourceKind::try_new(other).map_err(|e| {
             starlark::Error::new_other(anyhow::anyhow!("invalid resource kind '{other}': {e}"))
         })?,

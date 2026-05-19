@@ -24,8 +24,9 @@ use bosun_facts::FactsCollector;
 use bosun_handles::{RunrHandle, SystemdHandle};
 use bosun_primitives::{
     dispatch::RealDispatchClient, template::render_template, AptPrimitive, FilePrimitive,
-    ProcessSignalPrimitive, RealHealthCheckRunner, RunrCgroupPrimitive, RunrServicePrimitive,
-    RunrTimerPrimitive, SystemdServicePrimitive, SystemdTimerPrimitive,
+    GroupPrimitive, ProcessSignalPrimitive, RealHealthCheckRunner, RunrCgroupPrimitive,
+    RunrServicePrimitive, RunrTimerPrimitive, SystemdServicePrimitive, SystemdTimerPrimitive,
+    UserPrimitive,
 };
 use bosun_runr_client::Client as RunrClient;
 use bosun_systemd_client::BlockingSystemdManager;
@@ -446,6 +447,14 @@ fn build_primitives() -> HashMap<ResourceKind, Box<dyn Primitive>> {
         ResourceKind::from_static("systemd.timer"),
         Box::new(SystemdTimerPrimitive),
     );
+    m.insert(
+        ResourceKind::from_static("users.user"),
+        Box::new(UserPrimitive::with_real_backend()),
+    );
+    m.insert(
+        ResourceKind::from_static("users.group"),
+        Box::new(GroupPrimitive::with_real_backend()),
+    );
     m
 }
 
@@ -686,13 +695,15 @@ mod tests {
             "runr.cgroup",
             "systemd.service",
             "systemd.timer",
+            "users.user",
+            "users.group",
         ] {
             assert!(
                 m.contains_key(&ResourceKind::from_static(kind)),
                 "primitive {kind} not registered",
             );
         }
-        assert_eq!(m.len(), 8);
+        assert_eq!(m.len(), 10);
     }
 
     #[test]

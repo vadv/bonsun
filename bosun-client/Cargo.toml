@@ -57,3 +57,4 @@ cucumber = "0.21"
 rand = "0.8"
 ureq = { version = "2", default-features = false, features = ["json"] }
 wiremock = "0.6"
+nix = { version = "0.31", default-features = false, features = ["user"] }

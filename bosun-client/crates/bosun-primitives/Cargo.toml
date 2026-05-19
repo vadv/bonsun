@@ -44,6 +44,11 @@ tokio-util = { workspace = true }
 # ureq — Phase I health_check::url. Отдельный Agent (не из runr-client),
 # чтобы health-check работал на systemd-only нодах без runr.
 ureq = { workspace = true }
+# nix — Phase M users.user / users.group: getpwnam/getgrnam через
+# RealUsersBackend для идемпотентной проверки текущего состояния и
+# geteuid() для root-check перед exec'ом useradd/groupadd. Альтернатива
+# (libc + getpwnam_r) была бы unsafe, что запрещено workspace-линтами.
+nix = { workspace = true }
 
 [dev-dependencies]
 # Нужен в Phase E unit-тестах: конструируем `SystemdError::BusUnavailable`

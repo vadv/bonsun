@@ -1,8 +1,8 @@
 //! bosun-primitives — реализации trait Primitive: apt.package, file.content,
 //! template(), Phase D набор runr-примитивов
 //! (`runr.service`/`runr.timer`/`runr.cgroup`), Phase E набор
-//! systemd-примитивов (`systemd.service`/`systemd.timer`) и Phase G
-//! `process.signal`.
+//! systemd-примитивов (`systemd.service`/`systemd.timer`), Phase G
+//! `process.signal` и Phase M `users.user`/`users.group`.
 
 pub mod apt_package;
 pub mod dispatch;
@@ -15,6 +15,8 @@ pub mod runr_timer;
 pub mod systemd_service;
 pub mod systemd_timer;
 pub mod template;
+pub mod users_group;
+pub mod users_user;
 
 pub use apt_package::{AptPackageSpec, AptPrimitive};
 pub use dispatch::RealDispatchClient;
@@ -40,3 +42,12 @@ pub use systemd_timer::{
     TimerAction as SystemdTimerAction, TimerState as SystemdTimerState,
 };
 pub use template::{render_template, TemplateError};
+pub use users_group::{
+    decide_action_group, Action as UsersGroupAction, GroupAddOpts, GroupInfo, GroupModOpts,
+    GroupPrimitive, GroupSpec, GroupState,
+};
+pub use users_user::{
+    decide_action_user, Action as UsersUserAction, FieldDiff as UsersUserFieldDiff,
+    RealUsersBackend, UserAddOpts, UserInfo, UserModOpts, UserPrimitive, UserSpec, UserState,
+    UsersBackend, UsersError,
+};
