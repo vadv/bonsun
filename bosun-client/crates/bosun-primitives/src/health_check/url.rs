@@ -67,8 +67,14 @@ pub(super) fn run_once(agent: &Agent, url: &str, expected: u16) -> Attempt {
 /// Краткое описание transport-ошибки. Обрезается до `EXCERPT_LIMIT` — то же
 /// ограничение, что в cmd-варианте; в production-логах оно вмещает сообщение
 /// типа «connection refused» / «dns error: NXDOMAIN».
-fn transport_reason(t: &ureq::Transport) -> String {
-    let mut s = format!("{t}");
+pub(crate) fn transport_reason(t: &ureq::Transport) -> String {
+    truncate_reason(format!("{t}"))
+}
+
+/// Обрезка длинной строки до `EXCERPT_LIMIT` байт. Выделено отдельной
+/// функцией, чтобы можно было тестировать truncation без real transport-
+/// ошибки (создать `ureq::Transport` с длинным сообщением неудобно).
+pub(crate) fn truncate_reason(mut s: String) -> String {
     if s.len() > EXCERPT_LIMIT {
         s.truncate(EXCERPT_LIMIT);
     }
@@ -116,5 +122,51 @@ mod tests {
     #[test]
     fn run_once_default_expected_status_constant_is_200() {
         assert_eq!(DEFAULT_EXPECTED_STATUS, 200);
+    }
+
+    // ---- truncate_reason ----
+
+    #[test]
+    fn truncate_reason_short_message_unchanged() {
+        // Сообщение короче лимита остаётся как есть, без обрезки.
+        let short = "connection refused".to_string();
+        let len_before = short.len();
+        let out = truncate_reason(short);
+        assert_eq!(out.len(), len_before);
+        assert_eq!(out, "connection refused");
+    }
+
+    #[test]
+    fn truncate_reason_at_exact_limit_unchanged() {
+        // Граничный случай: длина == EXCERPT_LIMIT — обрезка не делается.
+        let s: String = "x".repeat(EXCERPT_LIMIT);
+        let out = truncate_reason(s);
+        assert_eq!(out.len(), EXCERPT_LIMIT);
+    }
+
+    #[test]
+    fn truncate_reason_truncates_long_message_to_limit() {
+        // Длинное сообщение > EXCERPT_LIMIT → результат строго равен лимиту.
+        // Это защищает оператора от мегабайтных error chain'ов в логах,
+        // когда `ureq::Transport::Display` цепляет inner `io::Error` с
+        // длинным контекстом.
+        let s: String = "x".repeat(EXCERPT_LIMIT + 100);
+        let out = truncate_reason(s);
+        assert_eq!(out.len(), EXCERPT_LIMIT);
+    }
+
+    #[test]
+    fn truncate_reason_preserves_prefix_of_long_message() {
+        // После обрезки начало сообщения сохраняется — это важно для
+        // диагностики (`connection refused`, `dns error`, `tls: ...`
+        // обычно первые 30-100 байт самые полезные).
+        let prefix = "connection refused at upstream.example:5432 ";
+        let s = format!("{}{}", prefix, "z".repeat(EXCERPT_LIMIT));
+        let out = truncate_reason(s);
+        assert_eq!(out.len(), EXCERPT_LIMIT);
+        assert!(
+            out.starts_with(prefix),
+            "prefix должен сохраняться, got: {out:?}",
+        );
     }
 }

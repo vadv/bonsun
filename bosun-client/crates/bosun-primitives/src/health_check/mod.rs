@@ -426,4 +426,56 @@ mod tests {
             "должны выйти через cancel быстрее retry_interval'а, заняло {elapsed:?}",
         );
     }
+
+    #[test]
+    fn cmd_retry_count_three_reports_three_attempts() {
+        // Явная проверка контракта: retry_count=3 → attempts=3 в final
+        // error. Защищает от регрессии в `resolve_defaults` (где
+        // retry_count.max(1)) и в самом retry-loop'е (где `1..=retries`).
+        let runner = RealHealthCheckRunner::new();
+        let check = HealthCheck::Cmd {
+            cmd: vec!["false".to_string()],
+            timeout_sec: Some(2),
+            retry_count: Some(3),
+            retry_interval_sec: Some(0),
+        };
+        let cancel = CancellationToken::new();
+        let err = runner.run(&check, &cancel).unwrap_err();
+        match err {
+            HealthCheckError::CmdExitNonZero { attempts, .. } => {
+                assert_eq!(attempts, 3, "expected 3 attempts, got {attempts}");
+            }
+            other => panic!("expected CmdExitNonZero, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cmd_retry_count_one_reports_one_attempt() {
+        // Граничный случай: retry_count=1 → одна попытка, без retry sleep'ов.
+        // Если в `1..=retries` ошибочно стоит `0..retries`, attempts=0 —
+        // это regression scenario.
+        let runner = RealHealthCheckRunner::new();
+        let check = HealthCheck::Cmd {
+            cmd: vec!["false".to_string()],
+            timeout_sec: Some(2),
+            retry_count: Some(1),
+            retry_interval_sec: Some(10),
+        };
+        let cancel = CancellationToken::new();
+        let started = std::time::Instant::now();
+        let err = runner.run(&check, &cancel).unwrap_err();
+        let elapsed = started.elapsed();
+        match err {
+            HealthCheckError::CmdExitNonZero { attempts, .. } => {
+                assert_eq!(attempts, 1);
+            }
+            other => panic!("expected CmdExitNonZero, got {other:?}"),
+        }
+        // retry_interval=10s не должен срабатывать после последней попытки —
+        // sleep вставляется только между попытками.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "single-attempt run должен укладываться быстро, заняло {elapsed:?}",
+        );
+    }
 }
