@@ -24,11 +24,39 @@
 //! аргументы. Это совпадает с поведением `process.signal` и убирает
 //! инъекционные риски.
 
-use std::process::Command as StdCommand;
+use std::io::Read as _;
+use std::process::{Command as StdCommand, Stdio};
 use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use bosun_core::defers::{DeferAction, DeferEntry, DispatchClient, DispatchError};
 use bosun_handles::{RunrError, RunrHandle, SystemdError, SystemdHandle};
+
+/// Максимальное время на одну deferred command в replay-цикле. Фиксированная
+/// константа на 60 секунд — длиннее обычно тонкие grep'ы и pkill, которые
+/// мы деферим, не делают. Если оператор знает, что defer-команда долгая,
+/// её нужно переоформить как синхронный примитив в bundle'е (не defer-канал):
+/// иначе один зависший exec заблокирует весь replay и через него — весь
+/// `bosun apply`. `--deadline-sec` не покрывает replay-фазу, поэтому
+/// hard-timeout живёт прямо в dispatch'е.
+///
+/// На превышении — child убивается через `kill()`, возвращается
+/// `DispatchError::Action("timed out ...")`. Defer-запись остаётся в
+/// журнале (replay инкрементирует attempt), и при превышении `max_attempts`
+/// промоутится в `.manual_clear` ровно так же, как и любой другой Action
+/// failure. То есть бесконечно зависшая команда не выйдет за пределы
+/// retry-окна сама собой.
+const COMMAND_DISPATCH_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Шаг polling-цикла `try_wait`. Тот же baseline, что в health_check::cmd
+/// и process_signal::apply — 50 мс достаточно, чтобы быстро ловить
+/// завершение обычной команды и не нагружать ядро лишними сис-вызовами.
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Максимум stderr, который мы возвращаем в сообщении ошибки — 256 байт.
+/// Длиннее всё равно не помещается в `tracing::warn`-строку без обрезки.
+const STDERR_EXCERPT_LIMIT: usize = 256;
 
 /// Маркер init-system для маршрутизации. Совпадает с `DeferEntry::init_system`.
 const INIT_SYSTEMD: &str = "systemd";
@@ -138,27 +166,83 @@ impl RealDispatchClient {
                 entry.id
             )));
         };
-        let output = StdCommand::new(program).args(args).output();
-        match output {
-            Ok(out) if out.status.success() => Ok(()),
-            Ok(out) => {
-                let code = out
-                    .status
+        run_with_timeout(program, args, COMMAND_DISPATCH_TIMEOUT)
+    }
+}
+
+/// Запустить `program` с `args` в дочернем процессе и дождаться завершения
+/// или превышения `timeout`. На timeout — `kill()`+`wait()` (errors на
+/// kill/wait игнорируем: главное не висеть в loop'е дальше timeout'а), и
+/// возвращается `DispatchError::Action("timed out ...")`. Семантика повторяет
+/// `health_check::cmd::run_once` и `process_signal::apply`, чтобы поведение
+/// зависших exec'ов в bosun было предсказуемым повсюду.
+fn run_with_timeout(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<(), DispatchError> {
+    let mut command = StdCommand::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    let mut child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return Err(DispatchError::Action(format!(
+                "failed to spawn command {program}: {e}"
+            )));
+        }
+    };
+
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                let stderr_excerpt = read_stderr_excerpt(&mut child);
+                let code = status
                     .code()
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "signal".to_string());
-                let stderr_excerpt = excerpt_stderr(&out.stderr);
-                Err(DispatchError::Action(format!(
-                    "command {} exited with {}: {}",
-                    program, code, stderr_excerpt
-                )))
+                return Err(DispatchError::Action(format!(
+                    "command {program} exited with {code}: {stderr_excerpt}",
+                )));
             }
-            Err(e) => Err(DispatchError::Action(format!(
-                "failed to spawn command {}: {}",
-                program, e
-            ))),
+            Ok(None) => {
+                if started.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(DispatchError::Action(format!(
+                        "command {program} timed out after {}s",
+                        timeout.as_secs(),
+                    )));
+                }
+                thread::sleep(POLL_INTERVAL);
+            }
+            Err(e) => {
+                return Err(DispatchError::Action(format!(
+                    "try_wait error for command {program}: {e}"
+                )));
+            }
         }
     }
+}
+
+/// Прочитать stderr дочернего процесса с обрезкой до [`STDERR_EXCERPT_LIMIT`].
+/// `child.stderr.take()` отдаёт PipeReader; на ошибке чтения возвращаем то,
+/// что успели прочитать.
+fn read_stderr_excerpt(child: &mut std::process::Child) -> String {
+    let Some(stderr) = child.stderr.take() else {
+        return String::new();
+    };
+    let mut buf = Vec::with_capacity(STDERR_EXCERPT_LIMIT);
+    let _ = stderr
+        .take(STDERR_EXCERPT_LIMIT as u64)
+        .read_to_end(&mut buf);
+    String::from_utf8_lossy(&buf).into_owned()
 }
 
 impl DispatchClient for RealDispatchClient {
@@ -195,19 +279,6 @@ fn map_systemd_result(result: Result<(), SystemdError>) -> Result<(), DispatchEr
         Ok(()) => Ok(()),
         Err(SystemdError::BusUnavailable { .. }) => Err(DispatchError::ClientUnavailable),
         Err(other) => Err(DispatchError::Action(format!("{other}"))),
-    }
-}
-
-/// Сократить stderr для логов defer'а: первые 256 байт + ellipsis.
-fn excerpt_stderr(stderr: &[u8]) -> String {
-    const LIMIT: usize = 256;
-    let text = String::from_utf8_lossy(stderr);
-    if text.len() <= LIMIT {
-        text.into_owned()
-    } else {
-        let mut truncated = text[..LIMIT].to_string();
-        truncated.push_str("...(truncated)");
-        truncated
     }
 }
 
@@ -636,5 +707,86 @@ mod tests {
             Err(DispatchError::Action(msg)) => assert!(msg.contains("openrc")),
             other => panic!("expected Action(_), got {other:?}"),
         }
+    }
+
+    /// `run_with_timeout` с долгой командой и коротким timeout'ом обязан
+    /// убить child и вернуть Action("timed out ..."). Замеряем wall-clock,
+    /// чтобы убедиться: мы не висим до конца sleep'а. Это регрессия H4:
+    /// раньше `StdCommand::output()` блокировался до завершения команды,
+    /// и одна зависшая deferred-команда могла заблокировать весь
+    /// `bosun apply` навсегда.
+    #[test]
+    fn run_with_timeout_kills_long_running_command() {
+        let started = Instant::now();
+        let res = run_with_timeout("sleep", &["30".to_string()], Duration::from_millis(200));
+        let elapsed = started.elapsed();
+        match res {
+            Err(DispatchError::Action(msg)) => {
+                assert!(msg.contains("timed out"), "got: {msg}");
+            }
+            other => panic!("expected Action(timed out), got {other:?}"),
+        }
+        // sleep 30 убит через ~200мс; пусть будет 5с с запасом — тест не
+        // должен зависать дольше этого даже на медленной машине.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "child должен быть убит сразу после timeout'а, заняло {elapsed:?}",
+        );
+    }
+
+    #[test]
+    fn run_with_timeout_returns_ok_for_fast_success() {
+        let res = run_with_timeout("/usr/bin/true", &[], Duration::from_secs(2));
+        assert!(matches!(res, Ok(())), "expected Ok, got {res:?}");
+    }
+
+    #[test]
+    fn run_with_timeout_returns_action_error_for_nonzero_exit() {
+        let res = run_with_timeout("/usr/bin/false", &[], Duration::from_secs(2));
+        match res {
+            Err(DispatchError::Action(msg)) => {
+                assert!(msg.contains("/usr/bin/false"), "got: {msg}");
+                assert!(msg.contains("exited with 1"), "got: {msg}");
+            }
+            other => panic!("expected Action(_), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_with_timeout_includes_stderr_excerpt_on_failure() {
+        let res = run_with_timeout(
+            "sh",
+            &[
+                "-c".to_string(),
+                "echo defer-bad-marker >&2; exit 9".to_string(),
+            ],
+            Duration::from_secs(2),
+        );
+        match res {
+            Err(DispatchError::Action(msg)) => {
+                assert!(
+                    msg.contains("defer-bad-marker"),
+                    "stderr excerpt должен попасть в сообщение, got: {msg}",
+                );
+            }
+            other => panic!("expected Action(_), got {other:?}"),
+        }
+    }
+
+    /// Документируем: production-таймаут защищает replay от зависших
+    /// deferred-команд. Здесь не дёргаем `client.dispatch` с `sleep 30` —
+    /// тест бы реально ждал 60 секунд (константа). Конкретное поведение
+    /// timeout'а проверяется юнит-тестом `run_with_timeout_kills_long_running_command`.
+    #[test]
+    fn command_dispatch_timeout_constant_is_sane() {
+        // sanity: константа должна быть достаточно длинной для тонких
+        // grep/pkill, но не такой большой, чтобы зависший exec блокировал
+        // ноду на десятки минут.
+        assert!(
+            COMMAND_DISPATCH_TIMEOUT >= Duration::from_secs(10)
+                && COMMAND_DISPATCH_TIMEOUT <= Duration::from_secs(300),
+            "COMMAND_DISPATCH_TIMEOUT = {:?} вне разумного диапазона 10-300s",
+            COMMAND_DISPATCH_TIMEOUT,
+        );
     }
 }
