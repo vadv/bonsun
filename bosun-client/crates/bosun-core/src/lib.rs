@@ -2,6 +2,7 @@
 
 pub mod bundle;
 pub mod call_args;
+pub mod defers;
 pub mod diff;
 pub mod digest;
 pub mod evaluator;
