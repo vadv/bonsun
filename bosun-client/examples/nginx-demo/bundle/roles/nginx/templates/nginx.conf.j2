@@ -1,0 +1,3 @@
+worker_processes {{ inv.worker_processes }};
+events { worker_connections {{ inv.worker_connections }}; }
+http { server { listen 80 default_server; } }

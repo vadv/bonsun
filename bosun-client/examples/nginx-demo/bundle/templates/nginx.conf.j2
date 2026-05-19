@@ -1,8 +1,0 @@
-worker_processes {{ inv.worker_processes }};
-events { worker_connections 768; }
-http {
-    server {
-        listen 80 default_server;
-        server_name {{ inv.facts.hostname }};
-    }
-}

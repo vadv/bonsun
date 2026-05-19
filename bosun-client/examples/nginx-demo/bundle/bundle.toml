@@ -1,5 +1,13 @@
 [bundle]
 name           = "nginx-demo"
-version        = "0.1.0"
+version        = "0.2.0"
+description    = "Minimal nginx bundle for bosun bundle-format tests"
 requires_bosun = "^0.1"
 entry          = "manifests/main.star"
+
+[bundle.inventory]
+default_merge_strategy = "deep_map_replace_list"
+
+[bundle.tags]
+production = "Production"
+staging    = "Staging"

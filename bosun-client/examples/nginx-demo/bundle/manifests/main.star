@@ -1,18 +1,12 @@
-load("@bosun/builtins", "apt", "file", "template")
+load("@bosun/builtins", "inventory", "tags")
+load("@roles/nginx", configure_nginx = "configure")
 
-# nginx ставится без пина версии — apt подберёт то, что предлагает текущий
-# bookworm-mirror. Если нужно пинить — задайте `version` явно (например,
-# из inv.nginx_version) и убедитесь, что версия доступна в apt-cache madison.
-apt.package(
-    name = "nginx",
-)
+tags.require_one_of("production", "staging")
 
-# nginx.conf рендерится из шаблона; `worker_processes` берётся из
-# defaults/main.yaml, `server_name` подставляется из факта hostname.
-file.content(
-    path     = "/etc/nginx/nginx.conf",
-    contents = template("nginx.conf.j2"),
-    mode     = 0o644,
-    owner    = "root",
-    group    = "root",
-)
+inv = inventory.read("inventory/base.yaml")
+if tags.has("production"):
+    inv = inventory.merge(inv, inventory.read("inventory/production.yaml"))
+elif tags.has("staging"):
+    inv = inventory.merge(inv, inventory.read("inventory/staging.yaml"))
+
+configure_nginx(inv = inv)
