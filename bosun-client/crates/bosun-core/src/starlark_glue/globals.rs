@@ -860,7 +860,12 @@ fn value_to_arg<'v>(
                 break;
             }
         }
-        if all_handles && !list.is_empty() {
+        // Пустой список — валидный HandleList(vec![]): означает «связей нет».
+        // Иначе depends_on=[] и аналоги падали бы в ветку Other → wrong type
+        // на стороне optional_handle_list. Списки со смешанным содержимым
+        // (хоть один не-Handle элемент) остаются Other — их валидация
+        // отвечает за type error.
+        if all_handles {
             return Ok(ArgValue::HandleList(handles));
         }
     }

@@ -1288,6 +1288,71 @@ service.unit(name = "nginx", state = "running", restart_on = [trigger])
         );
     }
 
+    /// Пустой `depends_on=[]` должен приниматься как «связей нет», а не
+    /// падать с wrong-type. Регрессия M3: раньше пустой список не проходил
+    /// HandleList-ветку и сваливался в Other → optional_handle_list ругался
+    /// на «list[Handle]» против Other.
+    #[test]
+    fn empty_depends_on_list_is_accepted_as_no_dependencies() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "apt")
+apt.package(name = "nginx", depends_on = [])
+"#,
+        );
+        let run = run(bundle, primitives_with_mock_apt());
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        let r = reg
+            .get(&ResourceId::new(
+                &ResourceKind::from_static("apt.package"),
+                "nginx",
+            ))
+            .unwrap();
+        assert!(r.depends_on.is_empty());
+    }
+
+    /// Пустой `reload_on=[]` также должен приниматься без ошибок.
+    #[test]
+    fn empty_reload_on_list_is_accepted_as_no_notify() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "apt")
+apt.package(name = "nginx", reload_on = [])
+"#,
+        );
+        let run = run(bundle, primitives_with_mock_apt());
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        let r = reg
+            .get(&ResourceId::new(
+                &ResourceKind::from_static("apt.package"),
+                "nginx",
+            ))
+            .unwrap();
+        assert!(r.reload_on.is_empty());
+    }
+
+    /// Список со смешанным содержимым (Handle + строка) остаётся type-error.
+    /// Пустые/однородные Handle-списки — валидны, mixed — нет.
+    #[test]
+    fn mixed_handle_and_str_in_depends_on_is_type_error() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "apt")
+trigger = apt.package(name = "trigger")
+apt.package(name = "nginx", depends_on = [trigger, "stringy"])
+"#,
+        );
+        let run = run(bundle, primitives_with_mock_apt());
+        let err = run.result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("depends_on") || msg.contains("list[Handle]"),
+            "expected list[Handle] type error, got: {msg}",
+        );
+    }
+
     /// service.unit(validate_with=[...]) на init=systemd должен дойти до
     /// systemd.service::build_payload с заполненным list[str]. Раньше glue
     /// упаковывал список в Other(Array), а build_payload использовал
