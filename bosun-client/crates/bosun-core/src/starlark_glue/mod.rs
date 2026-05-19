@@ -1275,6 +1275,207 @@ service.unit(name = "nginx", state = "running", restart_on = [trigger])
         );
     }
 
+    /// Универсальный stub-примитив с конфигурируемым `type_name`. Используется
+    /// тестами для регистрации `runr.timer` / `runr.cgroup` / `systemd.timer`
+    /// без копипасты MockRunrService/MockSystemdService на каждый kind.
+    struct MockKind(&'static str);
+
+    impl Primitive for MockKind {
+        fn type_name(&self) -> ResourceKind {
+            ResourceKind::from_static(self.0)
+        }
+        fn identity_keys(&self) -> &'static [&'static str] {
+            &["name"]
+        }
+        fn build_payload(
+            &self,
+            args: &CallArgs,
+            _ctx: &PlanCtx,
+        ) -> Result<serde_json::Value, PrimitiveError> {
+            let name = args
+                .required_str("name")
+                .map_err(|e| PrimitiveError::InvalidPayload(format!("{}: {e}", self.0)))?;
+            Ok(serde_json::json!({"name": name}))
+        }
+        fn plan(
+            &self,
+            _resource: &Resource,
+            _facts: &dyn FactsSource,
+            _ctx: &PlanCtx,
+        ) -> Result<Diff, PrimitiveError> {
+            Ok(Diff::NoChange)
+        }
+        fn apply(
+            &self,
+            _resource: &Resource,
+            _diff: &Diff,
+            _ctx: &ApplyCtx,
+        ) -> Result<ChangeReport, PrimitiveError> {
+            Ok(ChangeReport::no_change())
+        }
+    }
+
+    /// Реестр со всеми init-специфичными примитивами для тестов прямого
+    /// доступа через namespaces `runr.*` и `systemd.*`.
+    fn primitives_with_runr_and_systemd_kinds() -> Rc<HashMap<ResourceKind, Box<dyn Primitive>>> {
+        let mut m: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
+        m.insert(
+            ResourceKind::from_static("runr.service"),
+            Box::new(MockRunrService),
+        );
+        m.insert(
+            ResourceKind::from_static("runr.timer"),
+            Box::new(MockKind("runr.timer")),
+        );
+        m.insert(
+            ResourceKind::from_static("runr.cgroup"),
+            Box::new(MockKind("runr.cgroup")),
+        );
+        m.insert(
+            ResourceKind::from_static("systemd.service"),
+            Box::new(MockSystemdService),
+        );
+        m.insert(
+            ResourceKind::from_static("systemd.timer"),
+            Box::new(MockKind("systemd.timer")),
+        );
+        Rc::new(m)
+    }
+
+    #[test]
+    fn runr_service_namespace_registers_resource() {
+        // Прямой вызов runr.service(...) (без service.unit) должен попасть в
+        // registry с правильным kind вне зависимости от факта init_system.
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "runr")
+runr.service(name = "postgres", state = "running")
+"#,
+        );
+        let facts: Rc<dyn FactsSource> = Rc::new(FixedInitSystem(Some("systemd")));
+        let run = run_with_facts(bundle, primitives_with_runr_and_systemd_kinds(), facts);
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        assert_eq!(reg.all().len(), 1);
+        assert!(reg
+            .get(&ResourceId::new(
+                &ResourceKind::from_static("runr.service"),
+                "postgres",
+            ))
+            .is_some());
+    }
+
+    #[test]
+    fn runr_timer_namespace_registers_resource() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "runr")
+runr.timer(name = "backup-daily")
+"#,
+        );
+        let facts: Rc<dyn FactsSource> = Rc::new(FixedInitSystem(Some("runr")));
+        let run = run_with_facts(bundle, primitives_with_runr_and_systemd_kinds(), facts);
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        assert!(reg
+            .get(&ResourceId::new(
+                &ResourceKind::from_static("runr.timer"),
+                "backup-daily",
+            ))
+            .is_some());
+    }
+
+    #[test]
+    fn runr_cgroup_namespace_registers_resource() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "runr")
+runr.cgroup(name = "pg")
+"#,
+        );
+        let facts: Rc<dyn FactsSource> = Rc::new(FixedInitSystem(Some("runr")));
+        let run = run_with_facts(bundle, primitives_with_runr_and_systemd_kinds(), facts);
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        assert!(reg
+            .get(&ResourceId::new(
+                &ResourceKind::from_static("runr.cgroup"),
+                "pg",
+            ))
+            .is_some());
+    }
+
+    #[test]
+    fn systemd_service_namespace_registers_resource() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "systemd")
+systemd.service(name = "nginx", state = "running")
+"#,
+        );
+        let facts: Rc<dyn FactsSource> = Rc::new(FixedInitSystem(Some("systemd")));
+        let run = run_with_facts(bundle, primitives_with_runr_and_systemd_kinds(), facts);
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        assert!(reg
+            .get(&ResourceId::new(
+                &ResourceKind::from_static("systemd.service"),
+                "nginx",
+            ))
+            .is_some());
+    }
+
+    #[test]
+    fn systemd_timer_namespace_registers_resource() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "systemd")
+systemd.timer(name = "logrotate")
+"#,
+        );
+        let facts: Rc<dyn FactsSource> = Rc::new(FixedInitSystem(Some("systemd")));
+        let run = run_with_facts(bundle, primitives_with_runr_and_systemd_kinds(), facts);
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        assert!(reg
+            .get(&ResourceId::new(
+                &ResourceKind::from_static("systemd.timer"),
+                "logrotate",
+            ))
+            .is_some());
+    }
+
+    #[test]
+    fn runr_service_direct_call_works_on_systemd_host() {
+        // Кейс из ревью voice-325: на смешанном хосте (init_system=systemd)
+        // оператор может явно вызвать runr.service(...) для роли, которая
+        // живёт в runr-cgroup. service.unit маршрутизировала бы на
+        // systemd.service, поэтому прямой namespace необходим.
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "runr")
+runr.service(name = "pg-doorman", state = "running")
+"#,
+        );
+        let facts: Rc<dyn FactsSource> = Rc::new(FixedInitSystem(Some("systemd")));
+        let run = run_with_facts(bundle, primitives_with_runr_and_systemd_kinds(), facts);
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        // Только runr.service, без подмешивания systemd.service.
+        assert!(reg
+            .get(&ResourceId::new(
+                &ResourceKind::from_static("runr.service"),
+                "pg-doorman",
+            ))
+            .is_some());
+        assert!(reg
+            .get(&ResourceId::new(
+                &ResourceKind::from_static("systemd.service"),
+                "pg-doorman",
+            ))
+            .is_none());
+    }
+
     #[test]
     fn evaluation_aborts_on_deadline_for_heavy_manifest() {
         let bundle = bundle_with_manifest(

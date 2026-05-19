@@ -33,17 +33,26 @@ use crate::starlark_glue::inv_object::json_scalar_to_value;
 use crate::starlark_glue::{current_state, with_state, EvalState, StarlarkGlueError};
 
 /// Globals для bosun-манифеста. Включает namespaces `apt`, `file`, `inventory`,
-/// `tags`, `service`, `process`, `users` и функцию `template`, плюс стандартную
-/// библиотеку starlark.
+/// `tags`, `service`, `process`, `users`, `runr`, `systemd`, `cert` и функцию
+/// `template`, плюс стандартную библиотеку starlark.
+///
+/// `service.unit` — диспетчер по факту `init_system`. Конкретные `runr.*` и
+/// `systemd.*` — для случаев, когда роль действительно зависит от init-системы
+/// (например, runr-only `cgroup_procs_path` или systemd-only
+/// `condition_path_exists`). Power-user может использовать их напрямую без
+/// обёртки `service.unit`.
 pub fn build_globals() -> Globals {
     GlobalsBuilder::standard()
         .with_namespace("apt", apt_namespace)
+        .with_namespace("cert", cert_namespace)
         .with_namespace("file", file_namespace)
         .with_namespace("inventory", inventory_namespace)
         .with_namespace("tags", tags_namespace)
         .with_namespace("service", service_namespace)
         .with_namespace("process", process_namespace)
         .with_namespace("users", users_namespace)
+        .with_namespace("runr", runr_namespace)
+        .with_namespace("systemd", systemd_namespace)
         .with(template_fn)
         .build()
 }
@@ -308,18 +317,73 @@ fn cert_namespace(builder: &mut GlobalsBuilder) {
     }
 }
 
+/// Namespace `runr` — прямой доступ к runr-специфичным примитивам без обёртки
+/// `service.unit`. Использовать, когда роль завязана на runr (например, нужен
+/// `cgroup_procs_path` или роль гарантированно запускается на хосте с runr).
+/// Иначе предпочтительнее `service.unit`, которая работает и на чистом systemd.
+#[starlark_module]
+fn runr_namespace(builder: &mut GlobalsBuilder) {
+    /// `runr.service(name=, state=, ...)` — управление runr-сервисом через
+    /// HTTP API `runr` daemon. Помимо общего поднабора `service.unit` принимает
+    /// runr-специфичные kwargs: `cgroup_procs_path`, `restart_policy` и т.п.
+    fn service<'v>(
+        #[starlark(kwargs)] kwargs: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        register_primitive_call("runr.service", kwargs, eval)
+    }
+
+    /// `runr.timer(name=, ...)` — runr-таймер. На хостах с systemd использовать
+    /// `systemd.timer`.
+    fn timer<'v>(
+        #[starlark(kwargs)] kwargs: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        register_primitive_call("runr.timer", kwargs, eval)
+    }
+
+    /// `runr.cgroup(name=, ...)` — runr-cgroup. Конфигурирует resource limits
+    /// (cpu, memory, io) на уровне cgroup'а в runr.
+    fn cgroup<'v>(
+        #[starlark(kwargs)] kwargs: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        register_primitive_call("runr.cgroup", kwargs, eval)
+    }
+}
+
+/// Namespace `systemd` — прямой доступ к systemd-специфичным примитивам через
+/// dbus. Использовать, когда роль завязана на systemd (например, нужен
+/// `condition_path_exists`, drop-in override и т.п.). Иначе — `service.unit`.
+#[starlark_module]
+fn systemd_namespace(builder: &mut GlobalsBuilder) {
+    /// `systemd.service(name=, state=, ...)` — управление systemd unit'ом через
+    /// org.freedesktop.systemd1 dbus API. Принимает systemd-специфичные kwargs:
+    /// `condition_path_exists`, `drop_in` и т.п.
+    fn service<'v>(
+        #[starlark(kwargs)] kwargs: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        register_primitive_call("systemd.service", kwargs, eval)
+    }
+
+    /// `systemd.timer(name=, ...)` — systemd-таймер. На хостах с runr —
+    /// `runr.timer`.
+    fn timer<'v>(
+        #[starlark(kwargs)] kwargs: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        register_primitive_call("systemd.timer", kwargs, eval)
+    }
+}
+
 /// Перечень параметров, которые `service.unit` пропускает в конкретный
 /// примитив. Совпадает с тем подмножеством, которое и `runr.service`, и
 /// `systemd.service` читают в `build_payload` (плюс общая notify-инфраструктура
 /// `reload_on`/`restart_on`/`depends_on`). Любой ключ за пределами этого
 /// списка — ошибка: автор bundle'а либо обращается к init-специфичной фиче
-/// (тогда вызов должен идти на конкретный примитив), либо опечатался.
-///
-/// Известное ограничение: `health_check_cmd` и `validate_with` пропускаются
-/// сюда как list-of-strings, но конкретные `runr.service`/`systemd.service`
-/// в Phase D/E читают их через `optional_str` и `Array` тихо отбрасывают.
-/// Полноценный парсинг list-параметров подключится в Phase H/I вместе с
-/// реальным запуском validate-cmd и health-check exec.
+/// (тогда вызов должен идти на `runr.service` / `systemd.service` напрямую),
+/// либо опечатался.
 const SERVICE_UNIT_ALLOWED_KWARGS: &[&str] = &[
     "name",
     "state",
@@ -733,7 +797,10 @@ fn register_primitive_call<'v>(
         "file.delete" => ResourceKind::from_static("file.delete"),
         "file.symlink" => ResourceKind::from_static("file.symlink"),
         "runr.service" => ResourceKind::from_static("runr.service"),
+        "runr.timer" => ResourceKind::from_static("runr.timer"),
+        "runr.cgroup" => ResourceKind::from_static("runr.cgroup"),
         "systemd.service" => ResourceKind::from_static("systemd.service"),
+        "systemd.timer" => ResourceKind::from_static("systemd.timer"),
         "process.signal" => ResourceKind::from_static("process.signal"),
         "users.user" => ResourceKind::from_static("users.user"),
         "users.group" => ResourceKind::from_static("users.group"),
