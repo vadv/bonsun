@@ -6,7 +6,11 @@
 
 mod apply;
 mod backup;
-mod chown;
+// pub(crate) — Phase O cert_tls::apply переиспользует resolve_owner /
+// resolve_group / chown_if_needed / current_euid из этого модуля. Файл
+// fingerprint-узкий (libc::chown + getpwnam_r), дублировать его в cert_tls
+// означало бы дважды поддерживать унифицированный chown-flow.
+pub(crate) mod chown;
 mod plan;
 mod spec;
 

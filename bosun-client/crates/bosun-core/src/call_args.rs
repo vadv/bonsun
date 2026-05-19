@@ -147,6 +147,37 @@ impl CallArgs {
             None => Ok(Vec::new()),
         }
     }
+
+    /// Список строк из starlark-литерала. Starlark-glue превращает list[str]
+    /// в `ArgValue::Other(json_array)`, поэтому здесь распаковываем JSON.
+    /// `Some(_)` гарантирует, что аргумент был передан (даже как `[]`);
+    /// `None` — поле опустили.
+    pub fn optional_str_list(&self, name: &str) -> Result<Option<Vec<String>>, CallArgsError> {
+        match self.inner.get(name) {
+            Some(ArgValue::Other(serde_json::Value::Array(items))) => {
+                let mut out = Vec::with_capacity(items.len());
+                for (idx, item) in items.iter().enumerate() {
+                    match item {
+                        serde_json::Value::String(s) => out.push(s.clone()),
+                        _ => {
+                            return Err(CallArgsError::WrongType {
+                                name: format!("{name}[{idx}]"),
+                                expected: "str",
+                                actual: "non-string json",
+                            });
+                        }
+                    }
+                }
+                Ok(Some(out))
+            }
+            Some(ArgValue::Other(serde_json::Value::Null)) | None => Ok(None),
+            Some(other) => Err(CallArgsError::WrongType {
+                name: name.into(),
+                expected: "list[str]",
+                actual: type_name(other),
+            }),
+        }
+    }
 }
 
 fn type_name(v: &ArgValue) -> &'static str {
@@ -280,5 +311,55 @@ mod tests {
         args.put_raw("k", ArgValue::Str("new".into()));
         let taken = args.take_raw("k");
         assert!(matches!(taken, Some(ArgValue::Str(s)) if s == "new"));
+    }
+
+    #[test]
+    fn optional_str_list_absent_returns_none() {
+        let args = make(&[]);
+        assert!(args.optional_str_list("sans").unwrap().is_none());
+    }
+
+    #[test]
+    fn optional_str_list_explicit_null_returns_none() {
+        // starlark `None` приходит как `Other(Null)`: трактуем как absent.
+        let args = make(&[("sans", ArgValue::Other(serde_json::Value::Null))]);
+        assert!(args.optional_str_list("sans").unwrap().is_none());
+    }
+
+    #[test]
+    fn optional_str_list_parses_string_array() {
+        let json = serde_json::json!(["a", "b", "c"]);
+        let args = make(&[("sans", ArgValue::Other(json))]);
+        let got = args.optional_str_list("sans").unwrap().unwrap();
+        assert_eq!(got, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn optional_str_list_empty_array_returns_some_empty() {
+        let json = serde_json::json!([]);
+        let args = make(&[("sans", ArgValue::Other(json))]);
+        let got = args.optional_str_list("sans").unwrap().unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn optional_str_list_rejects_non_string_element() {
+        let json = serde_json::json!(["ok", 42]);
+        let args = make(&[("sans", ArgValue::Other(json))]);
+        let err = args.optional_str_list("sans").unwrap_err();
+        assert!(matches!(err, CallArgsError::WrongType { .. }));
+    }
+
+    #[test]
+    fn optional_str_list_rejects_wrong_type() {
+        let args = make(&[("sans", ArgValue::Str("not a list".into()))]);
+        let err = args.optional_str_list("sans").unwrap_err();
+        // Сверяем строкой через Display: вариант WrongType содержит
+        // expected="list[str]", и эта подстрока попадает в Display.
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("expected list[str]"),
+            "expected WrongType list[str], got: {msg}",
+        );
     }
 }

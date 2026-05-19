@@ -6,6 +6,7 @@
 //! `file.delete`/`file.symlink` (+ `apt.package` state=absent/purged).
 
 pub mod apt_package;
+pub mod cert_tls;
 pub mod dispatch;
 pub mod file_content;
 pub mod file_delete;
@@ -22,6 +23,9 @@ pub mod users_group;
 pub mod users_user;
 
 pub use apt_package::{AptPackageSpec, AptPackageState, AptPrimitive};
+pub use cert_tls::{
+    decide_action_cert, Action as CertTlsAction, CertAlgorithm, CertTlsPrimitive, CertTlsSpec,
+};
 pub use dispatch::RealDispatchClient;
 pub use file_content::{sha256_hex, FileContentSpec, FilePrimitive};
 pub use file_delete::{

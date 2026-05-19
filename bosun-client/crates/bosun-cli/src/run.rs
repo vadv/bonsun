@@ -23,10 +23,10 @@ use bosun_core::{
 use bosun_facts::FactsCollector;
 use bosun_handles::{RunrHandle, SystemdHandle};
 use bosun_primitives::{
-    dispatch::RealDispatchClient, template::render_template, AptPrimitive, FileDeletePrimitive,
-    FilePrimitive, FileSymlinkPrimitive, GroupPrimitive, ProcessSignalPrimitive,
-    RealHealthCheckRunner, RunrCgroupPrimitive, RunrServicePrimitive, RunrTimerPrimitive,
-    SystemdServicePrimitive, SystemdTimerPrimitive, UserPrimitive,
+    dispatch::RealDispatchClient, template::render_template, AptPrimitive, CertTlsPrimitive,
+    FileDeletePrimitive, FilePrimitive, FileSymlinkPrimitive, GroupPrimitive,
+    ProcessSignalPrimitive, RealHealthCheckRunner, RunrCgroupPrimitive, RunrServicePrimitive,
+    RunrTimerPrimitive, SystemdServicePrimitive, SystemdTimerPrimitive, UserPrimitive,
 };
 use bosun_runr_client::Client as RunrClient;
 use bosun_systemd_client::BlockingSystemdManager;
@@ -432,6 +432,10 @@ fn build_primitives() -> HashMap<ResourceKind, Box<dyn Primitive>> {
         Box::new(AptPrimitive::new()),
     );
     m.insert(
+        ResourceKind::from_static("cert.tls"),
+        Box::new(CertTlsPrimitive),
+    );
+    m.insert(
         ResourceKind::from_static("file.content"),
         Box::new(FilePrimitive),
     );
@@ -720,6 +724,7 @@ mod tests {
         let m = build_primitives();
         for kind in [
             "apt.package",
+            "cert.tls",
             "file.content",
             "file.delete",
             "file.symlink",
@@ -737,7 +742,7 @@ mod tests {
                 "primitive {kind} not registered",
             );
         }
-        assert_eq!(m.len(), 12);
+        assert_eq!(m.len(), 13);
     }
 
     #[test]

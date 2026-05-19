@@ -289,6 +289,25 @@ fn users_namespace(builder: &mut GlobalsBuilder) {
     }
 }
 
+#[starlark_module]
+fn cert_namespace(builder: &mut GlobalsBuilder) {
+    /// `cert.tls(cert_path=, key_path=, common_name=, ...)` — self-signed
+    /// x509-сертификат, сгенерированный pure-Rust пайплайном (rcgen + ring,
+    /// RSA-ключи — через rsa-крейт). Без openssl-binary и без libssl.
+    ///
+    /// Обязательные kwargs: `cert_path`, `key_path`, `common_name`.
+    /// Опциональные: `algorithm` ("rsa2048" | "ed25519" | "ecdsa_p256",
+    /// default "rsa2048"), `days_valid` (3650), `renew_before_days` (30),
+    /// `owner`, `group`, `mode_cert` (0o644), `mode_key` (0o600),
+    /// `subject_alt_names` (list[str]).
+    fn tls<'v>(
+        #[starlark(kwargs)] kwargs: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        register_primitive_call("cert.tls", kwargs, eval)
+    }
+}
+
 /// Перечень параметров, которые `service.unit` пропускает в конкретный
 /// примитив. Совпадает с тем подмножеством, которое и `runr.service`, и
 /// `systemd.service` читают в `build_payload` (плюс общая notify-инфраструктура
@@ -709,6 +728,7 @@ fn register_primitive_call<'v>(
 
     let kind = match kind_str {
         "apt.package" => ResourceKind::from_static("apt.package"),
+        "cert.tls" => ResourceKind::from_static("cert.tls"),
         "file.content" => ResourceKind::from_static("file.content"),
         "file.delete" => ResourceKind::from_static("file.delete"),
         "file.symlink" => ResourceKind::from_static("file.symlink"),

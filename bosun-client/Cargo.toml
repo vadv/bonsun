@@ -58,3 +58,17 @@ rand = "0.8"
 ureq = { version = "2", default-features = false, features = ["json"] }
 wiremock = "0.6"
 nix = { version = "0.31", default-features = false, features = ["user"] }
+# Phase O: cert.tls — генерация self-signed x509 без openssl-binary.
+# Берём rcgen с ring-бэкендом (pure Rust); RSA-ключи генерируем через
+# `rsa`-крейт и импортируем PKCS#8 DER в rcgen — это даёт полный
+# pure-Rust pipeline без зависимости от libssl/libcrypto.
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring"] }
+rsa = "0.9"
+rustls-pki-types = "1"
+# Парсер существующих сертификатов: достаём CN и validity, чтобы plan
+# мог решить, нужен ли renew. Использовать rcgen для parsing нельзя —
+# он умеет только генерировать.
+x509-parser = "0.16"
+# rcgen использует `time` для not_before/not_after — без зависимости
+# напрямую невозможно сконструировать OffsetDateTime для CertificateParams.
+time = "0.3"
