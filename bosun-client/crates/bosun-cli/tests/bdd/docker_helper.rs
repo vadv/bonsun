@@ -163,14 +163,42 @@ pub async fn given_fresh_container(world: &mut BosunWorld) {
     world.container_workdir = CONTAINER_WORKDIR.to_string();
 }
 
-#[when(regex = r#"^I run "([^"]+)" inside the container$"#)]
+#[when(regex = r#"^I run "((?:[^"\\]|\\.)+)" inside the container$"#)]
 pub async fn when_run_inside_container(world: &mut BosunWorld, cmd: String) {
     let id = world
         .container_id
         .clone()
         .unwrap_or_else(|| panic!("no container is running; add `Given a fresh container`"));
-    let res = docker_exec_shell(&id, &cmd).unwrap_or_else(|e| panic!("docker exec failed: {e}"));
+    let unescaped = unescape_step_quotes(&cmd);
+    let res =
+        docker_exec_shell(&id, &unescaped).unwrap_or_else(|e| panic!("docker exec failed: {e}"));
     world.last_exec = Some(res);
+}
+
+/// Раскрыть `\"` → `"` в строке шага. Gherkin step text — это литерал, в нём
+/// `\"` означает «литеральная двойная кавычка», но регексп `(?:[^"\\]|\\.)+`
+/// захватывает их буквально. Также `\\` → `\`. Прочие `\X` оставляем как есть
+/// — это нужно, например, для shell-команды, где `\\n` должен пройти в Python
+/// как `\n` (две литеральные кодпойнта), а не как реальный newline.
+fn unescape_step_quotes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 #[then(regex = r#"^exit code is (-?\d+)$"#)]
