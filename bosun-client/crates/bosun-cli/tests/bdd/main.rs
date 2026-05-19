@@ -17,7 +17,11 @@
 
 mod assertions_helper;
 mod bundle_helper;
+mod cert_helper;
+mod defers_helper;
 mod docker_helper;
+mod users_helper;
+mod validate_helper;
 mod world;
 
 use cucumber::gherkin::tagexpr::TagOperation;
