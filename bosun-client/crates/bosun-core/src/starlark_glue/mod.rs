@@ -925,6 +925,82 @@ apt.package(name = "nginx")
         );
     }
 
+    /// Mock-примитив, который панит в build_payload. Для F09-теста.
+    struct PanickyBuildPayload;
+
+    impl Primitive for PanickyBuildPayload {
+        fn type_name(&self) -> ResourceKind {
+            ResourceKind::from_static("apt.package")
+        }
+        fn identity_keys(&self) -> &'static [&'static str] {
+            &["name"]
+        }
+        #[allow(clippy::panic)]
+        fn build_payload(
+            &self,
+            _args: &CallArgs,
+            _ctx: &PlanCtx,
+        ) -> Result<serde_json::Value, PrimitiveError> {
+            panic!("boom from build_payload");
+        }
+        fn plan(
+            &self,
+            _: &Resource,
+            _: &dyn FactsSource,
+            _: &PlanCtx,
+        ) -> Result<Diff, PrimitiveError> {
+            Ok(Diff::NoChange)
+        }
+        fn apply(
+            &self,
+            _: &Resource,
+            _: &Diff,
+            _: &ApplyCtx,
+        ) -> Result<ChangeReport, PrimitiveError> {
+            Ok(ChangeReport::no_change())
+        }
+    }
+
+    #[test]
+    fn build_payload_panic_is_contained_as_invalid_call() {
+        // F09: panic в build_payload не валит eval манифеста, а
+        // мапится в InvalidCall — на верхнем уровне виден как
+        // ошибка eval, но без раскрутки stack'а CLI.
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "apt")
+apt.package(name = "nginx")
+"#,
+            serde_json::json!({}),
+        );
+        let mut primitives_map: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
+        primitives_map.insert(
+            ResourceKind::from_static("apt.package"),
+            Box::new(PanickyBuildPayload),
+        );
+        let primitives = Rc::new(primitives_map);
+        let registry = Rc::new(RefCell::new(Registry::new()));
+        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
+        let store = Arc::new(SensitiveStore::new());
+        let ctx = plan_ctx();
+        let err = evaluate_manifest(
+            &bundle,
+            primitives,
+            serde_json::json!({}),
+            facts,
+            store,
+            registry,
+            ctx,
+            default_template_fn(),
+        )
+        .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("panic") && msg.contains("boom"),
+            "expected panic-containing error, got: {msg}"
+        );
+    }
+
     #[test]
     fn nested_evaluate_manifest_on_same_thread_returns_error() {
         // F06 secondary: re-entrant evaluate_manifest должен явно отказать,

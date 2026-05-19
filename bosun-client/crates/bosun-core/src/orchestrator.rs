@@ -14,6 +14,7 @@
 //! с реальной коллекцией.
 
 use std::collections::HashMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use serde::Serialize;
 
@@ -198,7 +199,13 @@ impl Orchestrator {
             let resource_span = tracing::info_span!("resource", id = %resource.id, kind = %kind);
             let _enter = resource_span.enter();
 
-            match primitive.plan(resource, facts, plan_ctx) {
+            // F09: примитив user-supplied, паника не должна валить весь
+            // прогон — catch_unwind мапит её в PrimitiveError::Panic.
+            let plan_result = call_primitive(&format!("plan {}", &resource.id), || {
+                primitive.plan(resource, facts, plan_ctx)
+            });
+
+            match plan_result {
                 Ok(diff) => {
                     tracing::debug!(diff = ?diff, "plan computed");
                     match &diff {
@@ -319,8 +326,11 @@ impl Orchestrator {
             let resource_span = tracing::info_span!("resource", id = %resource.id, kind = %kind);
             let _enter = resource_span.enter();
 
-            // Step 1: plan.
-            let diff = match primitive.plan(resource, facts, plan_ctx) {
+            // Step 1: plan. F09: оборачиваем в catch_unwind.
+            let plan_result = call_primitive(&format!("plan {}", &resource.id), || {
+                primitive.plan(resource, facts, plan_ctx)
+            });
+            let diff = match plan_result {
                 Ok(d) => {
                     tracing::debug!(diff = ?d, "plan computed");
                     d
@@ -362,8 +372,11 @@ impl Orchestrator {
             // Помечаем dirty заранее, чтобы следующий get пересобрал.
             mark_dirty(&kind);
 
-            // Step 4: apply.
-            match primitive.apply(resource, &diff, apply_ctx) {
+            // Step 4: apply. F09: оборачиваем в catch_unwind.
+            let apply_result = call_primitive(&format!("apply {}", &resource.id), || {
+                primitive.apply(resource, &diff, apply_ctx)
+            });
+            match apply_result {
                 Ok(report) => {
                     if report.changed {
                         // `summary` поле, а не `message`: вместе с format-msg
@@ -442,6 +455,42 @@ impl Orchestrator {
 fn describe_primitive_error(err: &PrimitiveError) -> (String, String) {
     let text = format!("{err}");
     (text.clone(), text)
+}
+
+/// Обернуть закрытие в catch_unwind. Любая паника превращается в
+/// `PrimitiveError::Panic { context, message }`. Используется на границах
+/// orchestrator → primitive: примитив user-supplied'ов, паника не должна
+/// валить весь bosun-прогон.
+pub(crate) fn call_primitive<F, R>(context: &str, f: F) -> Result<R, PrimitiveError>
+where
+    F: FnOnce() -> Result<R, PrimitiveError>,
+{
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let message = panic_message(payload.as_ref());
+            tracing::error!(
+                context = %context,
+                message = %message,
+                "primitive panicked",
+            );
+            Err(PrimitiveError::Panic {
+                context: context.to_string(),
+                message,
+            })
+        }
+    }
+}
+
+/// Извлечь сообщение из payload паники.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "<non-string panic payload>".to_string()
 }
 
 #[cfg(test)]
@@ -1311,6 +1360,130 @@ mod tests {
             events.iter().any(|e| e.contains("applied with change")),
             "expected per-resource 'applied with change' event; got: {events:?}",
         );
+    }
+
+    /// Mock-примитив, который панически валится в plan и/или apply —
+    /// используется в F09-тестах catch_unwind.
+    struct PanickyPrimitive {
+        kind: ResourceKind,
+        panic_in_plan: bool,
+        panic_in_apply: bool,
+    }
+
+    impl Primitive for PanickyPrimitive {
+        fn type_name(&self) -> ResourceKind {
+            self.kind.clone()
+        }
+        fn identity_keys(&self) -> &'static [&'static str] {
+            &["name"]
+        }
+        fn build_payload(
+            &self,
+            _: &CallArgs,
+            _: &PlanCtx,
+        ) -> Result<serde_json::Value, PrimitiveError> {
+            Ok(serde_json::json!({}))
+        }
+        #[allow(clippy::panic)]
+        fn plan(
+            &self,
+            _: &Resource,
+            _: &dyn FactsSource,
+            _: &PlanCtx,
+        ) -> Result<Diff, PrimitiveError> {
+            if self.panic_in_plan {
+                panic!("boom from plan");
+            }
+            Ok(Diff::Add {
+                description: "x".into(),
+                payload: serde_json::json!({}),
+            })
+        }
+        #[allow(clippy::panic)]
+        fn apply(
+            &self,
+            _: &Resource,
+            _: &Diff,
+            _: &ApplyCtx,
+        ) -> Result<ChangeReport, PrimitiveError> {
+            if self.panic_in_apply {
+                panic!("boom from apply");
+            }
+            Ok(ChangeReport::changed("ok"))
+        }
+    }
+
+    #[test]
+    fn plan_only_contains_panic_in_plan() {
+        // F09: panic в primitive.plan не валит весь plan_only,
+        // ошибка попадает в PlanReport.errors.
+        let mut reg = Registry::new();
+        reg.add(resource("apt.package", "nginx", vec![])).unwrap();
+        reg.add(resource("apt.package", "curl", vec![])).unwrap();
+
+        let mut primitives: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
+        primitives.insert(
+            kind("apt.package"),
+            Box::new(PanickyPrimitive {
+                kind: kind("apt.package"),
+                panic_in_plan: true,
+                panic_in_apply: false,
+            }),
+        );
+
+        let orchestrator = Orchestrator::new(primitives);
+        let report = orchestrator.plan_only(&reg, &NoFacts, &plan_ctx()).unwrap();
+        // Оба ресурса упали с паникой, оба в errors, в resources — пусто.
+        assert!(report.has_errors());
+        assert_eq!(report.errors.len(), 2);
+        for err in &report.errors {
+            assert!(
+                err.message.contains("panic") && err.message.contains("boom"),
+                "expected panic in error message, got: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn apply_contains_panic_in_apply() {
+        // F09: panic в primitive.apply мапится в Outcome::Failed,
+        // оркестратор продолжает прогон (или останавливается по
+        // continue_on_error=false как при обычной ошибке).
+        let mut reg = Registry::new();
+        reg.add(resource("apt.package", "nginx", vec![])).unwrap();
+
+        let mut primitives: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
+        primitives.insert(
+            kind("apt.package"),
+            Box::new(PanickyPrimitive {
+                kind: kind("apt.package"),
+                panic_in_plan: false,
+                panic_in_apply: true,
+            }),
+        );
+
+        let orchestrator = Orchestrator::new(primitives);
+        let mark_dirty = |_: &ResourceKind| {};
+        let report = orchestrator
+            .apply(
+                &reg,
+                &NoFacts,
+                &mark_dirty,
+                &plan_ctx(),
+                &apply_ctx(),
+                ApplyOpts::default(),
+            )
+            .unwrap();
+
+        assert_eq!(report.summary.failed, 1);
+        match &report.resources[0].outcome {
+            Outcome::Failed { error } => {
+                assert!(error.contains("panic"), "got: {error}");
+                assert!(error.contains("boom"), "got: {error}");
+            }
+            other => panic!("expected Failed with panic, got {other:?}"),
+        }
     }
 
     #[test]

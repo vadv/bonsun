@@ -214,8 +214,12 @@ fn register_primitive_call<'v>(
             let identity = build_identity(primitive.identity_keys(), &call_args)
                 .map_err(|e| record_invalid_call_in(state, kind_str, &format!("{e}")))?;
 
-            let payload = primitive
-                .build_payload(&call_args, &state.plan_ctx)
+            // F09: build_payload — пользовательский код примитива; паника
+            // не должна валить eval манифеста, маппим в PrimitiveError::Panic.
+            let payload =
+                crate::orchestrator::call_primitive(&format!("build_payload {kind_str}"), || {
+                    primitive.build_payload(&call_args, &state.plan_ctx)
+                })
                 .map_err(|e| record_invalid_call_in(state, kind_str, &format!("{e}")))?;
 
             let reload_on = call_args
