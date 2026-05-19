@@ -45,7 +45,7 @@ tokio-test = "0.4"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 zbus_systemd = { version = "0.25901", default-features = false, features = ["systemd1", "zbus-async-tokio"] }
 futures-util = "0.3"
-debversion = "0.4"
+debversion = "0.5"
 libc = "0.2"
 starlark = "~0.13"
 minijinja = "2"
