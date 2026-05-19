@@ -72,3 +72,11 @@ x509-parser = "0.16"
 # rcgen использует `time` для not_before/not_after — без зависимости
 # напрямую невозможно сконструировать OffsetDateTime для CertificateParams.
 time = "0.3"
+# Phase P: pg_sql.exec / pg_sql.query — sync PostgreSQL клиент. Pure Rust
+# (под капотом tokio-postgres + однопоточный wrapper), без libpq. TLS
+# опционален; включим лениво при подключении к DSN с `sslmode=require`.
+postgres = "0.19"
+# Парсер DSN. Нужен для redaction пароля в логах и для прокидывания
+# параметров в `postgres::Config`. URI разбираем сами — `postgres::Config`
+# умеет это `parse`, но мы оборачиваем для редакции.
+url = "2"

@@ -24,9 +24,10 @@ use bosun_facts::FactsCollector;
 use bosun_handles::{RunrHandle, SystemdHandle};
 use bosun_primitives::{
     dispatch::RealDispatchClient, template::render_template, AptPrimitive, CertTlsPrimitive,
-    FileDeletePrimitive, FilePrimitive, FileSymlinkPrimitive, GroupPrimitive,
-    ProcessSignalPrimitive, RealHealthCheckRunner, RunrCgroupPrimitive, RunrServicePrimitive,
-    RunrTimerPrimitive, SystemdServicePrimitive, SystemdTimerPrimitive, UserPrimitive,
+    FileDeletePrimitive, FilePrimitive, FileSymlinkPrimitive, GroupPrimitive, PgSqlExecPrimitive,
+    PgSqlQueryPrimitive, ProcessSignalPrimitive, RealHealthCheckRunner, RunrCgroupPrimitive,
+    RunrServicePrimitive, RunrTimerPrimitive, SystemdServicePrimitive, SystemdTimerPrimitive,
+    UserPrimitive,
 };
 use bosun_runr_client::Client as RunrClient;
 use bosun_systemd_client::BlockingSystemdManager;
@@ -496,6 +497,14 @@ fn build_primitives() -> HashMap<ResourceKind, Box<dyn Primitive>> {
         Box::new(FileSymlinkPrimitive),
     );
     m.insert(
+        ResourceKind::from_static("pg_sql.exec"),
+        Box::new(PgSqlExecPrimitive::with_real_backend()),
+    );
+    m.insert(
+        ResourceKind::from_static("pg_sql.query"),
+        Box::new(PgSqlQueryPrimitive::with_real_backend()),
+    );
+    m.insert(
         ResourceKind::from_static("process.signal"),
         Box::new(ProcessSignalPrimitive::with_real_runner()),
     );
@@ -819,6 +828,8 @@ mod tests {
             "file.content",
             "file.delete",
             "file.symlink",
+            "pg_sql.exec",
+            "pg_sql.query",
             "process.signal",
             "runr.service",
             "runr.timer",
@@ -833,7 +844,7 @@ mod tests {
                 "primitive {kind} not registered",
             );
         }
-        assert_eq!(m.len(), 13);
+        assert_eq!(m.len(), 15);
     }
 
     #[test]

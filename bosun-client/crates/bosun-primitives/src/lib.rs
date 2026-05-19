@@ -12,6 +12,9 @@ pub mod file_content;
 pub mod file_delete;
 pub mod file_symlink;
 pub mod health_check;
+pub mod pg_sql_common;
+pub mod pg_sql_exec;
+pub mod pg_sql_query;
 pub mod process_signal;
 pub mod runr_cgroup;
 pub mod runr_service;
@@ -36,6 +39,9 @@ pub use file_symlink::{
     SymlinkState,
 };
 pub use health_check::RealHealthCheckRunner;
+pub use pg_sql_common::{redact_dsn, PgSqlBackend, PgSqlError, RealPgSqlBackend, Row as PgSqlRow};
+pub use pg_sql_exec::{PgSqlExecPrimitive, PgSqlExecSpec};
+pub use pg_sql_query::{PgSqlQueryPrimitive, PgSqlQuerySpec};
 pub use process_signal::{
     build_signal_argv, ProcessSignalPrimitive, ProcessSignalRunner, ProcessSignalSpec,
     RealProcessSignalRunner,

@@ -16,7 +16,7 @@
 //! параллельная плоскость apply (per-namespace pool) потребует, чтобы их
 //! можно было держать в Arc и звать из любого worker'а.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -126,6 +126,14 @@ pub struct ApplyCtx {
     /// `bosun-core::health_check` (контракт) и
     /// `bosun-primitives::health_check::RealHealthCheckRunner` (production).
     pub health_check_runner: Arc<dyn HealthCheckRunner>,
+    /// Runtime-store published-фактов: примитив (например, `pg_sql.query`
+    /// с `store_as_fact=<name>`) пишет сюда результат, последующие
+    /// примитивы или вышестоящий evaluator могут прочитать. Это НЕ
+    /// FactsCollector: добавление в `published_facts` не триггерит dirty-
+    /// refresh и не виден через `FactsSource::get`. Это runtime
+    /// runtime-storage для нечастого «вывели и забыли». Чтение —
+    /// `read_published_fact`.
+    pub published_facts: Arc<Mutex<HashMap<String, serde_json::Value>>>,
 }
 
 impl PlanCtx {
@@ -269,6 +277,21 @@ impl ApplyCtx {
             Err(_) => false,
         }
     }
+
+    /// Опубликовать факт под именем `name` со значением `value`. Если факт
+    /// с таким именем уже есть — перезапишется. PoisonError игнорируем
+    /// аналогично [`Self::record_changed`].
+    pub fn publish_fact(&self, name: impl Into<String>, value: serde_json::Value) {
+        if let Ok(mut guard) = self.published_facts.lock() {
+            guard.insert(name.into(), value);
+        }
+    }
+
+    /// Прочитать опубликованный факт. None, если факт не публиковался или
+    /// mutex отравлён.
+    pub fn read_published_fact(&self, name: &str) -> Option<serde_json::Value> {
+        self.published_facts.lock().ok()?.get(name).cloned()
+    }
 }
 
 /// Builder для [`ApplyCtx`]. Введён в Phase J: ApplyCtx разросся до 15 полей,
@@ -400,6 +423,7 @@ impl ApplyCtxBuilder {
             health_check_runner: self
                 .health_check_runner
                 .unwrap_or_else(|| Arc::new(NoopHealthCheckRunner)),
+            published_facts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }

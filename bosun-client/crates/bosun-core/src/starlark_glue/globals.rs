@@ -47,6 +47,7 @@ pub fn build_globals() -> Globals {
         .with_namespace("cert", cert_namespace)
         .with_namespace("file", file_namespace)
         .with_namespace("inventory", inventory_namespace)
+        .with_namespace("pg_sql", pg_sql_namespace)
         .with_namespace("tags", tags_namespace)
         .with_namespace("service", service_namespace)
         .with_namespace("process", process_namespace)
@@ -268,6 +269,41 @@ fn process_namespace(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         register_primitive_call("process.signal", kwargs, eval)
+    }
+}
+
+/// Namespace `pg_sql` — нативные примитивы для PostgreSQL.
+///
+/// `pg_sql.exec` выполняет DDL/DML/GRANT через sync PG-клиент с
+/// опциональным `if_not_exists_check` для идемпотентности (read-before-write).
+/// `pg_sql.query` выполняет SELECT и при `store_as_fact=<name>` публикует
+/// результат в runtime registry фактов, доступный последующим примитивам
+/// через `ApplyCtx::read_published_fact`.
+///
+/// chiit-аналог: `lib/utils/pg/{users,grant,extension,alter_role}.go`
+/// делал CREATE ROLE/GRANT/CREATE EXTENSION через `database/sql`. Здесь
+/// то же декларативно — без shell/command escape hatch.
+#[starlark_module]
+fn pg_sql_namespace(builder: &mut GlobalsBuilder) {
+    /// `pg_sql.exec(name=, dsn=, sql=, if_not_exists_check=?, timeout_sec=?)`
+    /// — выполнение SQL-команды. Идемпотентность через опциональный SELECT
+    /// `if_not_exists_check`: если возвращает > 0 строк, exec пропускается.
+    fn exec<'v>(
+        #[starlark(kwargs)] kwargs: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        register_primitive_call("pg_sql.exec", kwargs, eval)
+    }
+
+    /// `pg_sql.query(name=, dsn=, sql=, timeout_sec=?, store_as_fact=?)` —
+    /// выполнение SELECT. Результат — `Vec<BTreeMap<column,value>>` (все
+    /// значения как строки). При `store_as_fact=<name>` публикуется в
+    /// runtime-store фактов.
+    fn query<'v>(
+        #[starlark(kwargs)] kwargs: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        register_primitive_call("pg_sql.query", kwargs, eval)
     }
 }
 
@@ -801,6 +837,8 @@ fn register_primitive_call<'v>(
         "runr.cgroup" => ResourceKind::from_static("runr.cgroup"),
         "systemd.service" => ResourceKind::from_static("systemd.service"),
         "systemd.timer" => ResourceKind::from_static("systemd.timer"),
+        "pg_sql.exec" => ResourceKind::from_static("pg_sql.exec"),
+        "pg_sql.query" => ResourceKind::from_static("pg_sql.query"),
         "process.signal" => ResourceKind::from_static("process.signal"),
         "users.user" => ResourceKind::from_static("users.user"),
         "users.group" => ResourceKind::from_static("users.group"),

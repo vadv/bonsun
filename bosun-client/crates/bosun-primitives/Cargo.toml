@@ -61,6 +61,11 @@ rsa = { workspace = true }
 rustls-pki-types = { workspace = true }
 x509-parser = { workspace = true }
 time = { workspace = true }
+# Phase P — sync PostgreSQL клиент для pg_sql.exec/pg_sql.query. Pure Rust,
+# без libpq. TLS не включаем feature'ом: для production-парка PG предполагается
+# `host=/var/run/postgresql` (unix socket) или явная конфигурация в DSN.
+postgres = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 # Нужен в Phase E unit-тестах: конструируем `SystemdError::BusUnavailable`
