@@ -1,0 +1,5 @@
+records:
+  - id: left
+    pkg: original-pkg
+  - id: middle
+    pkg: middle-pkg

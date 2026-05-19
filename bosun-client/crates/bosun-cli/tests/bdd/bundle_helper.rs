@@ -1,28 +1,17 @@
 //! Подготовка bundle'а на хосте и заливка в контейнер.
 //!
-//! BDD-сценарий описывает bundle через docstring-блоки:
-//! ```
-//! Given a bundle with manifest:
-//!   """
-//!   apt.package(name = "nginx")
-//!   """
-//! ```
-//! Helper'ы материализуют bundle во временной директории, дописывают
-//! `bundle.toml`, копируют всё в контейнер.
+//! Сценарии bundle_structure.feature ссылаются на готовые фикстуры из
+//! `tests/bdd/data/bundles/<slug>/`. Helper копирует директорию в контейнер
+//! через `docker cp`. Никаких inline-докстрингов и парсинга таблиц — bundle
+//! живёт как реальные файлы на диске, его можно открыть, запустить вне docker,
+//! проверить в IDE.
 //!
-//! Bundle rev 2 убрал `--inventory`. BDD-сценарии, использующие
-//! `Given a bundle with inventory:`, продолжают работать: helper кладёт
-//! yaml в `inventory/legacy.yaml` и оборачивает manifest следующим
-//! образом — в начало добавляется:
-//! ```
-//! load("@bosun/builtins", "inventory")
-//! inv = inventory.read("inventory/legacy.yaml")
-//! ```
-//! Это даёт легаси-bundle'ам глобал `inv`, к которому шаблоны обращаются
-//! через template(inv = inv).
+//! Для legacy-сценариев (apt_package, file_content, template, idempotency и
+//! т.д.), которые описывают manifest/inventory/template через docstring-блоки,
+//! работает прежняя ветка `materialize_and_upload_bundle`.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use cucumber::{gherkin::Step, given, when};
 use tempfile::TempDir;
@@ -53,13 +42,8 @@ fn write_file(path: &Path, body: &str) -> anyhow::Result<()> {
 
 /// Сгенерировать manifest, оборачивая user-body в нужные `load()`-преамбулы.
 ///
-/// Логика:
-/// - Если user-body уже содержит `load(`, оставляем как есть.
-/// - Иначе подмешиваем стандартный `load("@bosun/builtins", "apt", "file",
-///   "template", "inventory")`.
-/// - Если задан inventory_yaml, добавляем `inv = inventory.read(...)` и
-///   декорируем все `template("X")` → `template("X", inv = inv)` через
-///   regex.
+/// Используется только для legacy-сценариев (apt_package.feature и т.п.),
+/// которые описывают manifest как docstring.
 fn assemble_manifest(user_body: &str, has_inventory: bool) -> String {
     let mut out = String::new();
     if !user_body.contains("load(") {
@@ -70,9 +54,6 @@ fn assemble_manifest(user_body: &str, has_inventory: bool) -> String {
     if has_inventory && !user_body.contains("inventory.read(") {
         out.push_str("inv = inventory.read(\"inventory/legacy.yaml\")\n");
     }
-    // Декорируем template("foo.j2") → template("foo.j2", inv = inv), если
-    // user-body использует один из этих вызовов и не передаёт inv явно.
-    // Простой regex: ищем `template("...")` без kwargs.
     let decorated = if has_inventory {
         decorate_template_calls(user_body)
     } else {
@@ -90,10 +71,9 @@ fn decorate_template_calls(body: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if i + 9 <= bytes.len() && &bytes[i..i + 9] == b"template(" {
-            // Найти закрывающий ")" на уровне 0; собрать содержимое аргументов.
             let mut depth = 1;
             let mut j = i + 9;
-            let mut content_start = j;
+            let content_start = j;
             while j < bytes.len() && depth > 0 {
                 match bytes[j] {
                     b'(' => depth += 1,
@@ -148,22 +128,15 @@ pub fn materialize_and_upload_bundle(world: &mut BosunWorld) -> anyhow::Result<S
         write_file(&root.join("inventory/legacy.yaml"), inv_body)?;
     }
 
-    // Templates: новая раскладка — `roles/legacy/templates/X` плюс
-    // обёртка-роль, которая вызывает template'ы. Чтобы не ломать существующие
-    // сценарии с прямым вызовом template() из main.star, мы кладём шаблоны
-    // в _lib/legacy/templates/ и в main.star тоже создаём load на @lib/legacy
-    // (если шаблон используется). Однако в текущих BDD-сценариях template()
-    // вызывается напрямую из main.star, что новый template() rejects через
-    // TemplateFromManifests. Поэтому если шаблоны есть, оборачиваем в роль.
+    // Если есть шаблоны, оборачиваем user-body в роль `legacy` и кладём
+    // templates рядом — module-relative template() их находит, top-level
+    // template() в манифесте запрещён.
     if !world.templates.is_empty() {
-        // Делаем «legacy» роль и переписываем main.star: он load'ит роль и
-        // вызывает её функцию, которая внутри зовёт template().
         let role_body = build_legacy_role_module(&user_body, has_inventory);
         write_file(&root.join("roles/legacy/main.star"), &role_body)?;
         for (rel, body) in &world.templates {
             write_file(&root.join("roles/legacy/templates").join(rel), body)?;
         }
-        // Перезаписываем main.star, чтобы он звал legacy роль.
         let main = if has_inventory {
             "load(\"@bosun/builtins\", \"inventory\")\nload(\"@roles/legacy\", \"main\")\ninv = inventory.read(\"inventory/legacy.yaml\")\nmain(inv = inv)\n"
         } else {
@@ -192,8 +165,6 @@ fn build_legacy_role_module(user_body: &str, has_inventory: bool) -> String {
     } else {
         out.push_str("def main():\n");
     }
-    // user_body может состоять из top-level вызовов; чтобы превратить его
-    // в тело функции, добавляем индентацию ко всем непустым строкам.
     let body = if has_inventory {
         decorate_template_calls(user_body)
     } else {
@@ -295,40 +266,42 @@ pub async fn when_apply_bundle_again(world: &mut BosunWorld) {
     world.last_exec = Some(res);
 }
 
-/// Шаг для нового bundle_structure.feature: на месте материализует bundle
-/// из таблицы (path, body). body может содержать литералы `\n` для переноса
-/// строк (Gherkin не поддерживает многострочные ячейки красиво).
-#[given(regex = r#"^a bundle structure under "([^"]+)":$"#)]
-pub async fn given_bundle_structure(
-    world: &mut BosunWorld,
-    _path_in_container: String,
-    step: &Step,
-) {
+/// Залить готовый bundle-фикстур из `tests/bdd/data/bundles/<slug>/` в
+/// `/work/bundle` внутри контейнера. Slug передаётся как относительный путь
+/// от `tests/bdd/data/bundles/`.
+#[given(regex = r#"^the bundle "([^"]+)"$"#)]
+pub async fn given_bundle_fixture(world: &mut BosunWorld, slug: String) {
     let id = world
         .container_id
         .clone()
         .unwrap_or_else(|| panic!("no container is running"));
-    let table = step
-        .table
-        .as_ref()
-        .unwrap_or_else(|| panic!("bundle structure step requires a table"));
 
-    let tmp = TempDir::new().unwrap_or_else(|e| panic!("tempdir: {e}"));
-    let root = tmp.path().join("bundle");
-    fs::create_dir_all(&root).unwrap_or_else(|e| panic!("mkdir: {e}"));
+    let source = fixture_dir(&slug).unwrap_or_else(|e| panic!("locate fixture '{slug}': {e}"));
 
-    for row in table.rows.iter().skip(1) {
-        if row.len() != 2 {
-            panic!("expected 2 columns, got {}: {row:?}", row.len());
-        }
-        let rel = &row[0];
-        let raw = row[1].replace("\\n", "\n");
-        let body = if rel == "bundle.toml" {
-            bundle_toml_from_json_blob(&raw)
-        } else {
-            raw
-        };
-        write_file(&root.join(rel), &body).unwrap_or_else(|e| panic!("write {rel}: {e}"));
+    let res = docker_exec_shell(&id, "rm -rf /work/bundle && mkdir -p /work")
+        .unwrap_or_else(|e| panic!("clear bundle: {e}"));
+    if res.exit_code != 0 {
+        panic!("clear /work/bundle: {}", res.stderr);
+    }
+    docker_cp_into(&id, &source, "/work/bundle").unwrap_or_else(|e| panic!("docker cp: {e}"));
+    // Фиксируем bundle_tmp = None — bundle лежит как фикстура, временной
+    // директории нет.
+    world.bundle_tmp = None;
+}
+
+/// Залить ровно тот же путь, но из произвольного места репо (например,
+/// examples/multi-role-pg/bundle/). Принимает путь относительно корня
+/// проекта (workspace root).
+#[given(regex = r#"^the bundle from "([^"]+)"$"#)]
+pub async fn given_bundle_from_workspace(world: &mut BosunWorld, rel_path: String) {
+    let id = world
+        .container_id
+        .clone()
+        .unwrap_or_else(|| panic!("no container is running"));
+
+    let source = workspace_relative(&rel_path);
+    if !source.exists() {
+        panic!("bundle source path does not exist: {}", source.display());
     }
 
     let res = docker_exec_shell(&id, "rm -rf /work/bundle && mkdir -p /work")
@@ -336,39 +309,32 @@ pub async fn given_bundle_structure(
     if res.exit_code != 0 {
         panic!("clear /work/bundle: {}", res.stderr);
     }
-    docker_cp_into(&id, &root, "/work/bundle").unwrap_or_else(|e| panic!("docker cp: {e}"));
-    world.bundle_tmp = Some(tmp);
+    docker_cp_into(&id, &source, "/work/bundle").unwrap_or_else(|e| panic!("docker cp: {e}"));
+    world.bundle_tmp = None;
 }
 
-/// Превращает JSON-blob в правильный bundle.toml. Поддерживаемые ключи:
-/// name, version, requires_bosun, entry, tags, inv_strategy.
-fn bundle_toml_from_json_blob(json_str: &str) -> String {
-    let v: serde_json::Value = serde_json::from_str(json_str.trim())
-        .unwrap_or_else(|e| panic!("invalid bundle.toml json '{json_str}': {e}"));
-    let obj = v
-        .as_object()
-        .unwrap_or_else(|| panic!("bundle.toml json must be object"));
-    let mut out = String::new();
-    out.push_str("[bundle]\n");
-    for key in ["name", "version", "description", "requires_bosun", "entry"] {
-        if let Some(val) = obj.get(key) {
-            if let Some(s) = val.as_str() {
-                out.push_str(&format!("{key} = \"{s}\"\n"));
-            }
-        }
+fn fixture_dir(slug: &str) -> anyhow::Result<PathBuf> {
+    // slug может приходить как "data/bundles/<name>" или просто "<name>";
+    // нормализуем к каноническому имени поддиректории.
+    let trimmed = slug.trim_start_matches("./");
+    let name = trimmed.strip_prefix("data/bundles/").unwrap_or(trimmed);
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let base = Path::new(manifest_dir)
+        .join("tests")
+        .join("bdd")
+        .join("data")
+        .join("bundles")
+        .join(name);
+    if !base.exists() {
+        anyhow::bail!("fixture directory not found: {}", base.display());
     }
-    if let Some(strategy) = obj.get("inv_strategy").and_then(|v| v.as_str()) {
-        out.push_str("\n[bundle.inventory]\n");
-        out.push_str(&format!("default_merge_strategy = \"{strategy}\"\n"));
-    }
-    if let Some(tags) = obj.get("tags").and_then(|v| v.as_object()) {
-        out.push_str("\n[bundle.tags]\n");
-        for (k, v) in tags {
-            let desc = v.as_str().unwrap_or("");
-            out.push_str(&format!("{k} = \"{desc}\"\n"));
-        }
-    }
-    out
+    Ok(base)
+}
+
+fn workspace_relative(rel: &str) -> PathBuf {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    // CARGO_MANIFEST_DIR = .../crates/bosun-cli; workspace = .../..
+    Path::new(manifest_dir).join("..").join("..").join(rel)
 }
 
 /// Применить bundle с указанными тэгами. `tags_csv` — строка, может быть пустой.
@@ -399,23 +365,34 @@ pub async fn when_apply_bundle_with_tags(world: &mut BosunWorld, tags_csv: Strin
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
-    use super::*;
-
     #[test]
     fn decorate_template_adds_inv_kwarg_when_missing() {
-        let s = decorate_template_calls("x = template(\"foo.j2\")");
+        let s = super::decorate_template_calls("x = template(\"foo.j2\")");
         assert!(s.contains("template(\"foo.j2\", inv = inv)"));
     }
 
     #[test]
     fn decorate_template_leaves_kwargs_alone() {
-        let s = decorate_template_calls("x = template(\"foo.j2\", inv = something)");
+        let s = super::decorate_template_calls("x = template(\"foo.j2\", inv = something)");
         assert_eq!(s, "x = template(\"foo.j2\", inv = something)");
     }
 
     #[test]
     fn assemble_inserts_load_preamble_when_missing() {
-        let s = assemble_manifest("apt.package(name = \"x\")\n", false);
+        let s = super::assemble_manifest("apt.package(name = \"x\")\n", false);
         assert!(s.starts_with("load(\"@bosun/builtins\""));
+    }
+
+    #[test]
+    fn fixture_dir_accepts_short_slug() {
+        let p = super::fixture_dir("multi-role-basic").unwrap();
+        assert!(p.ends_with("data/bundles/multi-role-basic"));
+        assert!(p.exists());
+    }
+
+    #[test]
+    fn fixture_dir_accepts_prefixed_slug() {
+        let p = super::fixture_dir("data/bundles/multi-role-basic").unwrap();
+        assert!(p.ends_with("data/bundles/multi-role-basic"));
     }
 }

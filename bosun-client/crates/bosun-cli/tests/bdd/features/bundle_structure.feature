@@ -1,28 +1,22 @@
 @docker @bundle
 Feature: Bundle directory structure
-  bosun applies bundles with role/lib/inventory directory layout.
+  bosun applies bundles с role/lib/inventory directory layout.
+  Каждый сценарий ссылается на готовую фикстуру из
+  tests/bdd/data/bundles/<slug>/. Helper копирует директорию в контейнер
+  через docker cp и запускает bosun apply / bundle validate.
 
   @bundle-roles @slow
   Scenario: Multi-role bundle with explicit inventory loading
     Given a fresh container
-    And a bundle structure under "/work/bundle":
-      | path                                | body                                                                                                                                       |
-      | bundle.toml                         | {"name":"multi","version":"0.1.0","requires_bosun":"^0.1","entry":"manifests/main.star","tags":{"production":""},"inv_strategy":"deep_map_replace_list"} |
-      | manifests/main.star                 | load("@bosun/builtins", "inventory", "tags") \n load("@roles/nginx", "configure") \n tags.require_one_of("production") \n inv = inventory.read("inventory/base.yaml") \n configure(inv = inv) |
-      | inventory/base.yaml                 | service_workers: 8 \n service_user: nginx                                                                                                  |
-      | roles/nginx/main.star               | load("@bosun/builtins", "apt", "file", "template") \n def configure(inv): \n     apt.package(name="nginx") \n     file.content(path="/etc/nginx/nginx.conf", contents=template("nginx.conf.j2", inv=inv), mode=0o644, owner="root", group="root") |
-      | roles/nginx/templates/nginx.conf.j2 | worker_processes {{ inv.service_workers }};                                                                                                |
+    And the bundle "multi-role-basic"
     When I apply the bundle with tags "production"
     Then exit code is 0
-    And file "/etc/nginx/nginx.conf" content contains "worker_processes 8;"
+    And file "/etc/nginx/nginx.conf" contains "worker_processes 8;"
 
   @bundle-tags
   Scenario: Missing --tags fails fast
     Given a fresh container
-    And a bundle structure under "/work/bundle":
-      | path                | body                                                                                                              |
-      | bundle.toml         | {"name":"x","version":"0.1.0","requires_bosun":"^0.1","entry":"manifests/main.star"}                              |
-      | manifests/main.star | load("@bosun/builtins", "tags") \n tags.require_one_of("production", "staging")                                  |
+    And the bundle "tags-require"
     When I apply the bundle with tags ""
     Then exit code is 3
     And output contains "expected one of"
@@ -30,10 +24,7 @@ Feature: Bundle directory structure
   @bundle-tags
   Scenario: Wrong tag fails
     Given a fresh container
-    And a bundle structure under "/work/bundle":
-      | path                | body                                                                                                              |
-      | bundle.toml         | {"name":"x","version":"0.1.0","requires_bosun":"^0.1","entry":"manifests/main.star"}                              |
-      | manifests/main.star | load("@bosun/builtins", "tags") \n tags.require_one_of("production", "staging")                                  |
+    And the bundle "tags-require"
     When I apply the bundle with tags "development"
     Then exit code is 3
     And output contains "expected one of"
@@ -41,22 +32,14 @@ Feature: Bundle directory structure
   @bundle-templates
   Scenario: Cross-module template access is rejected
     Given a fresh container
-    And a bundle structure under "/work/bundle":
-      | path                | body                                                                                                                  |
-      | bundle.toml         | {"name":"x","version":"0.1.0","requires_bosun":"^0.1","entry":"manifests/main.star","tags":{"bdd":""}}                |
-      | manifests/main.star | load("@roles/a", "configure") \n configure()                                                                          |
-      | roles/a/main.star   | load("@bosun/builtins", "template") \n def configure(): \n     x = template("@roles/b:foo.j2")                       |
-      | roles/b/main.star   | def stub(): \n     pass                                                                                              |
+    And the bundle "cross-module-template"
     When I apply the bundle with tags "bdd"
     Then exit code is 3
 
   @bundle-templates
   Scenario: template() from manifests/main.star is rejected
     Given a fresh container
-    And a bundle structure under "/work/bundle":
-      | path                | body                                                                                                                  |
-      | bundle.toml         | {"name":"x","version":"0.1.0","requires_bosun":"^0.1","entry":"manifests/main.star","tags":{"bdd":""}}                |
-      | manifests/main.star | load("@bosun/builtins", "template") \n template("foo.j2")                                                              |
+    And the bundle "template-from-manifests"
     When I apply the bundle with tags "bdd"
     Then exit code is 3
     And output contains "manifests"
@@ -64,23 +47,14 @@ Feature: Bundle directory structure
   @bundle-privacy
   Scenario: Private symbol import is rejected
     Given a fresh container
-    And a bundle structure under "/work/bundle":
-      | path                | body                                                                                                                  |
-      | bundle.toml         | {"name":"x","version":"0.1.0","requires_bosun":"^0.1","entry":"manifests/main.star","tags":{"bdd":""}}                |
-      | manifests/main.star | load("@roles/a", "_private")                                                                                          |
-      | roles/a/main.star   | def _private(): \n     pass                                                                                          |
+    And the bundle "private-symbol"
     When I apply the bundle with tags "bdd"
     Then exit code is 3
 
   @bundle-inventory
   Scenario: Inventory merge strategy replace replaces all lists
     Given a fresh container
-    And a bundle structure under "/work/bundle":
-      | path                  | body                                                                                                                                                                                    |
-      | bundle.toml           | {"name":"x","version":"0.1.0","requires_bosun":"^0.1","entry":"manifests/main.star","tags":{"bdd":""}}                                                                                  |
-      | manifests/main.star   | load("@bosun/builtins", "apt", "inventory") \n a = inventory.read("inventory/a.yaml") \n b = inventory.read("inventory/b.yaml") \n m = inventory.merge(a, b, strategy="replace") \n apt.package(name = m["servers"][0]) |
-      | inventory/a.yaml      | servers: ["alpha", "beta", "gamma"]                                                                                                                                                     |
-      | inventory/b.yaml      | servers: ["delta"]                                                                                                                                                                      |
+    And the bundle "merge-replace"
     When I apply the bundle with tags "bdd"
     Then exit code is 0
     And package "delta" is installed
@@ -88,12 +62,15 @@ Feature: Bundle directory structure
   @bundle-inventory
   Scenario: Inventory merge strategy deep_map_append_list concats
     Given a fresh container
-    And a bundle structure under "/work/bundle":
-      | path                  | body                                                                                                                                                                                                    |
-      | bundle.toml           | {"name":"x","version":"0.1.0","requires_bosun":"^0.1","entry":"manifests/main.star","tags":{"bdd":""}}                                                                                                  |
-      | manifests/main.star   | load("@bosun/builtins", "apt", "inventory") \n a = inventory.read("inventory/a.yaml") \n b = inventory.read("inventory/b.yaml") \n m = inventory.merge(a, b, strategy="deep_map_append_list") \n apt.package(name = m["servers"][3]) |
-      | inventory/a.yaml      | servers: ["alpha", "beta", "gamma"]                                                                                                                                                                     |
-      | inventory/b.yaml      | servers: ["delta"]                                                                                                                                                                                      |
+    And the bundle "merge-append"
+    When I apply the bundle with tags "bdd"
+    Then exit code is 0
+    And package "delta" is installed
+
+  @bundle-inventory
+  Scenario: Inventory merge without strategy uses bundle.toml default
+    Given a fresh container
+    And the bundle "merge-default-strategy"
     When I apply the bundle with tags "bdd"
     Then exit code is 0
     And package "delta" is installed
@@ -101,37 +78,34 @@ Feature: Bundle directory structure
   @bundle-inventory
   Scenario: Null in override removes key
     Given a fresh container
-    And a bundle structure under "/work/bundle":
-      | path                  | body                                                                                                                                                                                                    |
-      | bundle.toml           | {"name":"x","version":"0.1.0","requires_bosun":"^0.1","entry":"manifests/main.star","tags":{"bdd":""},"inv_strategy":"deep_map_replace_list"}                                                            |
-      | manifests/main.star   | load("@bosun/builtins", "apt", "inventory") \n a = inventory.read("inventory/a.yaml") \n b = inventory.read("inventory/b.yaml") \n m = inventory.merge(a, b) \n apt.package(name = m["keep"])           |
-      | inventory/a.yaml      | drop: original \n keep: original                                                                                                                                                                        |
-      | inventory/b.yaml      | drop: null                                                                                                                                                                                              |
+    And the bundle "merge-null-removes-key"
     When I apply the bundle with tags "bdd"
     Then exit code is 0
-    And package "original" is installed
+    And file "/etc/merge-result.txt" contains "keep=original"
+    And file "/etc/merge-result.txt" does not contain "drop="
+
+  @bundle-inventory
+  Scenario: merge_keyed combines records by key field
+    Given a fresh container
+    And the bundle "merge-keyed"
+    When I apply the bundle with tags "bdd"
+    Then exit code is 0
+    And file "/etc/keyed-result.txt" contains "left=merged-pkg"
+    And file "/etc/keyed-result.txt" contains "middle=middle-pkg"
+    And file "/etc/keyed-result.txt" contains "right=right-pkg"
 
   @bundle-composition
   Scenario: Role to lib to template composition resolves correctly
     Given a fresh container
-    And a bundle structure under "/work/bundle":
-      | path                              | body                                                                                                                                                                |
-      | bundle.toml                       | {"name":"x","version":"0.1.0","requires_bosun":"^0.1","entry":"manifests/main.star","tags":{"bdd":""}}                                                              |
-      | manifests/main.star               | load("@roles/myrole", "configure") \n configure()                                                                                                                   |
-      | roles/myrole/main.star            | load("@bosun/builtins", "file") \n load("@lib/runr", "render_service") \n def configure(): \n     file.content(path="/etc/myunit.service", contents=render_service(exec="/bin/true")) |
-      | _lib/runr/main.star               | load("@bosun/builtins", "template") \n def render_service(exec): \n     return template("service.j2", exec_path=exec)                                              |
-      | _lib/runr/templates/service.j2    | ExecStart={{ exec_path }}                                                                                                                                            |
+    And the bundle "role-lib-template"
     When I apply the bundle with tags "bdd"
     Then exit code is 0
-    And file "/etc/myunit.service" content contains "ExecStart=/bin/true"
+    And file "/etc/myunit.service" contains "ExecStart=/bin/true"
 
   @bundle-validate
   Scenario: bundle validate exits 0 on clean bundle
     Given a fresh container
-    And a bundle structure under "/work/bundle":
-      | path                | body                                                                                                                  |
-      | bundle.toml         | {"name":"x","version":"0.1.0","requires_bosun":"^0.1","entry":"manifests/main.star","tags":{"bdd":""}}                |
-      | manifests/main.star | load("@bosun/builtins", "apt", "tags") \n tags.require_one_of("bdd") \n apt.package(name = "nothing")                  |
+    And the bundle "validate-clean"
     When I run "bosun bundle validate --bundle /work/bundle --tags=bdd" inside the container
     Then exit code is 0
     And output contains "evaluate OK"
@@ -139,10 +113,7 @@ Feature: Bundle directory structure
   @bundle-validate
   Scenario: bundle validate exits 3 on missing inventory file
     Given a fresh container
-    And a bundle structure under "/work/bundle":
-      | path                | body                                                                                                                  |
-      | bundle.toml         | {"name":"x","version":"0.1.0","requires_bosun":"^0.1","entry":"manifests/main.star","tags":{"bdd":""}}                |
-      | manifests/main.star | load("@bosun/builtins", "inventory") \n inventory.read("inventory/missing.yaml")                                       |
+    And the bundle "validate-broken"
     When I run "bosun bundle validate --bundle /work/bundle --tags=bdd" inside the container
     Then exit code is 3
     And output contains "inventory/missing.yaml"

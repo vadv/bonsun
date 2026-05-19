@@ -112,6 +112,26 @@ pub async fn then_file_contains(world: &mut BosunWorld, path: String, needle: St
     }
 }
 
+#[then(regex = r#"^file "([^"]+)" does not contain "([^"]+)"$"#)]
+pub async fn then_file_does_not_contain(world: &mut BosunWorld, path: String, needle: String) {
+    let id = container_id_or_panic(world);
+    let res =
+        docker_exec_args(&id, &["cat", &path]).unwrap_or_else(|e| panic!("docker exec cat: {e}"));
+    if res.exit_code != 0 {
+        panic!(
+            "failed to read {path} (exit {code}): {err}",
+            code = res.exit_code,
+            err = res.stderr,
+        );
+    }
+    if res.stdout.contains(&needle) {
+        panic!(
+            "file {path} unexpectedly contains {needle:?}\nactual content:\n{actual}",
+            actual = res.stdout,
+        );
+    }
+}
+
 #[then(regex = r#"^file "([^"]+)" has sha256 "([0-9a-f]+)"$"#)]
 pub async fn then_file_has_sha(world: &mut BosunWorld, path: String, expected_hex: String) {
     let id = container_id_or_panic(world);

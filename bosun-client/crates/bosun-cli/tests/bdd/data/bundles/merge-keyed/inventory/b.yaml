@@ -1,0 +1,5 @@
+records:
+  - id: left
+    pkg: merged-pkg
+  - id: right
+    pkg: right-pkg
