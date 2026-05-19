@@ -109,6 +109,14 @@ pub enum Outcome {
     Deferred {
         reason: String,
     },
+    /// Прогон прерван извне: SIGTERM/SIGINT или истечение `--deadline-sec`.
+    /// Семантически отличается от `Deferred` («внешний фактор временно
+    /// мешает») и `Failed` («ресурс реально не применился»). Оператор
+    /// видит, что bosun не довёл работу до конца, и решает — повторить
+    /// команду или нет. CLI отдаёт exit-code 130.
+    Interrupted {
+        reason: String,
+    },
 }
 
 /// Результат apply одного ресурса.
@@ -130,6 +138,7 @@ pub struct ApplySummary {
     pub failed: usize,
     pub skipped: usize,
     pub deferred: usize,
+    pub interrupted: usize,
 }
 
 /// Отчёт о apply прогоне.
@@ -143,6 +152,13 @@ pub struct ApplyReport {
 impl ApplyReport {
     pub fn has_failures(&self) -> bool {
         self.summary.failed > 0
+    }
+
+    /// `true`, если хотя бы один ресурс отчитался `Interrupted` —
+    /// прогон был прерван SIGTERM/deadline. Используется CLI для
+    /// возврата exit-code 130 и для итогового `success=false`.
+    pub fn has_interruptions(&self) -> bool {
+        self.summary.interrupted > 0
     }
 }
 
@@ -335,6 +351,23 @@ impl Orchestrator {
                     tracing::debug!(diff = ?d, "plan computed");
                     d
                 }
+                Err(PrimitiveError::Cancelled) => {
+                    // Прервали посередине plan — нечего применять,
+                    // дальнейшие ресурсы тоже пропускаем.
+                    let reason = "plan cancelled by deadline or signal".to_string();
+                    tracing::info!("plan cancelled");
+                    resources.push(ResourceApplyOutcome {
+                        id: id.clone(),
+                        kind: kind.clone(),
+                        outcome: Outcome::Interrupted {
+                            reason: reason.clone(),
+                        },
+                        message: reason,
+                    });
+                    summary.interrupted += 1;
+                    aborted = true;
+                    continue;
+                }
                 Err(e) => {
                     let message = format!("plan failed: {e}");
                     tracing::warn!(error = %e, "plan failed");
@@ -425,6 +458,26 @@ impl Orchestrator {
                         summary.no_change += 1;
                     }
                 }
+                Err(PrimitiveError::Cancelled) => {
+                    // Прерывание apply посередине: deadline истёк или
+                    // прилетел SIGTERM. Не Deferred (это семантически
+                    // «попробуй позже»), не Failed (ресурс не сломался —
+                    // мы сами его не доделали). Останавливаем дальнейшие
+                    // ресурсы: они тоже отчитаются Cancelled, нечего
+                    // молотить вхолостую.
+                    let reason = "apply cancelled by deadline or signal".to_string();
+                    tracing::info!("apply cancelled");
+                    resources.push(ResourceApplyOutcome {
+                        id,
+                        kind,
+                        outcome: Outcome::Interrupted {
+                            reason: reason.clone(),
+                        },
+                        message: reason,
+                    });
+                    summary.interrupted += 1;
+                    aborted = true;
+                }
                 Err(e) if e.is_deferrable() => {
                     let reason = format!("{e}");
                     tracing::info!(reason = %reason, "apply deferred");
@@ -464,6 +517,7 @@ impl Orchestrator {
             failed = summary.failed,
             skipped = summary.skipped,
             deferred = summary.deferred,
+            interrupted = summary.interrupted,
             "apply complete",
         );
 
@@ -1308,6 +1362,178 @@ mod tests {
         assert_eq!(log.len(), 2);
         assert_eq!(report.summary.deferred, 2);
         assert_eq!(report.summary.failed, 0);
+    }
+
+    /// Mock-примитив, который имитирует прерывание apply: возвращает
+    /// `Cancelled` из apply (как будто проверка `cancelled_or_past_deadline`
+    /// сработала внутри `primitive.apply`).
+    struct CancellingApplyPrimitive {
+        kind: ResourceKind,
+        apply_count: std::sync::Mutex<u32>,
+    }
+    impl Primitive for CancellingApplyPrimitive {
+        fn type_name(&self) -> ResourceKind {
+            self.kind.clone()
+        }
+        fn identity_keys(&self) -> &'static [&'static str] {
+            &["name"]
+        }
+        fn build_payload(
+            &self,
+            _: &CallArgs,
+            _: &PlanCtx,
+        ) -> Result<serde_json::Value, PrimitiveError> {
+            Ok(serde_json::json!({}))
+        }
+        fn plan(
+            &self,
+            _: &Resource,
+            _: &dyn FactsSource,
+            _: &PlanCtx,
+        ) -> Result<Diff, PrimitiveError> {
+            Ok(Diff::Add {
+                description: "install".into(),
+                payload: serde_json::json!({}),
+            })
+        }
+        fn apply(
+            &self,
+            _: &Resource,
+            _: &Diff,
+            _: &ApplyCtx,
+        ) -> Result<ChangeReport, PrimitiveError> {
+            *self.apply_count.lock().unwrap() += 1;
+            Err(PrimitiveError::Cancelled)
+        }
+    }
+
+    #[test]
+    fn apply_cancelled_yields_interrupted_outcome_and_aborts_run() {
+        // Симуляция: первый ресурс отчитался Cancelled (SIGTERM/deadline).
+        // Ожидаем: один Outcome::Interrupted, остальные Skipped (не Deferred),
+        // summary.interrupted=1, summary.failed=0, summary.deferred=0,
+        // has_interruptions()=true. Это даёт CLI exit-code 130.
+        let mut reg = Registry::new();
+        let a = reg.add(resource("apt.package", "a", vec![])).unwrap();
+        reg.add(resource("apt.package", "b", vec![a])).unwrap();
+
+        let mut primitives: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
+        primitives.insert(
+            kind("apt.package"),
+            Box::new(CancellingApplyPrimitive {
+                kind: kind("apt.package"),
+                apply_count: std::sync::Mutex::new(0),
+            }),
+        );
+
+        let orchestrator = Orchestrator::new(primitives);
+        let mark_dirty = |_: &ResourceKind| {};
+        let report = orchestrator
+            .apply(
+                &reg,
+                &NoFacts,
+                &mark_dirty,
+                &plan_ctx(),
+                &apply_ctx(),
+                ApplyOpts {
+                    continue_on_error: true,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(report.resources.len(), 2);
+        assert_eq!(report.summary.interrupted, 1);
+        assert_eq!(report.summary.skipped, 1);
+        assert_eq!(report.summary.failed, 0);
+        assert_eq!(report.summary.deferred, 0);
+        assert!(report.has_interruptions());
+        assert!(!report.has_failures());
+
+        // Первый ресурс — Interrupted с понятным reason.
+        match &report.resources[0].outcome {
+            Outcome::Interrupted { reason } => {
+                assert!(reason.contains("cancelled"), "reason: {reason}");
+            }
+            other => panic!("expected Interrupted, got {other:?}"),
+        }
+        // Второй — Skipped (не Cancelled): мы прервали run, остальные
+        // даже не пытались.
+        assert!(matches!(report.resources[1].outcome, Outcome::Skipped));
+    }
+
+    #[test]
+    fn cancelled_in_plan_phase_yields_interrupted_outcome() {
+        // Plan вернул Cancelled — это тоже Interrupted. Apply не зовётся.
+        struct CancellingPlanPrimitive {
+            kind: ResourceKind,
+            apply_calls: std::sync::Mutex<u32>,
+        }
+        impl Primitive for CancellingPlanPrimitive {
+            fn type_name(&self) -> ResourceKind {
+                self.kind.clone()
+            }
+            fn identity_keys(&self) -> &'static [&'static str] {
+                &["name"]
+            }
+            fn build_payload(
+                &self,
+                _: &CallArgs,
+                _: &PlanCtx,
+            ) -> Result<serde_json::Value, PrimitiveError> {
+                Ok(serde_json::json!({}))
+            }
+            fn plan(
+                &self,
+                _: &Resource,
+                _: &dyn FactsSource,
+                _: &PlanCtx,
+            ) -> Result<Diff, PrimitiveError> {
+                Err(PrimitiveError::Cancelled)
+            }
+            fn apply(
+                &self,
+                _: &Resource,
+                _: &Diff,
+                _: &ApplyCtx,
+            ) -> Result<ChangeReport, PrimitiveError> {
+                *self.apply_calls.lock().unwrap() += 1;
+                Ok(ChangeReport::changed("should not happen"))
+            }
+        }
+
+        let mut reg = Registry::new();
+        reg.add(resource("apt.package", "x", vec![])).unwrap();
+        reg.add(resource("apt.package", "y", vec![])).unwrap();
+
+        let mut primitives: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
+        primitives.insert(
+            kind("apt.package"),
+            Box::new(CancellingPlanPrimitive {
+                kind: kind("apt.package"),
+                apply_calls: std::sync::Mutex::new(0),
+            }),
+        );
+        let orchestrator = Orchestrator::new(primitives);
+        let mark_dirty = |_: &ResourceKind| {};
+        let report = orchestrator
+            .apply(
+                &reg,
+                &NoFacts,
+                &mark_dirty,
+                &plan_ctx(),
+                &apply_ctx(),
+                ApplyOpts::default(),
+            )
+            .unwrap();
+
+        assert_eq!(report.summary.interrupted, 1);
+        assert_eq!(report.summary.failed, 0);
+        // Один Interrupted, остальное Skipped.
+        assert!(matches!(
+            report.resources[0].outcome,
+            Outcome::Interrupted { .. }
+        ));
+        assert!(matches!(report.resources[1].outcome, Outcome::Skipped));
     }
 
     use crate::tracing_test_util::{install_global_router, record_events};

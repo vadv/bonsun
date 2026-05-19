@@ -249,11 +249,16 @@ impl PrimitiveError {
     ///
     /// `RunrUnavailable` / `SystemdUnavailable` ведут себя так же: демон
     /// уйдёт в reboot или перезапустится и через минуту будет доступен.
+    ///
+    /// `Cancelled` сюда **не** входит: SIGTERM или истечение deadline —
+    /// это явный сигнал «прервите процесс», и трактовать его как «отложим,
+    /// замаскируем под success» враждебно оператору. Orchestrator маппит
+    /// такие ошибки в отдельный `Outcome::Interrupted`, CLI возвращает
+    /// exit-code 130 (POSIX-стандарт для SIGINT/SIGTERM).
     pub fn is_deferrable(&self) -> bool {
         matches!(
             self,
             PrimitiveError::DpkgLocked { .. }
-                | PrimitiveError::Cancelled
                 | PrimitiveError::RunrUnavailable { .. }
                 | PrimitiveError::SystemdUnavailable { .. }
         )
@@ -322,13 +327,20 @@ mod tests {
     }
 
     #[test]
-    fn is_deferrable_for_dpkg_locked_and_cancelled() {
+    fn is_deferrable_for_dpkg_locked() {
         assert!(PrimitiveError::DpkgLocked { holder_pid: None }.is_deferrable());
         assert!(PrimitiveError::DpkgLocked {
             holder_pid: Some(42)
         }
         .is_deferrable());
-        assert!(PrimitiveError::Cancelled.is_deferrable());
+    }
+
+    #[test]
+    fn is_deferrable_for_cancelled_is_false() {
+        // SIGTERM / deadline expiry — это «прервите процесс», не «отложим».
+        // Маппится в Outcome::Interrupted на уровне orchestrator'а, не в
+        // Deferred. См. exit-code 130 в CLI.
+        assert!(!PrimitiveError::Cancelled.is_deferrable());
     }
 
     #[test]

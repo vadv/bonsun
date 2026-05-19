@@ -34,6 +34,10 @@ pub struct MetricSnapshot {
     pub resources_unchanged: usize,
     pub resources_failed: usize,
     pub resources_deferred: usize,
+    /// Прерванные ресурсы — отдельный outcome для SIGTERM/deadline.
+    /// Алерт на «postgres-bosun застрял» проще ставить на эту метрику
+    /// напрямую, чем угадывать «exit_code=130 и >0 ресурсов».
+    pub resources_interrupted: usize,
     pub fact_states: Vec<FactStateEntry>,
 }
 
@@ -92,6 +96,10 @@ pub fn format(snapshot: &MetricSnapshot) -> String {
     out.push_str(&format!(
         "bosun_resources_total{{outcome=\"deferred\"}} {}\n",
         snapshot.resources_deferred,
+    ));
+    out.push_str(&format!(
+        "bosun_resources_total{{outcome=\"interrupted\"}} {}\n",
+        snapshot.resources_interrupted,
     ));
     out.push('\n');
 
@@ -173,6 +181,7 @@ mod tests {
             resources_unchanged: 47,
             resources_failed: 0,
             resources_deferred: 0,
+            resources_interrupted: 0,
             fact_states: vec![
                 FactStateEntry {
                     name: "hostname".to_string(),
@@ -245,11 +254,13 @@ mod tests {
     fn format_emits_all_resource_outcomes() {
         let mut sn = sample();
         sn.resources_deferred = 3;
+        sn.resources_interrupted = 1;
         let s = format(&sn);
         assert!(s.contains("bosun_resources_total{outcome=\"changed\"} 2"));
         assert!(s.contains("bosun_resources_total{outcome=\"unchanged\"} 47"));
         assert!(s.contains("bosun_resources_total{outcome=\"failed\"} 0"));
         assert!(s.contains("bosun_resources_total{outcome=\"deferred\"} 3"));
+        assert!(s.contains("bosun_resources_total{outcome=\"interrupted\"} 1"));
     }
 
     #[test]

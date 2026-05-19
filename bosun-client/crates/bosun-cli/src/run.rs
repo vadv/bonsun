@@ -79,6 +79,7 @@ pub fn run(args: &ApplyArgs) -> i32 {
                 resources_unchanged: 0,
                 resources_failed: 0,
                 resources_deferred: 0,
+                resources_interrupted: 0,
                 fact_states: Vec::new(),
             };
             if let Err(e) = metric::write_atomic(&args.metric_file, &snapshot) {
@@ -202,7 +203,7 @@ pub fn run(args: &ApplyArgs) -> i32 {
     );
 
     let view = facts.view();
-    let (exit, changed, unchanged, failed, deferred) = if args.dry_run {
+    let (exit, changed, unchanged, failed, deferred, interrupted) = if args.dry_run {
         match orchestrator.plan_only(&registry, &view, &plan_ctx) {
             Ok(report) => {
                 print_plan(&report, args.format);
@@ -218,6 +219,7 @@ pub fn run(args: &ApplyArgs) -> i32 {
                     changed_count,
                     report.summary.no_change,
                     report.errors.len(),
+                    0_usize,
                     0_usize,
                 )
             }
@@ -235,7 +237,13 @@ pub fn run(args: &ApplyArgs) -> i32 {
         match orchestrator.apply(&registry, &view, &mark_dirty, &plan_ctx, &apply_ctx, opts) {
             Ok(report) => {
                 print_apply(&report, args.format);
-                let code = if report.has_failures() {
+                // Приоритет кодов: Interrupted > PartialFailure > Success.
+                // Прерванный прогон важнее частичного провала: оператор
+                // должен понимать, что мы вообще не довели run до конца,
+                // а не «что-то упало, остальное доделали».
+                let code = if report.has_interruptions() {
+                    exit_code::APPLY_INTERRUPTED
+                } else if report.has_failures() {
                     exit_code::APPLY_PARTIAL_FAILURE
                 } else {
                     exit_code::SUCCESS
@@ -246,6 +254,7 @@ pub fn run(args: &ApplyArgs) -> i32 {
                     report.summary.no_change,
                     report.summary.failed,
                     report.summary.deferred,
+                    report.summary.interrupted,
                 )
             }
             Err(e) => {
@@ -267,6 +276,7 @@ pub fn run(args: &ApplyArgs) -> i32 {
         resources_unchanged: unchanged,
         resources_failed: failed,
         resources_deferred: deferred,
+        resources_interrupted: interrupted,
         fact_states,
     };
     if let Err(e) = metric::write_atomic(&args.metric_file, &snapshot) {
@@ -424,6 +434,7 @@ fn print_apply(report: &ApplyReport, format: ReportFormat) {
                     Outcome::Failed { .. } => "x ",
                     Outcome::Skipped => "- ",
                     Outcome::Deferred { .. } => "~ ",
+                    Outcome::Interrupted { .. } => "! ",
                     _ => "? ",
                 };
                 let label = match &r.outcome {
@@ -432,6 +443,7 @@ fn print_apply(report: &ApplyReport, format: ReportFormat) {
                     Outcome::Failed { error } => format!("failed: {error}"),
                     Outcome::Skipped => r.message.clone(),
                     Outcome::Deferred { reason } => format!("deferred: {reason}"),
+                    Outcome::Interrupted { reason } => format!("interrupted: {reason}"),
                     _ => r.message.clone(),
                 };
                 let _ = writeln!(out, "  {marker}{kind} {id}", kind = r.kind, id = r.id);
@@ -441,12 +453,13 @@ fn print_apply(report: &ApplyReport, format: ReportFormat) {
             }
             let _ = writeln!(
                 out,
-                "\nSummary: {changed} changed, {nc} no-change, {failed} failed, {skipped} skipped, {deferred} deferred.",
+                "\nSummary: {changed} changed, {nc} no-change, {failed} failed, {skipped} skipped, {deferred} deferred, {interrupted} interrupted.",
                 changed = report.summary.changed,
                 nc = report.summary.no_change,
                 failed = report.summary.failed,
                 skipped = report.summary.skipped,
                 deferred = report.summary.deferred,
+                interrupted = report.summary.interrupted,
             );
         }
     }

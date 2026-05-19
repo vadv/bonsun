@@ -21,29 +21,42 @@ pub const EVAL_ERROR: i32 = 3;
 /// директории, не удалось открыть lock-файл.
 pub const CLI_ENV_ERROR: i32 = 4;
 
+/// Apply прерван SIGTERM/SIGINT или истечением `--deadline-sec`.
+/// 130 — POSIX-стандарт (128 + SIGINT=2). Внешний оркестратор по этому
+/// коду понимает: «процесс прервали извне, попытка незавершена»,
+/// в отличие от 1 («часть ресурсов реально провалилась»).
+pub const APPLY_INTERRUPTED: i32 = 130;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn codes_distinct_in_documented_range() {
-        let codes = [
+    fn codes_distinct_and_within_expected_ranges() {
+        let small_codes = [
             SUCCESS,
             APPLY_PARTIAL_FAILURE,
             DRY_RUN_DRIFT,
             EVAL_ERROR,
             CLI_ENV_ERROR,
         ];
-        for code in codes {
+        for code in small_codes {
             assert!(
                 (0..=4).contains(&code),
-                "code {code} out of documented range"
+                "code {code} out of documented small range"
             );
         }
-        // Уникальность — простая защита от опечаток в константах.
-        let mut sorted = codes.to_vec();
+        // POSIX-style signal exit codes — отдельный диапазон 128+N.
+        assert_eq!(APPLY_INTERRUPTED, 130);
+
+        let all_codes: Vec<i32> = small_codes
+            .iter()
+            .copied()
+            .chain([APPLY_INTERRUPTED])
+            .collect();
+        let mut sorted = all_codes.clone();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), codes.len(), "exit codes must be distinct");
+        assert_eq!(sorted.len(), all_codes.len(), "exit codes must be distinct");
     }
 }
