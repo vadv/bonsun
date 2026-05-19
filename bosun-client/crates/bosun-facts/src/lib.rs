@@ -16,6 +16,7 @@ pub mod init_system;
 pub mod installed_packages;
 pub mod is_pod;
 pub mod memory_mb;
+pub mod pg;
 
 pub use catalog::with_default_collectors;
 pub use collector::{Fact, FactCollectCtx, FactsCollector, FactsSnapshot, FactsView};

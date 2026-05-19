@@ -1,8 +1,13 @@
 //! Фабрика default-набора коллекторов для MVP.
 //!
 //! Используется из bosun-cli при старте: создаёт `FactsCollector` со всеми
-//! шестью MVP-фактами и заданным root-путём. На проде root_fs = "/",
-//! в тестах подменяется на tempdir.
+//! MVP-фактами плюс опциональным набором PG-discovery-фактов. На проде
+//! root_fs = "/", в тестах подменяется на tempdir.
+//!
+//! PG-факты регистрируются всегда, даже на не-PG-нодах — это нужно для
+//! Strict-режима в Starlark: набор имён фактов должен быть стабильным
+//! независимо от того, какая роль применяется. На нодах без PG факты
+//! отдают `Unknown { reason: "no PostgreSQL detected ..." }`.
 
 use std::path::PathBuf;
 
@@ -13,10 +18,11 @@ use crate::init_system::InitSystemFact;
 use crate::installed_packages::InstalledPackagesFact;
 use crate::is_pod::IsPodFact;
 use crate::memory_mb::MemoryMbFact;
+use crate::pg::build_pg_facts;
 
-/// Возвращает коллектор со всеми MVP-фактами.
+/// Возвращает коллектор со всеми MVP-фактами плюс PG-discovery-фактами.
 pub fn with_default_collectors(root_fs: PathBuf) -> FactsCollector {
-    let facts: Vec<Box<dyn Fact>> = vec![
+    let mut facts: Vec<Box<dyn Fact>> = vec![
         Box::new(HostnameFact),
         Box::new(CpuCountFact),
         Box::new(MemoryMbFact),
@@ -24,6 +30,7 @@ pub fn with_default_collectors(root_fs: PathBuf) -> FactsCollector {
         Box::new(IsPodFact),
         Box::new(InstalledPackagesFact),
     ];
+    facts.extend(build_pg_facts(&root_fs, None));
     FactsCollector::new(root_fs, facts)
 }
 
@@ -36,13 +43,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_collectors_includes_all_six_facts() {
+    fn default_collectors_includes_mvp_and_pg_facts() {
         let tmp = TempDir::new().unwrap();
         let c = with_default_collectors(tmp.path().to_path_buf());
         c.collect_at_start();
         let snap = c.snapshot();
         let names: Vec<&str> = snap.names().collect();
-        // Все шесть фактов попадают в snapshot после collect_at_start:
+        // MVP-факты — все шесть попадают в snapshot после collect_at_start:
         // installed_packages с политикой AtStartAndAfterApply тоже собирается
         // на старте (F02-фикс: иначе apt.package видит Unknown и фолбэчит в Add).
         assert!(names.contains(&"hostname"));
@@ -51,7 +58,13 @@ mod tests {
         assert!(names.contains(&"init_system"));
         assert!(names.contains(&"is_pod"));
         assert!(names.contains(&"installed_packages"));
-        assert_eq!(names.len(), 6);
+        // PG-discovery-факты регистрируются всегда; на не-PG-нодах три из
+        // четырёх отдают Unknown с reason, но имена в snapshot должны быть.
+        assert!(names.contains(&"pg_initialized"));
+        assert!(names.contains(&"pg_is_master"));
+        assert!(names.contains(&"pg_users_with_passwords"));
+        assert!(names.contains(&"pg_extensions"));
+        assert_eq!(names.len(), 10);
     }
 
     #[test]

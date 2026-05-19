@@ -368,6 +368,7 @@ dependencies = [
  "bosun-core",
  "debversion",
  "num_cpus",
+ "postgres",
  "procfs",
  "serde",
  "serde_json",

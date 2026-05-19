@@ -18,6 +18,10 @@ tracing = { workspace = true }
 procfs = { workspace = true }
 num_cpus = { workspace = true }
 debversion = { workspace = true }
+# Phase T: PG discovery facts — sync PostgreSQL client. Pure Rust (без libpq),
+# тот же крейт, что у pg_sql.exec/pg_sql.query в bosun-primitives. Используется
+# в RealPgFactQuery для трёх SQL-фактов (is_master, users, extensions).
+postgres = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
