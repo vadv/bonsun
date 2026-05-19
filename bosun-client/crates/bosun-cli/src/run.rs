@@ -27,7 +27,8 @@ use bosun_primitives::{
     AptUpdateCachePrimitive, CertTlsPrimitive, FileDeletePrimitive, FilePrimitive,
     FileSymlinkPrimitive, GroupPrimitive, PgSqlExecPrimitive, PgSqlQueryPrimitive,
     ProcessSignalPrimitive, RealHealthCheckRunner, RunrCgroupPrimitive, RunrServicePrimitive,
-    RunrTimerPrimitive, SystemdServicePrimitive, SystemdTimerPrimitive, UserPrimitive,
+    RunrTimerPrimitive, SysctlReloadPrimitive, SystemdServicePrimitive, SystemdTimerPrimitive,
+    UserPrimitive,
 };
 use bosun_runr_client::Client as RunrClient;
 use bosun_systemd_client::BlockingSystemdManager;
@@ -517,6 +518,10 @@ fn build_primitives() -> HashMap<ResourceKind, Box<dyn Primitive>> {
         Box::new(ProcessSignalPrimitive::with_real_runner()),
     );
     m.insert(
+        ResourceKind::from_static("sysctl.reload"),
+        Box::new(SysctlReloadPrimitive::with_real_backend()),
+    );
+    m.insert(
         ResourceKind::from_static("runr.service"),
         Box::new(RunrServicePrimitive),
     );
@@ -841,6 +846,7 @@ mod tests {
             "pg_sql.exec",
             "pg_sql.query",
             "process.signal",
+            "sysctl.reload",
             "runr.service",
             "runr.timer",
             "runr.cgroup",
@@ -854,7 +860,7 @@ mod tests {
                 "primitive {kind} not registered",
             );
         }
-        assert_eq!(m.len(), 17);
+        assert_eq!(m.len(), 18);
     }
 
     #[test]

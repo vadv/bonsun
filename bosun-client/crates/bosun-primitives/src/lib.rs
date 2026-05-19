@@ -21,6 +21,7 @@ pub mod process_signal;
 pub mod runr_cgroup;
 pub mod runr_service;
 pub mod runr_timer;
+pub mod sysctl_reload;
 pub mod systemd_service;
 pub mod systemd_timer;
 pub mod template;
@@ -58,6 +59,9 @@ pub use runr_service::{
 };
 pub use runr_timer::{
     decide_timer_action, RunrTimerPrimitive, RunrTimerSpec, TimerAction, TimerState,
+};
+pub use sysctl_reload::{
+    RealSysctlBackend, SysctlBackend, SysctlReloadPrimitive, SysctlReloadSpec,
 };
 pub use systemd_service::{
     decide_action_systemd, Action as SystemdAction, ServiceState as SystemdServiceState,

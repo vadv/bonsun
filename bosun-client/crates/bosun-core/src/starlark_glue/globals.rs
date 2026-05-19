@@ -51,6 +51,7 @@ pub fn build_globals() -> Globals {
         .with_namespace("tags", tags_namespace)
         .with_namespace("service", service_namespace)
         .with_namespace("process", process_namespace)
+        .with_namespace("sysctl", sysctl_namespace)
         .with_namespace("users", users_namespace)
         .with_namespace("runr", runr_namespace)
         .with_namespace("systemd", systemd_namespace)
@@ -302,6 +303,29 @@ fn process_namespace(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         register_primitive_call("process.signal", kwargs, eval)
+    }
+}
+
+/// Namespace `sysctl` — применение kernel-параметров. Сейчас один
+/// примитив `sysctl.reload`. Полная композиция «положить файл + перечитать»
+/// в bundle'е выглядит как `file.content(...)` + `sysctl.reload(path=...)`
+/// — это даёт явный observable пайплайн без скрытых hook'ов.
+#[starlark_module]
+fn sysctl_namespace(builder: &mut GlobalsBuilder) {
+    /// `sysctl.reload(name=, path=)` — вызвать `sysctl -p <path>` для
+    /// применения параметров ядра из одного `.conf`-файла.
+    ///
+    /// Plan всегда отдаёт Update: ядро не экспортирует «когда последний
+    /// раз грузили этот файл», но повторный set того же значения через
+    /// `sysctl -p` — no-op на уровне ядра, что и обеспечивает реальную
+    /// идемпотентность. Apply падает с Apply error, если `path` не
+    /// существует на момент apply (типично создаётся `file.content`'ом
+    /// в том же bundle'е).
+    fn reload<'v>(
+        #[starlark(kwargs)] kwargs: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        register_primitive_call("sysctl.reload", kwargs, eval)
     }
 }
 
@@ -875,6 +899,7 @@ fn register_primitive_call<'v>(
         "pg_sql.exec" => ResourceKind::from_static("pg_sql.exec"),
         "pg_sql.query" => ResourceKind::from_static("pg_sql.query"),
         "process.signal" => ResourceKind::from_static("process.signal"),
+        "sysctl.reload" => ResourceKind::from_static("sysctl.reload"),
         "users.user" => ResourceKind::from_static("users.user"),
         "users.group" => ResourceKind::from_static("users.group"),
         other => ResourceKind::try_new(other).map_err(|e| {

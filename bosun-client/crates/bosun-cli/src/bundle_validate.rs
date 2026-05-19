@@ -202,6 +202,13 @@ fn build_validate_primitives() -> HashMap<ResourceKind, Box<dyn Primitive>> {
         }),
     );
     m.insert(
+        ResourceKind::from_static("sysctl.reload"),
+        Box::new(NoopPrimitive {
+            kind: "sysctl.reload",
+            identity_keys: &["name"],
+        }),
+    );
+    m.insert(
         ResourceKind::from_static("cert.tls"),
         Box::new(NoopPrimitive {
             kind: "cert.tls",
