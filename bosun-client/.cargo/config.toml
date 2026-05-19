@@ -1,0 +1,24 @@
+# Конфигурация cargo для кросс-сборок под musl.
+#
+# Применяется ТОЛЬКО когда явно передан --target. Обычный `cargo build`
+# на хосте использует системный gnu-toolchain и эти секции игнорирует.
+#
+# musl-сборка нужна, чтобы получить один статически слинкованный бинарь
+# bosun, который запускается на произвольной Linux-ноде без установленных
+# glibc/musl/openssl/libdbus и без C-ABI зависимостей.
+
+[target.x86_64-unknown-linux-musl]
+# musl-gcc предоставляется пакетом `musl-tools` на Debian/Ubuntu и
+# `musl-dev` на Alpine. На target-машине НЕ требуется.
+linker = "musl-gcc"
+# +crt-static вшивает musl libc в исполняемый файл; без этого бинарь
+# при запуске искал бы /lib/ld-musl-x86_64.so.1 на target-системе.
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-unknown-linux-musl]
+# Линкер aarch64-linux-musl-gcc ставится через musl-cross toolchain
+# (например, https://github.com/richfelker/musl-cross-make) или
+# через rust:alpine docker-образ. На локальном хосте обычно отсутствует —
+# для воспроизводимой сборки используется docker/musl-build.Dockerfile.
+linker = "aarch64-linux-musl-gcc"
+rustflags = ["-C", "target-feature=+crt-static"]

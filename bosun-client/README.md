@@ -51,6 +51,23 @@ make test-bdd            # BDD в Docker (требует docker)
 make test-bdd TAGS=@apt-package    # только @apt-package сценарии
 ```
 
+## Статический musl-бинарь
+
+Для деплоя на ноду собирается один самодостаточный бинарь под musl —
+без зависимостей от системных glibc, openssl, libdbus, libpq. Установка
+на target: `scp` + `chmod +x`, никакие пакеты ставить не нужно.
+
+```bash
+make musl-x86_64      # статический бинарь под x86_64 (нужен musl-tools)
+make musl-aarch64     # под aarch64 (нужен aarch64-linux-musl-gcc)
+make musl-docker      # воспроизводимая сборка в rust:alpine, без host-toolchain
+make musl-verify      # smoke-test в distroless/static контейнере
+```
+
+Результат — `target/x86_64-unknown-linux-musl/release/bosun`, ~25 MB,
+`ldd` показывает `statically linked`. Запускается на любом Linux с
+ядром ≥ 3.2, в том числе на distroless/static и scratch.
+
 ## Принципы
 
 - Минимум exec, минимум флюктуаций состояния.
