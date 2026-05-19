@@ -8,6 +8,7 @@ pub mod evaluator;
 pub mod facts;
 pub mod inventory;
 pub mod orchestrator;
+pub mod path_safety;
 pub mod primitive;
 pub mod registry;
 pub mod resource;
@@ -20,19 +21,25 @@ pub mod starlark_glue;
 #[doc(hidden)]
 pub mod tracing_test_util;
 
-pub use bundle::{Bundle, BundleError, BundleMetadata};
+pub use bundle::{Bundle, BundleError, BundleInventoryConfig, BundleMetadata};
 pub use call_args::{ArgValue, CallArgs, CallArgsError};
 pub use diff::{ChangeReport, Diff};
 pub use digest::sha256_hex;
 pub use evaluator::Evaluator;
 pub use facts::{FactCategory, FactValue, RefreshPolicy};
-pub use inventory::{InventoryError, InventorySource, JsonInventory};
+pub use inventory::{
+    merge_inventory, merge_inventory_keyed, InventoryError, InventorySource, JsonInventory,
+    MergeStrategy,
+};
 pub use orchestrator::{
     ApplyOpts, ApplyReport, ApplySummary, Orchestrator, Outcome, PlanFailure, PlanReport,
     PlanSummary, ResourceApplyOutcome, ResourcePlan,
 };
+pub use path_safety::{resolve_within_root, PathSafetyError};
 pub use primitive::{ApplyCtx, FactsSource, PlanCtx, Primitive, PrimitiveError};
 pub use registry::{Registry, RegistryError};
 pub use resource::{Handle, Resource, ResourceId, ResourceKind, ResourceKindError};
 pub use sensitive::{SensitivePayload, SensitiveStore};
-pub use starlark_glue::{default_template_fn, evaluate_manifest, StarlarkGlueError, TemplateFn};
+pub use starlark_glue::{
+    default_template_fn, evaluate_manifest, EvaluatorConfig, StarlarkGlueError, TemplateFn,
+};

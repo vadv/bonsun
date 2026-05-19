@@ -1,13 +1,17 @@
-//! Загрузчик bundle: layout `bundle.toml + manifests/ + defaults/ + templates/`.
+//! Загрузчик bundle: layout `bundle.toml + manifests/ + inventory/ + roles/ + _lib/`.
 //!
-//! Bundle — самодостаточная единица деплоя. Структура читается один раз
-//! на старте, дальше evaluator получает её по ссылке.
+//! Bundle — самодостаточная директория. `Bundle::load_dir` валидирует
+//! `bundle.toml`, проверяет `entry` через path-safety helper и сохраняет
+//! канонические пути. Manifests/roles/lib/inventory грузятся on-demand
+//! Starlark-loader'ом, не предзагружаются.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use semver::VersionReq;
 use serde::Deserialize;
+
+use crate::path_safety::{resolve_within_root, PathSafetyError};
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -30,66 +34,100 @@ pub enum BundleError {
     },
     #[error("bundle requires bosun {required} but current is {current}")]
     VersionIncompatible { required: String, current: String },
+    #[error("module not found: load path '{load_path}' resolves to {fs_path:?}")]
+    ModuleNotFound { load_path: String, fs_path: PathBuf },
+    #[error("unsupported load path: '{load_path}' (expected @bosun/builtins, @roles/<name>, or @lib/<name>)")]
+    UnsupportedLoadPath { load_path: String },
+    #[error("template() called from unsupported module: {module:?} (only roles/<name>/main.star or _lib/<name>/main.star)")]
+    UnsupportedModuleForTemplate { module: PathBuf },
+    #[error("template() cannot be called from manifests/main.star: {hint}")]
+    TemplateFromManifests { hint: String },
+    #[error("private symbol '{symbol}' cannot be imported from {module:?}")]
+    PrivateSymbol { symbol: String, module: PathBuf },
+    #[error("path-safety violation: {0}")]
+    PathSafety(#[from] PathSafetyError),
+    #[error("inventory.merge: missing default merge strategy; set [bundle.inventory].default_merge_strategy in bundle.toml or pass strategy= argument")]
+    DefaultMergeStrategyMissing,
 }
 
-/// Метаданные bundle, читаемые из `bundle.toml` секции `[bundle]`.
+/// Метаданные bundle из `bundle.toml`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BundleMetadata {
     pub name: String,
     pub version: String,
+    #[serde(default)]
+    pub description: Option<String>,
     pub requires_bosun: String,
-    /// Относительный путь под bundle/ к стартовому манифесту (например `manifests/main.star`).
+    /// Относительный путь под bundle/ к entry-манифесту.
     pub entry: String,
+    /// Опциональная конфигурация inventory (default_merge_strategy).
+    #[serde(default)]
+    pub inventory: BundleInventoryConfig,
+    /// Документация активных тэгов для CLI `--help`. Не валидируется
+    /// при evaluate — bundle author может использовать любые тэги, набор
+    /// здесь служит документацией.
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
 }
 
-/// Корневая структура `bundle.toml`. Только секция `[bundle]` обязательна.
+/// `[bundle.inventory]`-секция.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct BundleInventoryConfig {
+    #[serde(default)]
+    pub default_merge_strategy: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct BundleManifest {
     bundle: BundleMetadata,
 }
 
-/// Загруженный bundle: метаданные, контент манифестов, путь к templates,
-/// объединённые defaults.
-#[derive(Debug)]
+/// Загруженный bundle.
+///
+/// В отличие от MVP-версии, bundle не предзагружает manifests/defaults в
+/// память. Все .star/.yaml файлы читаются on-demand через FileLoader и
+/// `inventory.load`. Это даёт чёткий контракт «структура bundle — на
+/// усмотрение автора» и убирает необходимость auto-scan.
+#[derive(Debug, Clone)]
 pub struct Bundle {
     pub metadata: BundleMetadata,
+    /// Канонический путь к корню bundle. Никаких symlink'ов в этом значении.
     pub root: PathBuf,
-    /// Контент всех `*.star` манифестов: ключ — относительный путь под bundle/,
-    /// значение — содержимое файла.
-    pub manifests: HashMap<PathBuf, String>,
-    pub templates_root: PathBuf,
-    /// JSON-представление слитых defaults/*.yaml. Если defaults/ пуст или
-    /// отсутствует, корень — пустой объект.
-    pub defaults: serde_json::Value,
+    /// Канонический absolute путь к entry-манифесту. Проверяется через
+    /// `path_safety::resolve_within_root` в `load_dir`.
+    pub entry: PathBuf,
 }
 
 impl Bundle {
-    /// Прочитать bundle из директории. Читает `bundle.toml`, все `manifests/*.star`,
-    /// сливает `defaults/*.yaml` в один JSON-объект, фиксирует путь к `templates/`.
+    /// Прочитать bundle из директории. Минимум: `bundle.toml` с обязательными
+    /// полями плюс файл, на который указывает `entry`.
     pub fn load_dir(path: &Path) -> Result<Self, BundleError> {
-        let manifest = load_manifest(path)?;
-        let entry_path = path.join(&manifest.bundle.entry);
-        if !entry_path.is_file() {
-            return Err(BundleError::EntryNotFound(
-                entry_path.to_string_lossy().into_owned(),
-            ));
-        }
+        let canonical_root = std::fs::canonicalize(path).map_err(|e| BundleError::Io {
+            path: path.to_string_lossy().into_owned(),
+            source: e,
+        })?;
 
-        let manifests = load_manifests(path)?;
-        let defaults = load_defaults(path)?;
-        let templates_root = path.join("templates");
+        let manifest = load_manifest(&canonical_root)?;
+
+        let entry = match resolve_within_root(&canonical_root, &manifest.bundle.entry) {
+            Ok(p) => p,
+            Err(PathSafetyError::NotFound(missing)) => {
+                return Err(BundleError::EntryNotFound(
+                    missing.to_string_lossy().into_owned(),
+                ));
+            }
+            Err(other) => return Err(BundleError::PathSafety(other)),
+        };
 
         Ok(Self {
             metadata: manifest.bundle,
-            root: path.to_path_buf(),
-            manifests,
-            templates_root,
-            defaults,
+            root: canonical_root,
+            entry,
         })
     }
 
-    /// Проверить совместимость текущей версии bosun с требованием bundle.
-    /// Используется парсер `semver::VersionReq` с cargo-семантикой.
+    /// Проверка совместимости текущей версии bosun с требованием bundle.
+    /// Cargo-семантика caret-синтаксиса: `^0.4` → `>=0.4.0, <0.5.0`.
     pub fn check_compatibility(&self, current_version: &str) -> Result<(), BundleError> {
         let req = VersionReq::parse(&self.metadata.requires_bosun).map_err(|e| {
             BundleError::InvalidManifest(format!(
@@ -111,18 +149,84 @@ impl Bundle {
         Ok(())
     }
 
-    /// Получить содержимое entry-манифеста (например `manifests/main.star`).
-    pub fn entry_manifest(&self) -> Option<&str> {
-        let entry_rel = PathBuf::from(&self.metadata.entry);
-        self.manifests.get(&entry_rel).map(|s| s.as_str())
+    /// Резолв `@roles/<name>` или `@lib/<name>` в канонический путь к
+    /// `roles/<name>/main.star` или `_lib/<name>/main.star`. Любые другие
+    /// префиксы — `UnsupportedLoadPath`.
+    pub fn resolve_module(&self, load_path: &str) -> Result<PathBuf, BundleError> {
+        let relative = if let Some(name) = load_path.strip_prefix("@roles/") {
+            format!("roles/{name}/main.star")
+        } else if let Some(name) = load_path.strip_prefix("@lib/") {
+            format!("_lib/{name}/main.star")
+        } else {
+            return Err(BundleError::UnsupportedLoadPath {
+                load_path: load_path.to_string(),
+            });
+        };
+
+        match resolve_within_root(&self.root, &relative) {
+            Ok(p) => Ok(p),
+            Err(PathSafetyError::NotFound(missing)) => Err(BundleError::ModuleNotFound {
+                load_path: load_path.to_string(),
+                fs_path: missing,
+            }),
+            Err(other) => Err(BundleError::PathSafety(other)),
+        }
     }
 
-    /// Deep-merge defaults с override. Правила:
-    /// - Object + Object: ключи объединяются, override побеждает при коллизии.
-    /// - Array/Scalar в override: полностью заменяет defaults.
-    /// - Null в override: удаляет ключ из defaults.
-    pub fn merge_inventory(&self, override_value: serde_json::Value) -> serde_json::Value {
-        merge_json(self.defaults.clone(), override_value)
+    /// Резолв template-пути относительно defining-модуля. `module` —
+    /// канонический путь к .star файлу, определившему текущую функцию;
+    /// `template_rel` — что было передано в `template("...")`.
+    pub fn resolve_template(
+        &self,
+        module: &Path,
+        template_rel: &str,
+    ) -> Result<PathBuf, BundleError> {
+        // template() из manifests/main.star — запрещён по spec.
+        let manifests_main = self.root.join("manifests").join("main.star");
+        if module == manifests_main {
+            return Err(BundleError::TemplateFromManifests {
+                hint: "move rendering into a role or @lib module".to_string(),
+            });
+        }
+
+        // Cross-module access ловится здесь же: если template_rel содержит
+        // `@`-префикс или `:`-разделитель, отказываем до резолва.
+        if template_rel.starts_with('@') || template_rel.contains(':') {
+            return Err(BundleError::PathSafety(PathSafetyError::ParentDir(
+                template_rel.to_string(),
+            )));
+        }
+
+        let templates_dir = templates_dir_for_module(&self.root, module).ok_or_else(|| {
+            BundleError::UnsupportedModuleForTemplate {
+                module: module.to_path_buf(),
+            }
+        })?;
+
+        resolve_within_root(&templates_dir, template_rel).map_err(BundleError::PathSafety)
+    }
+}
+
+/// Определить templates/ директорию для модуля. Возвращает None, если
+/// модуль не лежит ни под `roles/<name>/main.star`, ни под `_lib/<name>/main.star`.
+fn templates_dir_for_module(root: &Path, module: &Path) -> Option<PathBuf> {
+    let rel = module.strip_prefix(root).ok()?;
+    let components: Vec<&str> = rel
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => s.to_str(),
+            _ => None,
+        })
+        .collect();
+    // Ожидаем «roles/<name>/main.star» или «_lib/<name>/main.star».
+    if components.len() == 3 && components[2] == "main.star" {
+        match components[0] {
+            "roles" => Some(root.join("roles").join(components[1]).join("templates")),
+            "_lib" => Some(root.join("_lib").join(components[1]).join("templates")),
+            _ => None,
+        }
+    } else {
+        None
     }
 }
 
@@ -135,201 +239,6 @@ fn load_manifest(root: &Path) -> Result<BundleManifest, BundleError> {
     })?;
     toml::from_str::<BundleManifest>(&text)
         .map_err(|e| BundleError::InvalidManifest(format!("{path}: {e}", path = path.display())))
-}
-
-/// Загрузить все `*.star` файлы из `manifests/` рекурсивно. Если директории
-/// нет, возвращаем пустой набор — entry-проверка отдельно отловит проблему.
-fn load_manifests(root: &Path) -> Result<HashMap<PathBuf, String>, BundleError> {
-    let manifests_dir = root.join("manifests");
-    if !manifests_dir.exists() {
-        return Ok(HashMap::new());
-    }
-    let mut out = HashMap::new();
-    walk_star_files(root, &manifests_dir, &mut out)?;
-    Ok(out)
-}
-
-fn walk_star_files(
-    root: &Path,
-    dir: &Path,
-    out: &mut HashMap<PathBuf, String>,
-) -> Result<(), BundleError> {
-    let entries = std::fs::read_dir(dir).map_err(|e| BundleError::Io {
-        path: dir.to_string_lossy().into_owned(),
-        source: e,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|e| BundleError::Io {
-            path: dir.to_string_lossy().into_owned(),
-            source: e,
-        })?;
-        let path = entry.path();
-        let file_type = entry.file_type().map_err(|e| BundleError::Io {
-            path: path.to_string_lossy().into_owned(),
-            source: e,
-        })?;
-        if file_type.is_dir() {
-            walk_star_files(root, &path, out)?;
-            continue;
-        }
-        if path.extension().and_then(|e| e.to_str()) != Some("star") {
-            continue;
-        }
-        let text = std::fs::read_to_string(&path).map_err(|e| BundleError::Io {
-            path: path.to_string_lossy().into_owned(),
-            source: e,
-        })?;
-        let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
-        out.insert(rel, text);
-    }
-    Ok(())
-}
-
-/// Прочитать все `*.yaml` файлы из `defaults/` и слить deep-merge-ом в один JSON-объект.
-/// Порядок имеет значение: файлы сортируются по имени, каждый следующий
-/// перезаписывает предыдущий при коллизии ключей (без null-семантики удаления —
-/// это поведение из override, не между defaults-файлами).
-fn load_defaults(root: &Path) -> Result<serde_json::Value, BundleError> {
-    let defaults_dir = root.join("defaults");
-    if !defaults_dir.exists() {
-        return Ok(serde_json::Value::Object(serde_json::Map::new()));
-    }
-    let entries = std::fs::read_dir(&defaults_dir).map_err(|e| BundleError::Io {
-        path: defaults_dir.to_string_lossy().into_owned(),
-        source: e,
-    })?;
-    let mut yaml_files: Vec<PathBuf> = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| BundleError::Io {
-            path: defaults_dir.to_string_lossy().into_owned(),
-            source: e,
-        })?;
-        let path = entry.path();
-        let ext = path.extension().and_then(|e| e.to_str());
-        if matches!(ext, Some("yaml") | Some("yml")) {
-            yaml_files.push(path);
-        }
-    }
-    yaml_files.sort();
-
-    let mut merged = serde_json::Value::Object(serde_json::Map::new());
-    for yaml_path in yaml_files {
-        let text = std::fs::read_to_string(&yaml_path).map_err(|e| BundleError::Io {
-            path: yaml_path.to_string_lossy().into_owned(),
-            source: e,
-        })?;
-        let yaml_value: serde_norway::Value =
-            serde_norway::from_str(&text).map_err(|e| BundleError::InvalidYaml {
-                path: yaml_path.to_string_lossy().into_owned(),
-                source: e,
-            })?;
-        let json_value = yaml_to_json(yaml_value).map_err(BundleError::InvalidManifest)?;
-        merged = merge_json_no_null_delete(merged, json_value);
-    }
-    Ok(merged)
-}
-
-/// Конвертация serde_norway::Value → serde_json::Value. Не поддерживаем
-/// сложные ключи маппинга (только строковые ключи в YAML), а также tagged-значения.
-fn yaml_to_json(v: serde_norway::Value) -> Result<serde_json::Value, String> {
-    use serde_norway::Value as Y;
-    Ok(match v {
-        Y::Null => serde_json::Value::Null,
-        Y::Bool(b) => serde_json::Value::Bool(b),
-        Y::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                serde_json::Value::Number(i.into())
-            } else if let Some(u) = n.as_u64() {
-                serde_json::Value::Number(u.into())
-            } else if let Some(f) = n.as_f64() {
-                serde_json::Number::from_f64(f)
-                    .map(serde_json::Value::Number)
-                    .unwrap_or(serde_json::Value::Null)
-            } else {
-                return Err(format!("unsupported number in YAML: {n:?}"));
-            }
-        }
-        Y::String(s) => serde_json::Value::String(s),
-        Y::Sequence(seq) => {
-            let mut out = Vec::with_capacity(seq.len());
-            for item in seq {
-                out.push(yaml_to_json(item)?);
-            }
-            serde_json::Value::Array(out)
-        }
-        Y::Mapping(map) => {
-            let mut out = serde_json::Map::with_capacity(map.len());
-            for (k, v) in map {
-                let key = match k {
-                    Y::String(s) => s,
-                    other => {
-                        return Err(format!("YAML mapping key must be a string; got {other:?}"));
-                    }
-                };
-                out.insert(key, yaml_to_json(v)?);
-            }
-            serde_json::Value::Object(out)
-        }
-        Y::Tagged(_) => {
-            return Err("YAML tagged values are not supported in bundle defaults".to_string());
-        }
-    })
-}
-
-/// Deep-merge defaults и override с null-семантикой удаления.
-/// - Object + Object: ключи сливаются; null в override удаляет ключ defaults.
-/// - null на корне override: «override не задан», возвращаем defaults без изменений.
-///   Это отличается от null внутри map: null-как-значение-ключа удаляет ключ,
-///   но null-как-корень означает отсутствие самого override.
-/// - Иначе override полностью заменяет defaults.
-fn merge_json(base: serde_json::Value, over: serde_json::Value) -> serde_json::Value {
-    use serde_json::Value;
-    match (base, over) {
-        (base, Value::Null) => base,
-        (Value::Object(mut base_map), Value::Object(over_map)) => {
-            for (k, v) in over_map {
-                if v.is_null() {
-                    base_map.remove(&k);
-                    continue;
-                }
-                match base_map.remove(&k) {
-                    Some(base_v) => {
-                        base_map.insert(k, merge_json(base_v, v));
-                    }
-                    None => {
-                        base_map.insert(k, v);
-                    }
-                }
-            }
-            Value::Object(base_map)
-        }
-        (_, over) => over,
-    }
-}
-
-/// То же, что merge_json, но без удаления по null — используется для слияния
-/// defaults-файлов между собой.
-fn merge_json_no_null_delete(
-    base: serde_json::Value,
-    over: serde_json::Value,
-) -> serde_json::Value {
-    use serde_json::Value;
-    match (base, over) {
-        (Value::Object(mut base_map), Value::Object(over_map)) => {
-            for (k, v) in over_map {
-                match base_map.remove(&k) {
-                    Some(base_v) => {
-                        base_map.insert(k, merge_json_no_null_delete(base_v, v));
-                    }
-                    None => {
-                        base_map.insert(k, v);
-                    }
-                }
-            }
-            Value::Object(base_map)
-        }
-        (_, over) => over,
-    }
 }
 
 #[cfg(test)]
@@ -353,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn load_dir_reads_metadata_and_manifests() {
+    fn load_dir_reads_metadata_and_validates_entry() {
         let (_keep, root) = make_bundle_dir();
         write(
             &root.join("bundle.toml"),
@@ -361,23 +270,33 @@ mod tests {
 [bundle]
 name           = "demo"
 version        = "0.1.0"
+description    = "demo bundle"
 requires_bosun = "^0.1"
 entry          = "manifests/main.star"
+
+[bundle.inventory]
+default_merge_strategy = "deep_map_replace_list"
+
+[bundle.tags]
+production = "Production"
+staging    = "Staging"
 "#,
         );
         write(
             &root.join("manifests/main.star"),
             "load(\"@bosun/builtins\", \"apt\")\n",
         );
-        write(&root.join("defaults/main.yaml"), "foo: bar\n");
-        fs::create_dir_all(root.join("templates")).unwrap();
 
         let bundle = Bundle::load_dir(&root).unwrap();
         assert_eq!(bundle.metadata.name, "demo");
         assert_eq!(bundle.metadata.entry, "manifests/main.star");
-        assert!(bundle.entry_manifest().unwrap().contains("@bosun/builtins"));
-        assert_eq!(bundle.defaults["foo"], serde_json::json!("bar"));
-        assert_eq!(bundle.templates_root, root.join("templates"));
+        assert_eq!(bundle.metadata.description.as_deref(), Some("demo bundle"));
+        assert_eq!(
+            bundle.metadata.inventory.default_merge_strategy.as_deref(),
+            Some("deep_map_replace_list")
+        );
+        assert_eq!(bundle.metadata.tags.len(), 2);
+        assert!(bundle.entry.ends_with("manifests/main.star"));
     }
 
     #[test]
@@ -419,27 +338,6 @@ entry = "manifests/main.star"
     }
 
     #[test]
-    fn check_compatibility_supports_explicit_range_req() {
-        let (_keep, root) = make_bundle_dir();
-        write(
-            &root.join("bundle.toml"),
-            r#"
-[bundle]
-name = "demo"
-version = "0.1.0"
-requires_bosun = ">=0.1, <0.3"
-entry = "manifests/main.star"
-"#,
-        );
-        write(&root.join("manifests/main.star"), "");
-        let bundle = Bundle::load_dir(&root).unwrap();
-        bundle.check_compatibility("0.1.0").unwrap();
-        bundle.check_compatibility("0.2.5").unwrap();
-        let err = bundle.check_compatibility("0.3.0").unwrap_err();
-        assert!(matches!(err, BundleError::VersionIncompatible { .. }));
-    }
-
-    #[test]
     fn missing_entry_file_is_error() {
         let (_keep, root) = make_bundle_dir();
         write(
@@ -458,6 +356,40 @@ entry = "manifests/missing.star"
     }
 
     #[test]
+    fn load_dir_rejects_absolute_entry() {
+        let (_keep, root) = make_bundle_dir();
+        write(
+            &root.join("bundle.toml"),
+            r#"
+[bundle]
+name = "demo"
+version = "0.1.0"
+requires_bosun = "^0.1"
+entry = "/etc/passwd"
+"#,
+        );
+        let err = Bundle::load_dir(&root).unwrap_err();
+        assert!(matches!(err, BundleError::PathSafety(_)));
+    }
+
+    #[test]
+    fn load_dir_rejects_parent_dir_in_entry() {
+        let (_keep, root) = make_bundle_dir();
+        write(
+            &root.join("bundle.toml"),
+            r#"
+[bundle]
+name = "demo"
+version = "0.1.0"
+requires_bosun = "^0.1"
+entry = "../etc/passwd"
+"#,
+        );
+        let err = Bundle::load_dir(&root).unwrap_err();
+        assert!(matches!(err, BundleError::PathSafety(_)));
+    }
+
+    #[test]
     fn invalid_toml_is_error() {
         let (_keep, root) = make_bundle_dir();
         write(&root.join("bundle.toml"), "this is not toml = = =");
@@ -473,165 +405,124 @@ entry = "manifests/missing.star"
     }
 
     #[test]
-    fn merge_inventory_combines_nested_objects() {
-        let bundle = with_defaults(serde_json::json!({"a": {"b": 1}}));
-        let result = bundle.merge_inventory(serde_json::json!({"a": {"c": 2}}));
-        assert_eq!(result, serde_json::json!({"a": {"b": 1, "c": 2}}));
-    }
-
-    #[test]
-    fn merge_inventory_override_wins_on_scalar_collision() {
-        let bundle = with_defaults(serde_json::json!({"name": "default"}));
-        let result = bundle.merge_inventory(serde_json::json!({"name": "override"}));
-        assert_eq!(result, serde_json::json!({"name": "override"}));
-    }
-
-    #[test]
-    fn merge_inventory_array_is_replaced_not_concatenated() {
-        let bundle = with_defaults(serde_json::json!({"a": [1, 2, 3]}));
-        let result = bundle.merge_inventory(serde_json::json!({"a": [4, 5]}));
-        assert_eq!(result, serde_json::json!({"a": [4, 5]}));
-    }
-
-    #[test]
-    fn merge_inventory_null_removes_key() {
-        let bundle = with_defaults(serde_json::json!({"a": {"b": 1, "c": 2}}));
-        let result = bundle.merge_inventory(serde_json::json!({"a": {"b": null}}));
-        assert_eq!(result, serde_json::json!({"a": {"c": 2}}));
-    }
-
-    #[test]
-    fn merge_inventory_empty_override_keeps_defaults() {
-        let bundle = with_defaults(serde_json::json!({"a": 1, "b": 2}));
-        let result = bundle.merge_inventory(serde_json::json!({}));
-        assert_eq!(result, serde_json::json!({"a": 1, "b": 2}));
-    }
-
-    #[test]
-    fn merge_inventory_null_at_root_keeps_defaults() {
-        // null на корне override'а трактуем как «override не передан» —
-        // возвращаем defaults без изменений. Этот путь срабатывает, когда
-        // CLI вызывается без флага `--inventory`.
-        let bundle = with_defaults(serde_json::json!({"a": 1}));
-        let result = bundle.merge_inventory(serde_json::Value::Null);
-        assert_eq!(result, serde_json::json!({"a": 1}));
-    }
-
-    #[test]
-    fn merge_inventory_null_at_root_with_empty_defaults_keeps_empty_object() {
-        let bundle = with_defaults(serde_json::json!({}));
-        let result = bundle.merge_inventory(serde_json::Value::Null);
-        assert_eq!(result, serde_json::json!({}));
-    }
-
-    #[test]
-    fn merge_inventory_scalar_into_object_replaces() {
-        let bundle = with_defaults(serde_json::json!({"a": {"b": 1}}));
-        let result = bundle.merge_inventory(serde_json::json!({"a": "simple"}));
-        assert_eq!(result, serde_json::json!({"a": "simple"}));
-    }
-
-    #[test]
-    fn merge_inventory_object_into_scalar_replaces() {
-        let bundle = with_defaults(serde_json::json!({"a": 1}));
-        let result = bundle.merge_inventory(serde_json::json!({"a": {"b": 2}}));
-        assert_eq!(result, serde_json::json!({"a": {"b": 2}}));
-    }
-
-    #[test]
-    fn load_defaults_merges_multiple_yaml_files_in_alphabetical_order() {
+    fn resolve_module_for_roles_returns_canonical_path() {
         let (_keep, root) = make_bundle_dir();
-        write(
-            &root.join("bundle.toml"),
-            r#"
-[bundle]
-name = "demo"
-version = "0.1.0"
-requires_bosun = "^0.1"
-entry = "manifests/main.star"
-"#,
-        );
+        write(&root.join("bundle.toml"), default_bundle_toml());
         write(&root.join("manifests/main.star"), "");
-        // a-file задаёт x=1, b-file перебивает на x=2 и добавляет y=3.
-        write(&root.join("defaults/a-base.yaml"), "x: 1\nshared: from_a\n");
-        write(&root.join("defaults/b-extra.yaml"), "x: 2\ny: 3\n");
+        write(&root.join("roles/nginx/main.star"), "");
         let bundle = Bundle::load_dir(&root).unwrap();
-        assert_eq!(bundle.defaults["x"], serde_json::json!(2));
-        assert_eq!(bundle.defaults["y"], serde_json::json!(3));
-        assert_eq!(bundle.defaults["shared"], serde_json::json!("from_a"));
+        let p = bundle.resolve_module("@roles/nginx").unwrap();
+        assert!(p.ends_with("roles/nginx/main.star"));
     }
 
     #[test]
-    fn load_defaults_returns_empty_when_missing() {
+    fn resolve_module_for_lib_returns_canonical_path() {
         let (_keep, root) = make_bundle_dir();
-        write(
-            &root.join("bundle.toml"),
-            r#"
-[bundle]
-name = "demo"
-version = "0.1.0"
-requires_bosun = "^0.1"
-entry = "manifests/main.star"
-"#,
-        );
+        write(&root.join("bundle.toml"), default_bundle_toml());
+        write(&root.join("manifests/main.star"), "");
+        write(&root.join("_lib/runr/main.star"), "");
+        let bundle = Bundle::load_dir(&root).unwrap();
+        let p = bundle.resolve_module("@lib/runr").unwrap();
+        assert!(p.ends_with("_lib/runr/main.star"));
+    }
+
+    #[test]
+    fn resolve_module_unsupported_prefix_is_error() {
+        let (_keep, root) = make_bundle_dir();
+        write(&root.join("bundle.toml"), default_bundle_toml());
         write(&root.join("manifests/main.star"), "");
         let bundle = Bundle::load_dir(&root).unwrap();
-        assert_eq!(bundle.defaults, serde_json::json!({}));
+        let err = bundle.resolve_module("//foo/bar").unwrap_err();
+        assert!(matches!(err, BundleError::UnsupportedLoadPath { .. }));
     }
 
     #[test]
-    fn load_manifests_finds_nested_star_files() {
+    fn resolve_module_missing_role_is_module_not_found() {
         let (_keep, root) = make_bundle_dir();
-        write(
-            &root.join("bundle.toml"),
-            r#"
-[bundle]
-name = "demo"
-version = "0.1.0"
-requires_bosun = "^0.1"
-entry = "manifests/main.star"
-"#,
-        );
-        write(&root.join("manifests/main.star"), "# main\n");
-        write(&root.join("manifests/lib/util.star"), "# util\n");
-        let bundle = Bundle::load_dir(&root).unwrap();
-        let main_rel = PathBuf::from("manifests/main.star");
-        let util_rel = PathBuf::from("manifests/lib/util.star");
-        assert!(bundle.manifests.contains_key(&main_rel));
-        assert!(bundle.manifests.contains_key(&util_rel));
-    }
-
-    #[test]
-    fn invalid_yaml_in_defaults_returns_error() {
-        let (_keep, root) = make_bundle_dir();
-        write(
-            &root.join("bundle.toml"),
-            r#"
-[bundle]
-name = "demo"
-version = "0.1.0"
-requires_bosun = "^0.1"
-entry = "manifests/main.star"
-"#,
-        );
+        write(&root.join("bundle.toml"), default_bundle_toml());
         write(&root.join("manifests/main.star"), "");
-        write(&root.join("defaults/bad.yaml"), "x: : :");
-        let err = Bundle::load_dir(&root).unwrap_err();
-        assert!(matches!(err, BundleError::InvalidYaml { .. }));
+        let bundle = Bundle::load_dir(&root).unwrap();
+        let err = bundle.resolve_module("@roles/missing").unwrap_err();
+        assert!(matches!(err, BundleError::ModuleNotFound { .. }));
     }
 
-    fn with_defaults(defaults: serde_json::Value) -> Bundle {
-        Bundle {
-            metadata: BundleMetadata {
-                name: "test".into(),
-                version: "0.1.0".into(),
-                requires_bosun: "^0.1".into(),
-                entry: "manifests/main.star".into(),
-            },
-            root: PathBuf::from("/tmp/nonexistent"),
-            manifests: HashMap::new(),
-            templates_root: PathBuf::from("/tmp/nonexistent/templates"),
-            defaults,
-        }
+    #[test]
+    fn resolve_template_from_role_module_resolves_to_role_templates() {
+        let (_keep, root) = make_bundle_dir();
+        write(&root.join("bundle.toml"), default_bundle_toml());
+        write(&root.join("manifests/main.star"), "");
+        write(&root.join("roles/nginx/main.star"), "");
+        write(&root.join("roles/nginx/templates/nginx.conf.j2"), "ok");
+        let bundle = Bundle::load_dir(&root).unwrap();
+        let role_module = bundle.resolve_module("@roles/nginx").unwrap();
+        let p = bundle
+            .resolve_template(&role_module, "nginx.conf.j2")
+            .unwrap();
+        assert!(p.ends_with("roles/nginx/templates/nginx.conf.j2"));
+    }
+
+    #[test]
+    fn resolve_template_from_lib_module_resolves_to_lib_templates() {
+        let (_keep, root) = make_bundle_dir();
+        write(&root.join("bundle.toml"), default_bundle_toml());
+        write(&root.join("manifests/main.star"), "");
+        write(&root.join("_lib/runr/main.star"), "");
+        write(&root.join("_lib/runr/templates/service.j2"), "ok");
+        let bundle = Bundle::load_dir(&root).unwrap();
+        let lib_module = bundle.resolve_module("@lib/runr").unwrap();
+        let p = bundle.resolve_template(&lib_module, "service.j2").unwrap();
+        assert!(p.ends_with("_lib/runr/templates/service.j2"));
+    }
+
+    #[test]
+    fn resolve_template_from_manifests_main_is_rejected() {
+        let (_keep, root) = make_bundle_dir();
+        write(&root.join("bundle.toml"), default_bundle_toml());
+        write(&root.join("manifests/main.star"), "");
+        let bundle = Bundle::load_dir(&root).unwrap();
+        let err = bundle
+            .resolve_template(&bundle.entry, "anything.j2")
+            .unwrap_err();
+        assert!(matches!(err, BundleError::TemplateFromManifests { .. }));
+    }
+
+    #[test]
+    fn resolve_template_cross_module_path_is_rejected() {
+        let (_keep, root) = make_bundle_dir();
+        write(&root.join("bundle.toml"), default_bundle_toml());
+        write(&root.join("manifests/main.star"), "");
+        write(&root.join("roles/nginx/main.star"), "");
+        let bundle = Bundle::load_dir(&root).unwrap();
+        let role_module = bundle.resolve_module("@roles/nginx").unwrap();
+        let err = bundle
+            .resolve_template(&role_module, "@roles/other:foo.j2")
+            .unwrap_err();
+        // Cross-module access блокируется на уровне строки до резолва.
+        assert!(matches!(err, BundleError::PathSafety(_)));
+    }
+
+    #[test]
+    fn resolve_template_unsupported_module_is_error() {
+        let (_keep, root) = make_bundle_dir();
+        write(&root.join("bundle.toml"), default_bundle_toml());
+        write(&root.join("manifests/main.star"), "");
+        write(&root.join("scratch/foo.star"), "");
+        let bundle = Bundle::load_dir(&root).unwrap();
+        let weird = root.join("scratch/foo.star").canonicalize().unwrap();
+        let err = bundle.resolve_template(&weird, "x.j2").unwrap_err();
+        assert!(matches!(
+            err,
+            BundleError::UnsupportedModuleForTemplate { .. }
+        ));
+    }
+
+    fn default_bundle_toml() -> &'static str {
+        r#"
+[bundle]
+name = "demo"
+version = "0.1.0"
+requires_bosun = "^0.1"
+entry = "manifests/main.star"
+"#
     }
 }
