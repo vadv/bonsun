@@ -5,6 +5,7 @@
 //! `process.signal`, Phase M `users.user`/`users.group` и Phase N
 //! `file.delete`/`file.symlink` (+ `apt.package` state=absent/purged).
 
+pub mod apt_key;
 pub mod apt_package;
 pub mod apt_update_cache;
 pub mod cert_tls;
@@ -26,6 +27,7 @@ pub mod template;
 pub mod users_group;
 pub mod users_user;
 
+pub use apt_key::{AptKeyBackend, AptKeyPrimitive, AptKeySpec, AptKeyState, RealAptKeyBackend};
 pub use apt_package::{AptPackageSpec, AptPackageState, AptPrimitive};
 pub use apt_update_cache::{
     AptCacheBackend, AptUpdateCachePrimitive, AptUpdateCacheSpec, RealAptCacheBackend,

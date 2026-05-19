@@ -153,6 +153,13 @@ impl FactsSource for FixtureFacts {
 fn build_validate_primitives() -> HashMap<ResourceKind, Box<dyn Primitive>> {
     let mut m: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
     m.insert(
+        ResourceKind::from_static("apt.key"),
+        Box::new(NoopPrimitive {
+            kind: "apt.key",
+            identity_keys: &["name"],
+        }),
+    );
+    m.insert(
         ResourceKind::from_static("apt.package"),
         Box::new(NoopPrimitive {
             kind: "apt.package",

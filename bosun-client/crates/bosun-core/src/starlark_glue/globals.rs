@@ -82,6 +82,23 @@ fn apt_namespace(builder: &mut GlobalsBuilder) {
     ) -> starlark::Result<Value<'v>> {
         register_primitive_call("apt.update_cache", kwargs, eval)
     }
+
+    /// `apt.key(name=, state=, url=?, key_data=?, fingerprint=?,
+    /// keyring_path=?)` — управление GPG-ключом репозитория в
+    /// modern signed-by стиле (`/etc/apt/keyrings/<name>.gpg`).
+    ///
+    /// `state="present"` принимает либо `url` (HTTP GET), либо
+    /// `key_data` (inline ASCII/binary). Если задан `fingerprint`, apply
+    /// верифицирует ключ через `gpg --show-keys --with-fingerprint`.
+    /// `state="absent"` снимает keyring. Legacy `apt-key add` сознательно
+    /// не поддерживается: он deprecated в Debian 11+/Ubuntu 22.04+ и
+    /// вычищается в новых релизах.
+    fn key<'v>(
+        #[starlark(kwargs)] kwargs: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        register_primitive_call("apt.key", kwargs, eval)
+    }
 }
 
 #[starlark_module]
@@ -843,6 +860,7 @@ fn register_primitive_call<'v>(
     let mut call_args = kwargs_to_call_args(kwargs, eval)?;
 
     let kind = match kind_str {
+        "apt.key" => ResourceKind::from_static("apt.key"),
         "apt.package" => ResourceKind::from_static("apt.package"),
         "apt.update_cache" => ResourceKind::from_static("apt.update_cache"),
         "cert.tls" => ResourceKind::from_static("cert.tls"),

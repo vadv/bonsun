@@ -23,11 +23,11 @@ use bosun_core::{
 use bosun_facts::FactsCollector;
 use bosun_handles::{RunrHandle, SystemdHandle};
 use bosun_primitives::{
-    dispatch::RealDispatchClient, template::render_template, AptPrimitive, AptUpdateCachePrimitive,
-    CertTlsPrimitive, FileDeletePrimitive, FilePrimitive, FileSymlinkPrimitive, GroupPrimitive,
-    PgSqlExecPrimitive, PgSqlQueryPrimitive, ProcessSignalPrimitive, RealHealthCheckRunner,
-    RunrCgroupPrimitive, RunrServicePrimitive, RunrTimerPrimitive, SystemdServicePrimitive,
-    SystemdTimerPrimitive, UserPrimitive,
+    dispatch::RealDispatchClient, template::render_template, AptKeyPrimitive, AptPrimitive,
+    AptUpdateCachePrimitive, CertTlsPrimitive, FileDeletePrimitive, FilePrimitive,
+    FileSymlinkPrimitive, GroupPrimitive, PgSqlExecPrimitive, PgSqlQueryPrimitive,
+    ProcessSignalPrimitive, RealHealthCheckRunner, RunrCgroupPrimitive, RunrServicePrimitive,
+    RunrTimerPrimitive, SystemdServicePrimitive, SystemdTimerPrimitive, UserPrimitive,
 };
 use bosun_runr_client::Client as RunrClient;
 use bosun_systemd_client::BlockingSystemdManager;
@@ -477,6 +477,10 @@ fn materialize_facts_json(snapshot: &bosun_facts::FactsSnapshot) -> serde_json::
 fn build_primitives() -> HashMap<ResourceKind, Box<dyn Primitive>> {
     let mut m: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
     m.insert(
+        ResourceKind::from_static("apt.key"),
+        Box::new(AptKeyPrimitive::with_real_backend()),
+    );
+    m.insert(
         ResourceKind::from_static("apt.package"),
         Box::new(AptPrimitive::new()),
     );
@@ -827,6 +831,7 @@ mod tests {
     fn build_primitives_registers_all_primitives() {
         let m = build_primitives();
         for kind in [
+            "apt.key",
             "apt.package",
             "apt.update_cache",
             "cert.tls",
@@ -849,7 +854,7 @@ mod tests {
                 "primitive {kind} not registered",
             );
         }
-        assert_eq!(m.len(), 16);
+        assert_eq!(m.len(), 17);
     }
 
     #[test]
