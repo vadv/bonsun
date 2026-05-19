@@ -41,3 +41,10 @@ rand = { workspace = true }
 # в external-command runner (F05-фикс). Это часть public API trait'а
 # CommandRunner, поэтому в [dependencies], не [dev-dependencies].
 tokio-util = { workspace = true }
+
+[dev-dependencies]
+# Нужен в Phase E unit-тестах: конструируем `SystemdError::BusUnavailable`
+# с реальным `zbus::Error::Address`, чтобы убедиться, что маппер ошибок
+# относит этот класс к `is_deferrable=true`. В production-коде bosun-primitives
+# никак не зависит от zbus — все нужные типы re-exported через bosun-handles.
+zbus = { workspace = true }

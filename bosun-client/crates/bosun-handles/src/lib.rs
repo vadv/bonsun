@@ -119,17 +119,15 @@ impl RunrHandle for bosun_runr_client::Client {
     }
 }
 
-/// Sync-фасад над systemd dbus-клиентом. Только подмножество, нужное
-/// будущим `systemd_service`/`systemd_timer` примитивам (Phase E): start,
-/// stop, restart, reload, enable, disable, daemon_reload и `unit_info`
-/// для InvocationID-сравнения.
+/// Sync-фасад над systemd dbus-клиентом. Подмножество, нужное Phase E
+/// примитивам `systemd.service`/`systemd.timer`: start, stop, restart, reload,
+/// enable, disable, daemon_reload и `unit_info` для InvocationID-сравнения.
 ///
-/// В Phase D реализация нужна лишь чтобы зарезервировать поле
-/// `ApplyCtx.systemd` и убедиться, что trait-object компилируется в
-/// `Option<Arc<dyn SystemdHandle>>`. Конкретный adapter для
-/// `bosun_systemd_client::BlockingSystemdManager` добавится в Phase E
-/// вместе с примитивами `systemd.service` / `systemd.timer` — там же
-/// доопределится семантика `JobHandle + wait_for_job` поверх sync API.
+/// `start_unit`/`stop_unit`/`restart_unit`/`reload_unit` синхронные:
+/// в blanket-impl поверх `BlockingSystemdManager` они дожидаются завершения
+/// systemd-job через `wait_for_job` с лимитом, чтобы примитив получал
+/// готовый результат и проверял `InvocationID` без дополнительной возни с
+/// `JobHandle`.
 pub trait SystemdHandle: Send + Sync {
     fn daemon_reload(&self) -> Result<(), SystemdError>;
     fn needs_daemon_reload(&self, unit_name: &str) -> Result<bool, SystemdError>;
@@ -140,4 +138,68 @@ pub trait SystemdHandle: Send + Sync {
     fn enable_unit(&self, name: &str) -> Result<(), SystemdError>;
     fn disable_unit(&self, name: &str) -> Result<(), SystemdError>;
     fn unit_info(&self, name: &str) -> Result<UnitInfo, SystemdError>;
+}
+
+/// Бюджет ожидания одной job у `wait_for_job`. systemd сам по умолчанию
+/// ждёт `DefaultTimeoutStartSec=90s`, поэтому 120 секунд достаточно, чтобы
+/// пропустить таймер unit'а и распознать его сбой как `JobFailed`, а не
+/// как наш locale timeout.
+const JOB_WAIT_BUDGET: Duration = Duration::from_secs(120);
+
+impl SystemdHandle for bosun_systemd_client::BlockingSystemdManager {
+    fn daemon_reload(&self) -> Result<(), SystemdError> {
+        bosun_systemd_client::BlockingSystemdManager::daemon_reload(self)
+    }
+    fn needs_daemon_reload(&self, unit_name: &str) -> Result<bool, SystemdError> {
+        bosun_systemd_client::BlockingSystemdManager::needs_daemon_reload(self, unit_name)
+    }
+    fn start_unit(&self, name: &str) -> Result<(), SystemdError> {
+        let handle = bosun_systemd_client::BlockingSystemdManager::start_unit(self, name)?;
+        bosun_systemd_client::BlockingSystemdManager::wait_for_job(
+            self,
+            &handle,
+            name,
+            JOB_WAIT_BUDGET,
+        )?;
+        Ok(())
+    }
+    fn stop_unit(&self, name: &str) -> Result<(), SystemdError> {
+        let handle = bosun_systemd_client::BlockingSystemdManager::stop_unit(self, name)?;
+        bosun_systemd_client::BlockingSystemdManager::wait_for_job(
+            self,
+            &handle,
+            name,
+            JOB_WAIT_BUDGET,
+        )?;
+        Ok(())
+    }
+    fn restart_unit(&self, name: &str) -> Result<(), SystemdError> {
+        let handle = bosun_systemd_client::BlockingSystemdManager::restart_unit(self, name)?;
+        bosun_systemd_client::BlockingSystemdManager::wait_for_job(
+            self,
+            &handle,
+            name,
+            JOB_WAIT_BUDGET,
+        )?;
+        Ok(())
+    }
+    fn reload_unit(&self, name: &str) -> Result<(), SystemdError> {
+        let handle = bosun_systemd_client::BlockingSystemdManager::reload_unit(self, name)?;
+        bosun_systemd_client::BlockingSystemdManager::wait_for_job(
+            self,
+            &handle,
+            name,
+            JOB_WAIT_BUDGET,
+        )?;
+        Ok(())
+    }
+    fn enable_unit(&self, name: &str) -> Result<(), SystemdError> {
+        bosun_systemd_client::BlockingSystemdManager::enable_unit(self, name)
+    }
+    fn disable_unit(&self, name: &str) -> Result<(), SystemdError> {
+        bosun_systemd_client::BlockingSystemdManager::disable_unit(self, name)
+    }
+    fn unit_info(&self, name: &str) -> Result<UnitInfo, SystemdError> {
+        bosun_systemd_client::BlockingSystemdManager::unit_info(self, name)
+    }
 }

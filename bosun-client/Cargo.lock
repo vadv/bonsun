@@ -344,6 +344,7 @@ dependencies = [
  "thiserror",
  "tokio-util",
  "tracing",
+ "zbus",
 ]
 
 [[package]]
