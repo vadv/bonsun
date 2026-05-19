@@ -51,8 +51,9 @@ pub enum RunrError {
     #[error("runr {kind} not found: {name}")]
     NotFound { kind: String, name: String },
 
-    /// Polling-цикл `verify_restart` истёк до того, как `restarts` инкрементился
-    /// и состояние стало `Running`. Сигнал, что runr принял команду, но фактический
+    /// Polling-цикл `verify_restart` истёк, не увидев замены PID (или
+    /// инкремента `restarts` в fallback-режиме при отсутствующем `pid`) и
+    /// перехода в `Running`. Сигнал, что runr принял команду, но фактический
     /// рестарт либо не произошёл, либо не завершился до дедлайна.
     #[error("restart of {unit} did not produce observed restart increment")]
     RestartNotObserved { unit: String },

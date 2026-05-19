@@ -50,9 +50,11 @@ pub trait RunrHandle: Send + Sync {
     fn service_statuses(&self) -> Result<Vec<ServiceStatus>, RunrError>;
     fn timer_statuses(&self) -> Result<Vec<TimerStatus>, RunrError>;
     fn units_list(&self) -> Result<Vec<UnitListItem>, RunrError>;
-    /// Polling-проверка фактического рестарта по диффу `restarts`. Удобный
-    /// blanket-метод поверх `service_statuses`, реализованный для production
-    /// клиента в `bosun_runr_client::verify_restart`.
+    /// Polling-проверка фактического рестарта: сравнивает PID до и после
+    /// (state=Running обязателен), с fallback на инкремент `restarts` для
+    /// runr без `pid` в snapshot'е. Удобный blanket-метод поверх
+    /// `service_statuses`, реализованный для production клиента в
+    /// `bosun_runr_client::verify_restart`.
     fn verify_restart(
         &self,
         name: &str,

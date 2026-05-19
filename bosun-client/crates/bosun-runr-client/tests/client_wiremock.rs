@@ -526,13 +526,13 @@ async fn base_url_trailing_slash_is_normalized() {
 // verify_restart.
 // ---------------------------------------------------------------------------
 
-/// Готовый `ServiceStatus` с заданным значением `restarts` и `state`. Хелпер,
+/// Готовый `ServiceStatus` с заданными `pid`, `restarts` и `state`. Хелпер,
 /// чтобы тестовые case-ы не дублировали все поля.
-fn status_with(name: &str, restarts: u64, state: &str) -> ServiceStatus {
+fn status_with(name: &str, pid: Option<u32>, restarts: u64, state: &str) -> ServiceStatus {
     ServiceStatus {
         name: name.to_string(),
         state: state.to_string(),
-        pid: Some(1),
+        pid,
         restarts,
         in_state_for_ms: 1000,
         uptime_ms: Some(1000),
@@ -547,17 +547,19 @@ fn status_with(name: &str, restarts: u64, state: &str) -> ServiceStatus {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn verify_restart_observes_increment_and_running_state() {
+async fn verify_restart_returns_status_when_pid_changed() {
     let server = MockServer::start().await;
-    // Возвращаем сразу пост-рестартовый снимок: restarts=4, Running.
+    // PID сменился (42 → 43), state=Running — primary критерий restart'а.
+    // Счётчик `restarts` сохраняем тем же, что подчёркивает: real runr на
+    // external restart его не двигает.
     Mock::given(method("GET"))
         .and(path("/api/v1/services/statuses"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
             {
                 "name": "pg",
                 "state": "Running",
-                "pid": 100,
-                "restarts": 4u64,
+                "pid": 43,
+                "restarts": 3u64,
                 "in_state_for_ms": 500,
                 "uptime_ms": 500,
                 "autostart": true,
@@ -570,7 +572,7 @@ async fn verify_restart_observes_increment_and_running_state() {
         .await;
 
     let client = client_for(&server);
-    let before = status_with("pg", 3, "Running");
+    let before = status_with("pg", Some(42), 3, "Running");
     let after = blocking(move || {
         bosun_runr_client::verify_restart(
             &client,
@@ -582,20 +584,21 @@ async fn verify_restart_observes_increment_and_running_state() {
     })
     .await
     .unwrap();
-    assert_eq!(after.restarts, 4);
+    assert_eq!(after.pid, Some(43));
     assert_eq!(after.state, "Running");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn verify_restart_no_increment_returns_timeout_error() {
+async fn verify_restart_returns_restart_not_observed_when_pid_unchanged() {
     let server = MockServer::start().await;
-    // Сервер всегда отвечает теми же restarts=3 — инкремента не будет.
+    // PID тот же (42 = 42) и счётчик не вырос — runr ничего не пересоздал.
     Mock::given(method("GET"))
         .and(path("/api/v1/services/statuses"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
             {
                 "name": "pg",
                 "state": "Running",
+                "pid": 42,
                 "restarts": 3u64,
                 "in_state_for_ms": 1000,
                 "autostart": true,
@@ -608,7 +611,7 @@ async fn verify_restart_no_increment_returns_timeout_error() {
         .await;
 
     let client = client_for(&server);
-    let before = status_with("pg", 3, "Running");
+    let before = status_with("pg", Some(42), 3, "Running");
     let err = blocking(move || {
         bosun_runr_client::verify_restart(
             &client,
@@ -627,17 +630,18 @@ async fn verify_restart_no_increment_returns_timeout_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn verify_restart_increment_but_not_running_returns_timeout_error() {
+async fn verify_restart_returns_restart_not_observed_when_state_not_running() {
     let server = MockServer::start().await;
-    // restarts инкрементился (3 → 4), но state == "Failed" — verify не должен
-    // считать это успехом. Дойдёт до deadline и вернёт RestartNotObserved.
+    // PID сменился (42 → 99), но state=Failed — verify не должен считать
+    // это успехом: сервис не в Running. Дойдёт до deadline → RestartNotObserved.
     Mock::given(method("GET"))
         .and(path("/api/v1/services/statuses"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
             {
                 "name": "pg",
                 "state": "Failed",
-                "restarts": 4u64,
+                "pid": 99,
+                "restarts": 3u64,
                 "in_state_for_ms": 100,
                 "autostart": true,
                 "memory_rss_anon_bytes": 0,
@@ -649,7 +653,7 @@ async fn verify_restart_increment_but_not_running_returns_timeout_error() {
         .await;
 
     let client = client_for(&server);
-    let before = status_with("pg", 3, "Running");
+    let before = status_with("pg", Some(42), 3, "Running");
     let err = blocking(move || {
         bosun_runr_client::verify_restart(
             &client,
@@ -662,6 +666,47 @@ async fn verify_restart_increment_but_not_running_returns_timeout_error() {
     .await
     .unwrap_err();
     assert!(matches!(err, RunrError::RestartNotObserved { .. }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_restart_falls_back_to_restarts_increment_when_pid_missing() {
+    let server = MockServer::start().await;
+    // Mock эмулирует старый runr без `pid` в snapshot'е: PID нет,
+    // но счётчик растёт. Fallback на restarts-инкремент должен
+    // распознать restart.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/services/statuses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "name": "pg",
+                "state": "Running",
+                "restarts": 4u64,
+                "in_state_for_ms": 500,
+                "uptime_ms": 500,
+                "autostart": true,
+                "memory_rss_anon_bytes": 0,
+                "memory_rss_file_bytes": 0,
+                "cpu_usage_percent": 0.0,
+            }
+        ])))
+        .mount(&server)
+        .await;
+
+    let client = client_for(&server);
+    let before = status_with("pg", None, 3, "Running");
+    let after = blocking(move || {
+        bosun_runr_client::verify_restart(
+            &client,
+            "pg",
+            &before,
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(after.restarts, 4);
+    assert_eq!(after.state, "Running");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
