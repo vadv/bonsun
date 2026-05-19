@@ -78,6 +78,11 @@ impl BlockingSystemdManager {
         self.rt.block_on(self.inner.enable_unit(name))
     }
 
+    /// Blocking `is_unit_enabled`.
+    pub fn is_unit_enabled(&self, name: &str) -> Result<bool, SystemdError> {
+        self.rt.block_on(self.inner.is_unit_enabled(name))
+    }
+
     /// Blocking `disable_unit`.
     pub fn disable_unit(&self, name: &str) -> Result<(), SystemdError> {
         self.rt.block_on(self.inner.disable_unit(name))

@@ -422,6 +422,9 @@ mod tests {
         fn enable_unit(&self, _: &str) -> Result<(), SystemdError> {
             unimplemented!()
         }
+        fn is_unit_enabled(&self, _: &str) -> Result<bool, SystemdError> {
+            unimplemented!()
+        }
         fn disable_unit(&self, _: &str) -> Result<(), SystemdError> {
             unimplemented!()
         }

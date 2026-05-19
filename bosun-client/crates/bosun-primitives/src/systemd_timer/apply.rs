@@ -194,6 +194,11 @@ mod tests {
             self.record(&format!("enable_unit:{name}"));
             Ok(())
         }
+        fn is_unit_enabled(&self, _: &str) -> Result<bool, SystemdError> {
+            // systemd.timer apply не вызывает is_unit_enabled — заглушка
+            // на случай переиспользования mock'а.
+            Ok(false)
+        }
         fn disable_unit(&self, name: &str) -> Result<(), SystemdError> {
             self.record(&format!("disable_unit:{name}"));
             Ok(())

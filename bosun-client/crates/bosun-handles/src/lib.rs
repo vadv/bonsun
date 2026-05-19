@@ -155,6 +155,11 @@ pub trait SystemdHandle: Send + Sync {
     fn restart_unit(&self, name: &str) -> Result<(), SystemdError>;
     fn reload_unit(&self, name: &str) -> Result<(), SystemdError>;
     fn enable_unit(&self, name: &str) -> Result<(), SystemdError>;
+    /// Read-only проверка `GetUnitFileState`. Используется apply'ем
+    /// `systemd.service` для пропуска `enable_unit` на уже включённых
+    /// юнитах (read-before-write). См. описание маппинга в
+    /// `bosun_systemd_client::SystemdManager::is_unit_enabled`.
+    fn is_unit_enabled(&self, name: &str) -> Result<bool, SystemdError>;
     fn disable_unit(&self, name: &str) -> Result<(), SystemdError>;
     fn unit_info(&self, name: &str) -> Result<UnitInfo, SystemdError>;
 }
@@ -214,6 +219,9 @@ impl SystemdHandle for bosun_systemd_client::BlockingSystemdManager {
     }
     fn enable_unit(&self, name: &str) -> Result<(), SystemdError> {
         bosun_systemd_client::BlockingSystemdManager::enable_unit(self, name)
+    }
+    fn is_unit_enabled(&self, name: &str) -> Result<bool, SystemdError> {
+        bosun_systemd_client::BlockingSystemdManager::is_unit_enabled(self, name)
     }
     fn disable_unit(&self, name: &str) -> Result<(), SystemdError> {
         bosun_systemd_client::BlockingSystemdManager::disable_unit(self, name)

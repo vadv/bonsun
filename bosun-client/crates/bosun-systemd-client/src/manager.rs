@@ -155,6 +155,39 @@ impl SystemdManager {
             .map_err(|err| SystemdError::from_zbus(err, "enable_unit", name))
     }
 
+    /// Прочитать `GetUnitFileState(name)` и решить, считается ли unit
+    /// включённым в смысле `systemctl is-enabled`. Используется apply'ем
+    /// `systemd.service`, чтобы не дёргать `EnableUnitFiles` на каждом
+    /// повторном apply'е для уже включённых юнитов (read-before-write).
+    ///
+    /// Маппинг по строке состояния (`org.freedesktop.systemd1` man-page):
+    /// - `enabled`, `enabled-runtime`, `static`, `alias` → `true`;
+    /// - `disabled`, `masked`, `masked-runtime`, `linked`, `linked-runtime`,
+    ///   `indirect`, `generated`, `transient`, `bad`, `disabled-runtime`
+    ///   → `false`;
+    /// - неизвестное значение → `false` (безопасный default, не
+    ///   перепрыгиваем enable наугад).
+    ///
+    /// `NoSuchUnit` → `false`: файла нет, юнит точно не включён, апплаю
+    /// надо идти в `enable_unit` (где он получит ту же ошибку, если файл
+    /// и правда отсутствует).
+    pub async fn is_unit_enabled(&self, name: &str) -> Result<bool, SystemdError> {
+        match self.proxy.get_unit_file_state(name.to_string()).await {
+            Ok(state) => Ok(matches!(
+                state.as_str(),
+                "enabled" | "enabled-runtime" | "static" | "alias"
+            )),
+            Err(err) => {
+                let mapped = SystemdError::from_zbus(err, "is_unit_enabled", name);
+                if matches!(mapped, SystemdError::NoSuchUnit(_)) {
+                    Ok(false)
+                } else {
+                    Err(mapped)
+                }
+            }
+        }
+    }
+
     /// `DisableUnitFiles([name], runtime=false)`.
     pub async fn disable_unit(&self, name: &str) -> Result<(), SystemdError> {
         self.proxy

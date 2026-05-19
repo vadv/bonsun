@@ -6,12 +6,10 @@
 //!    `needs_daemon_reload(name) == true`, вызывает `daemon_reload()`;
 //!    остальные пропускают (флаг `ctx.systemd_daemon_reload_done`).
 //! 3. Snapshot `before: UnitInfo` через `unit_info(name)`.
-//! 4. Если `spec.enable && !before.is_enabled` — `enable_unit`. На текущий
-//!    момент API для is_enabled у `SystemdHandle` нет (см. Phase A); в
-//!    качестве страхующей замены вызываем `enable_unit` unconditionally
-//!    при `spec.enable=true`. systemd обрабатывает повторный enable как
-//!    no-op, так что идемпотентность сохраняется. TODO: вернуться, когда
-//!    `is_unit_enabled` появится в Phase A-расширении.
+//! 4. Если `spec.enable` — read-before-write: сначала `is_unit_enabled(name)`,
+//!    и `enable_unit` зовётся только при `false`. systemd обрабатывает
+//!    повторный enable как no-op, но это лишний dbus round-trip на каждый
+//!    apply — `GetUnitFileState` дешевле.
 //! 5. `decide_action_systemd(spec, before, restart_triggered, reload_triggered)`.
 //! 6. Defer-eligible (Restart/Reload) → `ctx.defers.enqueue(...)` ДО
 //!    реального вызова — at-least-once гарантия.
@@ -98,11 +96,17 @@ pub fn run(
         }
     }
 
-    // 2. EnableUnitFiles если требуется. См. модульный комментарий: пока
-    // API для is_unit_enabled нет, вызов идемпотентен на стороне systemd.
+    // 2. EnableUnitFiles если требуется. Read-before-write: сначала
+    // `is_unit_enabled` (GetUnitFileState), потом enable_unit только если
+    // юнит ещё не включён. Экономит dbus round-trip на повторных apply'ях.
     if spec.enable {
-        if let Err(e) = systemd.enable_unit(&spec.name) {
-            return Err(map_systemd_error(e, "enable_unit"));
+        let already_enabled = systemd
+            .is_unit_enabled(&spec.name)
+            .map_err(|e| map_systemd_error(e, "is_unit_enabled"))?;
+        if !already_enabled {
+            if let Err(e) = systemd.enable_unit(&spec.name) {
+                return Err(map_systemd_error(e, "enable_unit"));
+            }
         }
     }
 
@@ -513,6 +517,12 @@ mod tests {
         // Что вернуть на enable_unit / disable_unit.
         enable_error: Mutex<Option<SystemdError>>,
         disable_error: Mutex<Option<SystemdError>>,
+        // Ответ `is_unit_enabled`. По умолчанию `false` — апплай идёт в
+        // `enable_unit`, как требуется большинству тестов. Чтобы тестировать
+        // путь «уже включён», см. `with_is_unit_enabled(true)`. Для error-path
+        // используем одноразовый инжектор `is_unit_enabled_error`.
+        is_unit_enabled_response: Mutex<bool>,
+        is_unit_enabled_error: Mutex<Option<SystemdError>>,
     }
 
     impl MockSystemd {
@@ -526,6 +536,8 @@ mod tests {
                 stop_error: Mutex::new(None),
                 enable_error: Mutex::new(None),
                 disable_error: Mutex::new(None),
+                is_unit_enabled_response: Mutex::new(false),
+                is_unit_enabled_error: Mutex::new(None),
             }
         }
 
@@ -539,6 +551,12 @@ mod tests {
 
         fn with_needs_reload(self, v: bool) -> Self {
             *self.needs_daemon_reload_response.lock().unwrap() = v;
+            self
+        }
+
+        /// Подменить ответ `is_unit_enabled`. По умолчанию `false`.
+        fn with_is_unit_enabled(self, v: bool) -> Self {
+            *self.is_unit_enabled_response.lock().unwrap() = v;
             self
         }
 
@@ -590,6 +608,13 @@ mod tests {
                 return Err(e);
             }
             Ok(())
+        }
+        fn is_unit_enabled(&self, name: &str) -> Result<bool, SystemdError> {
+            self.record(&format!("is_unit_enabled:{name}"));
+            if let Some(e) = self.is_unit_enabled_error.lock().unwrap().take() {
+                return Err(e);
+            }
+            Ok(*self.is_unit_enabled_response.lock().unwrap())
         }
         fn disable_unit(&self, name: &str) -> Result<(), SystemdError> {
             self.record(&format!("disable_unit:{name}"));
@@ -916,6 +941,77 @@ mod tests {
     }
 
     #[test]
+    fn apply_enable_true_already_enabled_skips_enable_unit() {
+        // is_unit_enabled=true → enable_unit пропускается (read-before-write).
+        let mock = Arc::new(MockSystemd::new().with_is_unit_enabled(true));
+        mock.enqueue_unit_info(Ok(make_unit("nginx", "active", "abc")));
+        let r = make_resource("nginx.service", ServiceState::Running, true);
+        let (_tmp, ctx) = make_ctx(Some(mock.clone()));
+        let _ = run(&r, &force_update(&r), &ctx).unwrap();
+        let calls = mock.calls();
+        assert!(
+            calls.iter().any(|c| c == "is_unit_enabled:nginx.service"),
+            "expected is_unit_enabled to be called, got {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|c| c == "enable_unit:nginx.service"),
+            "enable_unit must be skipped when already enabled, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn apply_enable_true_when_not_enabled_calls_enable_unit() {
+        // is_unit_enabled=false → enable_unit вызывается.
+        let mock = Arc::new(MockSystemd::new().with_is_unit_enabled(false));
+        mock.enqueue_unit_info(Ok(make_unit("nginx", "active", "abc")));
+        let r = make_resource("nginx.service", ServiceState::Running, true);
+        let (_tmp, ctx) = make_ctx(Some(mock.clone()));
+        let _ = run(&r, &force_update(&r), &ctx).unwrap();
+        let calls = mock.calls();
+        assert!(
+            calls.iter().any(|c| c == "is_unit_enabled:nginx.service"),
+            "expected is_unit_enabled to be called, got {calls:?}"
+        );
+        assert!(
+            calls.iter().any(|c| c == "enable_unit:nginx.service"),
+            "enable_unit must be called when not enabled, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn apply_enable_true_is_unit_enabled_error_propagates() {
+        // Ошибка от is_unit_enabled должна пробрасываться, enable не дёргается.
+        let mock = Arc::new(MockSystemd::new());
+        *mock.is_unit_enabled_error.lock().unwrap() = Some(SystemdError::BusUnavailable {
+            reason: "socket missing".into(),
+            source: zbus::Error::Address("unix:path=/nonexistent".into()),
+        });
+        let r = make_resource("nginx.service", ServiceState::Running, true);
+        let (_tmp, ctx) = make_ctx(Some(mock.clone()));
+        let err = run(&r, &force_update(&r), &ctx).unwrap_err();
+        assert!(
+            err.is_deferrable(),
+            "BusUnavailable должен маппиться в deferrable SystemdUnavailable, got {err:?}"
+        );
+        match err {
+            PrimitiveError::SystemdUnavailable { reason } => {
+                assert!(
+                    reason.contains("is_unit_enabled"),
+                    "reason должен ссылаться на is_unit_enabled, got {reason}"
+                );
+            }
+            other => panic!("expected SystemdUnavailable, got {other:?}"),
+        }
+        assert!(
+            !mock
+                .calls()
+                .iter()
+                .any(|c| c == "enable_unit:nginx.service"),
+            "enable_unit не должен вызываться при ошибке is_unit_enabled"
+        );
+    }
+
+    #[test]
     fn apply_bus_unavailable_during_needs_reload_is_deferrable() {
         struct UnavailableSystemd;
         impl SystemdHandle for UnavailableSystemd {
@@ -941,6 +1037,9 @@ mod tests {
                 unimplemented!()
             }
             fn enable_unit(&self, _: &str) -> Result<(), SystemdError> {
+                unimplemented!()
+            }
+            fn is_unit_enabled(&self, _: &str) -> Result<bool, SystemdError> {
                 unimplemented!()
             }
             fn disable_unit(&self, _: &str) -> Result<(), SystemdError> {
