@@ -1,0 +1,12 @@
+[bundle]
+name           = "pgbouncer-cluster"
+version        = "0.1.0"
+description    = "pgbouncer на одной ноде с runr-supervised сервисом и cross-resource notify"
+requires_bosun = "^0.1"
+
+[bundle.inventory]
+default_merge_strategy = "deep_map_replace_list"
+
+[bundle.tags]
+production = "Production cluster"
+staging    = "Staging cluster"

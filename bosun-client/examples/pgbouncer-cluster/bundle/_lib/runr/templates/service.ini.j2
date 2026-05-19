@@ -1,0 +1,16 @@
+[Service]
+Name={{ inv.name }}
+{% if inv.working_directory %}WorkingDirectory={{ inv.working_directory }}
+{% endif %}{% if inv.user %}User={{ inv.user }}
+{% endif %}{% if inv.group %}Group={{ inv.group }}
+{% endif %}Autostart={{ "yes" if inv.autostart else "no" }}
+{% for env in inv.environment %}Environment={{ env.key }}={{ env.value }}
+{% endfor %}ExecStart={{ inv.exec_start }}
+{% if inv.exec_reload %}ExecReload={{ inv.exec_reload }}
+{% endif %}{% if inv.restart != "always" %}Restart={{ inv.restart }}
+{% endif %}{% if inv.timeout_sec %}TimeoutSec={{ inv.timeout_sec }}
+{% endif %}{% if inv.restart_sec %}RestartSec={{ inv.restart_sec }}
+{% endif %}{% if inv.limit_nofile %}LimitNOFILE={{ inv.limit_nofile }}
+{% endif %}{% if inv.max_memory_rss %}MaxMemoryRSS={{ inv.max_memory_rss }}
+{% endif %}{% if inv.kill_mode != "control-group" %}KillMode={{ inv.kill_mode }}
+{% endif %}

@@ -1,0 +1,5 @@
+{
+  "init_system": "runr",
+  "hostname": "pgbouncer-demo",
+  "os_family": "debian"
+}

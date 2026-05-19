@@ -125,3 +125,19 @@ Feature: Bundle directory structure
     When I run "bosun bundle validate --bundle /work/bundle --tags=staging" inside the container
     Then exit code is 0
     And output contains "evaluate OK"
+
+  @bundle-validate @bundle-roles
+  Scenario: examples/pgbouncer-cluster validates with production tag (runr facts)
+    Given a fresh container
+    And the bundle from "examples/pgbouncer-cluster/bundle"
+    When I run "bosun bundle validate --bundle /work/bundle --tags=production --facts /work/bundle/fixtures/facts-runr.json" inside the container
+    Then exit code is 0
+    And output contains "evaluate OK"
+
+  @bundle-validate @bundle-roles
+  Scenario: examples/pgbouncer-cluster validates with staging tag (systemd facts)
+    Given a fresh container
+    And the bundle from "examples/pgbouncer-cluster/bundle"
+    When I run "bosun bundle validate --bundle /work/bundle --tags=staging --facts /work/bundle/fixtures/facts-systemd.json" inside the container
+    Then exit code is 0
+    And output contains "evaluate OK"

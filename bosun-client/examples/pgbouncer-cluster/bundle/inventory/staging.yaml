@@ -1,0 +1,4 @@
+pgbouncer:
+  pool_mode: session
+  default_pool_size: 10
+  max_client_conn: 100

@@ -147,7 +147,9 @@ impl FactsSource for FixtureFacts {
 }
 
 /// Mock-набор примитивов для validate. Регистрируют payload, не делают
-/// plan/apply (валидация не запускает оркестратор).
+/// plan/apply (валидация не запускает оркестратор). Состав совпадает с
+/// продакшен-набором из `run::build_primitives` плюс runr.service /
+/// systemd.service, к которым диспатчит абстрактный `service.unit`.
 fn build_validate_primitives() -> HashMap<ResourceKind, Box<dyn Primitive>> {
     let mut m: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
     m.insert(
@@ -162,6 +164,27 @@ fn build_validate_primitives() -> HashMap<ResourceKind, Box<dyn Primitive>> {
         Box::new(NoopPrimitive {
             kind: "file.content",
             identity_keys: &["path"],
+        }),
+    );
+    m.insert(
+        ResourceKind::from_static("runr.service"),
+        Box::new(NoopPrimitive {
+            kind: "runr.service",
+            identity_keys: &["name"],
+        }),
+    );
+    m.insert(
+        ResourceKind::from_static("systemd.service"),
+        Box::new(NoopPrimitive {
+            kind: "systemd.service",
+            identity_keys: &["name"],
+        }),
+    );
+    m.insert(
+        ResourceKind::from_static("process.signal"),
+        Box::new(NoopPrimitive {
+            kind: "process.signal",
+            identity_keys: &["name"],
         }),
     );
     m

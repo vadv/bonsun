@@ -1,0 +1,6 @@
+[Cgroup]
+Name={{ inv.name }}
+{% if inv.memory_max %}MemoryMax={{ inv.memory_max }}
+{% endif %}{% if inv.cpu_max %}CpuMax={{ inv.cpu_max }}
+{% endif %}{% for io in inv.io_max %}MaxIO={{ io.mount_path }}{% if io.read_bps %} read_bps:{{ io.read_bps }}{% endif %}{% if io.write_bps %} write_bps:{{ io.write_bps }}{% endif %}{% if io.read_iops %} read_iops:{{ io.read_iops }}{% endif %}{% if io.write_iops %} write_iops:{{ io.write_iops }}{% endif %}
+{% endfor %}

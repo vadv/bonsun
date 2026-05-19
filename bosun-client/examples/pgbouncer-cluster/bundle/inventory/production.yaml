@@ -1,0 +1,4 @@
+pgbouncer:
+  pool_mode: transaction
+  default_pool_size: 50
+  max_client_conn: 1000

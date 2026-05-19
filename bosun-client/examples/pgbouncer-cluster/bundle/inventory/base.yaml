@@ -1,0 +1,18 @@
+timezone: UTC
+cluster_name: pgbouncer-demo
+
+pgbouncer:
+  listen_addr: 127.0.0.1
+  listen_port: 6432
+  auth_type: scram-sha-256
+  pool_mode: transaction
+  default_pool_size: 20
+  max_client_conn: 100
+  databases:
+    - name: postgres
+      host: 127.0.0.1
+      port: 5432
+  users:
+    - name: bouncer
+      # scram-sha-256 hash для пароля "demo" (только для примера, не для production).
+      password: "SCRAM-SHA-256$4096:salt$stored:server"

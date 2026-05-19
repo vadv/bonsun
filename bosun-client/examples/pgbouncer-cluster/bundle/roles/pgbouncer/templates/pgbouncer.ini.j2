@@ -1,0 +1,15 @@
+[databases]
+{% for db in inv.pgbouncer.databases %}{{ db.name }} = host={{ db.host }} port={{ db.port }}
+{% endfor %}
+
+[pgbouncer]
+listen_addr = {{ inv.pgbouncer.listen_addr }}
+listen_port = {{ inv.pgbouncer.listen_port }}
+auth_type = {{ inv.pgbouncer.auth_type }}
+auth_file = /etc/pgbouncer/userlist.txt
+pool_mode = {{ inv.pgbouncer.pool_mode }}
+default_pool_size = {{ inv.pgbouncer.default_pool_size }}
+max_client_conn = {{ inv.pgbouncer.max_client_conn }}
+unix_socket_dir = /var/run/postgresql
+logfile = /var/log/postgresql/pgbouncer.log
+pidfile = /var/run/postgresql/pgbouncer.pid

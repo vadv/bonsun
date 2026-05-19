@@ -1,0 +1,7 @@
+[Timer]
+Name={{ inv.name }}
+{% if inv.on_calendar %}OnCalendar={{ inv.on_calendar }}
+{% endif %}{% if inv.on_startup_sec %}OnStartupSec={{ inv.on_startup_sec }}
+{% endif %}{% if inv.randomized_delay_sec %}RandomizedDelaySec={{ inv.randomized_delay_sec }}
+{% endif %}{% if inv.unit_name %}Unit={{ inv.unit_name }}
+{% endif %}Autostart={{ "yes" if inv.autostart else "no" }}

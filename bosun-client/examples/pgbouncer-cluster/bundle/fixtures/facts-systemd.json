@@ -1,0 +1,5 @@
+{
+  "init_system": "systemd",
+  "hostname": "pgbouncer-demo",
+  "os_family": "debian"
+}
