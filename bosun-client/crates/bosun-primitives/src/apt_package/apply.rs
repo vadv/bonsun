@@ -113,6 +113,9 @@ fn compute_resource_deadline(ctx_deadline: Instant, spec_timeout_sec: u32) -> In
 }
 
 /// Сборка `apt-get install` с canonical-флагами по spec.
+/// F08: `--allow-downgrades` и `--allow-change-held-packages` добавляются
+/// только если spec явно их разрешает. По умолчанию apt отказывается от
+/// downgrade и не трогает `apt-mark hold` пакеты.
 fn install_attempt(
     runner: &dyn CommandRunner,
     spec: &AptPackageSpec,
@@ -123,22 +126,22 @@ fn install_attempt(
         Some(v) => format!("{}={}", spec.name, v),
         None => spec.name.clone(),
     };
-    runner.run(
-        "apt-get",
-        &[
-            "install",
-            "-qy",
-            "-oDpkg::Options::=--force-confdef",
-            "-oDpkg::Options::=--force-confold",
-            "-oAPT::Acquire::Retries=3",
-            "-oDPkg::Lock::Timeout=30",
-            "--allow-downgrades",
-            "--allow-change-held-packages",
-            &pkg_spec,
-        ],
-        deadline,
-        cancel,
-    )
+    let mut args: Vec<&str> = vec![
+        "install",
+        "-qy",
+        "-oDpkg::Options::=--force-confdef",
+        "-oDpkg::Options::=--force-confold",
+        "-oAPT::Acquire::Retries=3",
+        "-oDPkg::Lock::Timeout=30",
+    ];
+    if spec.allow_downgrade {
+        args.push("--allow-downgrades");
+    }
+    if spec.allow_change_held {
+        args.push("--allow-change-held-packages");
+    }
+    args.push(&pkg_spec);
+    runner.run("apt-get", &args, deadline, cancel)
 }
 
 fn install_success_message(spec: &AptPackageSpec) -> String {
@@ -307,6 +310,33 @@ mod tests {
                 "name": name,
                 "version": version,
                 "timeout_sec": 600_u32,
+                "allow_downgrade": false,
+                "allow_change_held": false,
+            }),
+            reload_on: Vec::new(),
+            depends_on: Vec::new(),
+        }
+    }
+
+    /// Resource с явными opt-in флагами для F08-тестов.
+    fn resource_with_flags(
+        name: &str,
+        version: Option<&str>,
+        allow_downgrade: bool,
+        allow_change_held: bool,
+    ) -> Resource {
+        let kind = ResourceKind::from_static("apt.package");
+        let id = ResourceId::new(&kind, name);
+        Resource {
+            id,
+            kind,
+            spec_version: 1,
+            payload: serde_json::json!({
+                "name": name,
+                "version": version,
+                "timeout_sec": 600_u32,
+                "allow_downgrade": allow_downgrade,
+                "allow_change_held": allow_change_held,
             }),
             reload_on: Vec::new(),
             depends_on: Vec::new(),
@@ -372,10 +402,51 @@ mod tests {
         assert!(install_args
             .iter()
             .any(|a| a.contains("DPkg::Lock::Timeout=30")));
+        // F08: opt-in флаги по умолчанию отсутствуют.
+        assert!(!install_args.iter().any(|a| a == "--allow-downgrades"));
+        assert!(!install_args
+            .iter()
+            .any(|a| a == "--allow-change-held-packages"));
+    }
+
+    #[test]
+    fn apply_install_with_allow_downgrade_adds_flag() {
+        let runner = MockRunner::new(vec![cmdres(Some(0), "")]);
+        let r = resource_with_flags("nginx", Some("1.18.0"), true, false);
+        let tmp = tempfile::tempdir().unwrap();
+        let (_d, lock_path) = free_lock_path();
+        let ctx = make_ctx(tmp.path().to_path_buf());
+
+        let diff = Diff::Add {
+            description: "install".into(),
+            payload: r.payload.clone(),
+        };
+        run(&runner, &lock_path, &r, &diff, &ctx).unwrap();
+        let install_args = &runner.calls()[0].1;
         assert!(install_args.iter().any(|a| a == "--allow-downgrades"));
+        assert!(!install_args
+            .iter()
+            .any(|a| a == "--allow-change-held-packages"));
+    }
+
+    #[test]
+    fn apply_install_with_allow_change_held_adds_flag() {
+        let runner = MockRunner::new(vec![cmdres(Some(0), "")]);
+        let r = resource_with_flags("nginx", None, false, true);
+        let tmp = tempfile::tempdir().unwrap();
+        let (_d, lock_path) = free_lock_path();
+        let ctx = make_ctx(tmp.path().to_path_buf());
+
+        let diff = Diff::Add {
+            description: "install".into(),
+            payload: r.payload.clone(),
+        };
+        run(&runner, &lock_path, &r, &diff, &ctx).unwrap();
+        let install_args = &runner.calls()[0].1;
         assert!(install_args
             .iter()
             .any(|a| a == "--allow-change-held-packages"));
+        assert!(!install_args.iter().any(|a| a == "--allow-downgrades"));
     }
 
     #[test]
@@ -642,6 +713,8 @@ mod tests {
             name: "nginx".into(),
             version: Some("1.0".into()),
             timeout_sec: 600,
+            allow_downgrade: false,
+            allow_change_held: false,
         };
         assert_eq!(install_success_message(&s), "installed nginx=1.0");
     }
@@ -652,6 +725,8 @@ mod tests {
             name: "curl".into(),
             version: None,
             timeout_sec: 600,
+            allow_downgrade: false,
+            allow_change_held: false,
         };
         assert_eq!(install_success_message(&s), "installed curl");
     }

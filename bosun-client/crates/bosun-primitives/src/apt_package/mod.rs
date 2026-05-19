@@ -93,11 +93,23 @@ impl<R: CommandRunner> Primitive for AptPrimitive<R> {
             .optional_u32("timeout_sec")
             .map_err(|e| PrimitiveError::InvalidPayload(format!("apt.package: {e}")))?
             .unwrap_or(600);
+        // F08: opt-in флаги; по умолчанию false — apt отказывает в
+        // downgrade и не трогает hold'ы.
+        let allow_downgrade = args
+            .optional_bool("allow_downgrade")
+            .map_err(|e| PrimitiveError::InvalidPayload(format!("apt.package: {e}")))?
+            .unwrap_or(false);
+        let allow_change_held = args
+            .optional_bool("allow_change_held")
+            .map_err(|e| PrimitiveError::InvalidPayload(format!("apt.package: {e}")))?
+            .unwrap_or(false);
 
         Ok(serde_json::json!({
             "name": name,
             "version": version,
             "timeout_sec": timeout_sec,
+            "allow_downgrade": allow_downgrade,
+            "allow_change_held": allow_change_held,
         }))
     }
 
@@ -164,6 +176,9 @@ mod tests {
         assert_eq!(payload["name"], "nginx");
         assert_eq!(payload["version"], "1.18.0");
         assert_eq!(payload["timeout_sec"], 1800);
+        // F08: дефолтные значения allow_*-флагов.
+        assert_eq!(payload["allow_downgrade"], false);
+        assert_eq!(payload["allow_change_held"], false);
     }
 
     #[test]
@@ -176,6 +191,22 @@ mod tests {
             .unwrap();
         assert_eq!(payload["timeout_sec"], 600);
         assert_eq!(payload["version"], serde_json::Value::Null);
+        assert_eq!(payload["allow_downgrade"], false);
+        assert_eq!(payload["allow_change_held"], false);
+    }
+
+    #[test]
+    fn build_payload_accepts_allow_flags() {
+        let mut args: HashMap<String, ArgValue> = HashMap::new();
+        args.insert("name".into(), ArgValue::Str("nginx".into()));
+        args.insert("allow_downgrade".into(), ArgValue::Bool(true));
+        args.insert("allow_change_held".into(), ArgValue::Bool(true));
+        let call_args = CallArgs::new(args);
+        let payload = AptPrimitive::new()
+            .build_payload(&call_args, &plan_ctx())
+            .unwrap();
+        assert_eq!(payload["allow_downgrade"], true);
+        assert_eq!(payload["allow_change_held"], true);
     }
 
     #[test]

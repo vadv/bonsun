@@ -123,6 +123,19 @@ impl CallArgs {
         }
     }
 
+    /// Опциональный bool-аргумент. None если не передан.
+    pub fn optional_bool(&self, name: &str) -> Result<Option<bool>, CallArgsError> {
+        match self.inner.get(name) {
+            Some(ArgValue::Bool(b)) => Ok(Some(*b)),
+            Some(other) => Err(CallArgsError::WrongType {
+                name: name.into(),
+                expected: "bool",
+                actual: type_name(other),
+            }),
+            None => Ok(None),
+        }
+    }
+
     pub fn optional_handle_list(&self, name: &str) -> Result<Vec<ResourceId>, CallArgsError> {
         match self.inner.get(name) {
             Some(ArgValue::HandleList(v)) => Ok(v.clone()),
@@ -202,6 +215,25 @@ mod tests {
     fn optional_handle_list_default_empty() {
         let args = make(&[]);
         assert!(args.optional_handle_list("reload_on").unwrap().is_empty());
+    }
+
+    #[test]
+    fn optional_bool_present_true() {
+        let args = make(&[("k", ArgValue::Bool(true))]);
+        assert_eq!(args.optional_bool("k").unwrap(), Some(true));
+    }
+
+    #[test]
+    fn optional_bool_absent_returns_none() {
+        let args = make(&[]);
+        assert_eq!(args.optional_bool("k").unwrap(), None);
+    }
+
+    #[test]
+    fn optional_bool_wrong_type_is_error() {
+        let args = make(&[("k", ArgValue::Int(1))]);
+        let err = args.optional_bool("k").unwrap_err();
+        assert!(matches!(err, CallArgsError::WrongType { .. }));
     }
 
     #[test]
