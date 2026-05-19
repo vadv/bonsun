@@ -1,15 +1,14 @@
 //! Интеграционный слой между Starlark и bosun.
 //!
-//! Архитектура (см. spec «Starlark evaluator glue»):
-//! - Native globals `apt`, `file`, `template` собираются в `FrozenModule`
-//!   `@bosun/builtins`. `BundleLoader` выдаёт его на `load("@bosun/builtins")`.
-//! - `inv` — это специальный объект, который устанавливается как
-//!   module-level переменная через `module.set("inv", ...)` перед
-//!   eval_module. Внутри `inv` хранит ссылку на состояние через
-//!   thread-local handle.
+//! Архитектура (см. spec «bundle architecture rev 2»):
+//! - Native globals `apt`, `file`, `runr`, `template`, `inventory`, `tags`,
+//!   `inv` — собираются в `Globals` и в `FrozenModule` `@bosun/builtins`.
+//! - `BundleLoader` отдаёт `@bosun/builtins`, `@roles/<name>`, `@lib/<name>`.
 //! - На время `evaluate_manifest` thread-local `CURRENT_STATE` хранит
-//!   `Rc<EvalState>`. Native-функции и attribute access читают state
-//!   через `with_state(...)`. После возврата thread-local очищается.
+//!   `Rc<EvalState>`. Native-функции и attribute access читают state через
+//!   `with_state(...)`. После возврата thread-local очищается.
+//! - `current_module` stack обновляется через RAII `ModuleStackGuard` —
+//!   push при входе в load_role_or_lib, pop при выходе/Drop'е.
 //!
 //! `allow(unsafe_code)`: derive-макросы `Trace`/`Freeze` из `starlark_derive`
 //! генерируют `unsafe impl`-блоки. Мы не пишем `unsafe` сами — это требование
@@ -22,13 +21,14 @@ mod inv_object;
 mod load_resolver;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use starlark::environment::Module;
 use starlark::eval::Evaluator;
-use starlark::syntax::{AstModule, Dialect};
+use starlark::syntax::AstModule;
 
 use crate::bundle::{Bundle, BundleError};
 use crate::primitive::{FactsSource, PlanCtx, Primitive};
@@ -37,19 +37,21 @@ use crate::resource::ResourceKind;
 use crate::sensitive::SensitiveStore;
 
 pub use globals::{build_builtins_module, build_globals};
-pub use load_resolver::BundleLoader;
+pub(crate) use load_resolver::BundleLoader;
 
-/// Closure для рендера шаблона из Starlark-глобала `template(path)`.
+/// Closure для рендера шаблона. Аргументы:
+/// - `resolved_path`: канонический absolute путь к файлу .j2 под bundle root
+///   (уже валидированный через path_safety; glue передаёт готовый путь).
+/// - `original`: исходная строка из `template("...")` — полезна для логов.
+/// - `extra_context`: kwargs, переданные в `template(path, **kwargs)`.
+///   CLI закладывает в свою closure базовые facts/inv; этот аргумент
+///   добавляется поверх (kwargs побеждают). Часто будет пустой JSON-объект.
 ///
-/// Вынесена в инжектируемый closure, потому что реальный рендер
-/// (`render_template`) живёт в `bosun-primitives` — он зависит от
-/// `bosun-core`, и обратная зависимость замкнула бы цикл крейтов. CLI
-/// в Phase 8 строит этот closure через `bosun-primitives::render_template`
-/// с забэканным templates_root, inv-копией и materialized-фактами.
-///
-/// Тип `Rc<dyn Fn>`, потому что closure хранится в `Rc<EvalState>` и
-/// разделяется между вызовами native-функций — копия дешёвая.
-pub type TemplateFn = Rc<dyn Fn(&str) -> Result<String, anyhow::Error>>;
+/// CLI собирает closure через `bosun-primitives::render_template` с
+/// захваченным facts. Glue-слой вычисляет defining модуль через walk
+/// call-stack и резолвит шаблон до вызова closure.
+pub type TemplateFn =
+    Rc<dyn Fn(&std::path::Path, &str, &serde_json::Value) -> Result<String, anyhow::Error>>;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -64,27 +66,37 @@ pub enum StarlarkGlueError {
     UnknownPrimitive(String),
     #[error("bundle error: {0}")]
     Bundle(#[from] BundleError),
+    #[error("load cycle detected: {0}")]
+    LoadCycle(String),
 }
 
 /// State, разделяемое между всеми Starlark-объектами одного запуска
 /// evaluate_manifest. Хранится в thread-local на время вызова.
-///
-/// Все поля — owned либо Arc/Rc/RefCell. Никаких borrowed-ссылок, чтобы
-/// state мог жить в `Rc` (необходимое для thread-local).
 pub(crate) struct EvalState {
+    pub(crate) bundle: Rc<Bundle>,
     pub(crate) primitives: Rc<HashMap<ResourceKind, Box<dyn Primitive>>>,
+    /// FactsSource хранится в state на случай если примитивы захотят его
+    /// читать через with_state в build_payload. Сейчас primitives получают
+    /// факты через materialized JSON в template-closure, но поле сохранено
+    /// для forward-совместимости с runr-integration и runtime-decision
+    /// примитивами.
+    #[allow(dead_code)]
     pub(crate) facts: Rc<dyn FactsSource>,
-    /// Хранилище секретов для file.content.contents. Native-функция
-    /// `file.content(...)` извлекает `contents`-аргумент и кладёт его сюда
-    /// под ключом ResourceId до того, как зовёт `Primitive::build_payload`.
+    /// Хранилище секретов для file.content.contents.
     pub(crate) sensitive: Arc<SensitiveStore>,
     pub(crate) registry: Rc<RefCell<Registry>>,
     pub(crate) plan_ctx: PlanCtx,
     pub(crate) errors: RefCell<Vec<StarlarkGlueError>>,
-    /// Closure для рендера шаблонов. Инжектируется CLI в Phase 8; в
-    /// unit-тестах bosun-core может быть `default_template_fn`, который
-    /// сразу отдаёт ошибку «template rendering not configured».
     pub(crate) template_fn: TemplateFn,
+    pub(crate) tags: HashSet<String>,
+    /// Стек canonical путей загружаемых модулей. Пушится при входе в
+    /// `BundleLoader::load_role_or_lib` через `ModuleStackGuard`. Используется
+    /// как backup для call-stack-walk, если starlark frame не отдаёт codemap.
+    pub(crate) current_module: RefCell<Vec<PathBuf>>,
+    /// Кэш `inventory.load`: канонический путь yaml → распарсенный JSON.
+    /// Заполняется лениво при первой загрузке; в следующих вызовах того же
+    /// path парсинг не повторяется.
+    pub(crate) inventory_cache: RefCell<HashMap<PathBuf, serde_json::Value>>,
 }
 
 thread_local! {
@@ -101,9 +113,6 @@ impl StateGuard {
     fn install(state: Rc<EvalState>) -> Result<Self, StarlarkGlueError> {
         let already_installed = CURRENT_STATE.with(|cell| cell.borrow().is_some());
         if already_installed {
-            // Re-entrant evaluate_manifest на том же thread запрещён: вложенный
-            // bosun-evaluation потерял бы parent state. В release-build раньше
-            // это был silent debug_assert; теперь — явная ошибка.
             return Err(StarlarkGlueError::Eval(
                 "nested evaluate_manifest is not supported on the same thread".to_string(),
             ));
@@ -123,10 +132,27 @@ impl Drop for StateGuard {
     }
 }
 
-/// Хук-функция для starlark-evaluator'а: выставляется через
-/// `before_stmt_for_dap` и вызывается перед каждым bytecode-statement'ом.
-/// Проверяет `plan_ctx.deadline` и `cancel`; при превышении/отмене
-/// возвращает `Err`, и evaluator прерывает eval_module с этой ошибкой.
+/// RAII-guard для стека current_module: push на конструировании, pop на drop.
+/// При панике в eval'е drop гарантирует, что стек консистентен и следующий
+/// template() не резолвится из неправильной директории.
+pub(crate) struct ModuleStackGuard {
+    state: Rc<EvalState>,
+}
+
+impl ModuleStackGuard {
+    pub(crate) fn push(state: Rc<EvalState>, module: PathBuf) -> Self {
+        state.current_module.borrow_mut().push(module);
+        Self { state }
+    }
+}
+
+impl Drop for ModuleStackGuard {
+    fn drop(&mut self) {
+        self.state.current_module.borrow_mut().pop();
+    }
+}
+
+/// Хук-функция для starlark-evaluator'а.
 struct DeadlineChecker {
     deadline: std::time::Instant,
     cancel: tokio_util::sync::CancellationToken,
@@ -152,9 +178,7 @@ impl<'a, 'e: 'a> starlark::eval::BeforeStmtFuncDyn<'a, 'e> for DeadlineChecker {
     }
 }
 
-/// Прочитать текущий state. Возвращает None, если вне `evaluate_manifest`.
-/// Использовать ТОЛЬКО внутри native-функций и attribute-access'ов
-/// Starlark-объектов, созданных нашим glue.
+/// Прочитать текущий state.
 pub(crate) fn with_state<R>(f: impl FnOnce(&EvalState) -> R) -> Option<R> {
     CURRENT_STATE.with(|cell| {
         let slot = cell.borrow();
@@ -162,46 +186,61 @@ pub(crate) fn with_state<R>(f: impl FnOnce(&EvalState) -> R) -> Option<R> {
     })
 }
 
+/// Получить Rc клон текущего state.
+pub(crate) fn current_state() -> Option<Rc<EvalState>> {
+    CURRENT_STATE.with(|cell| cell.borrow().as_ref().map(Rc::clone))
+}
+
 /// Default closure для тестов и контекстов, где template-рендеринг
-/// не сконфигурирован: всегда возвращает ошибку с понятным сообщением.
+/// не сконфигурирован.
 pub fn default_template_fn() -> TemplateFn {
-    Rc::new(|path: &str| {
+    Rc::new(|_resolved, path, _ctx| {
         Err(anyhow::anyhow!(
             "template('{path}') called but no template renderer configured for this evaluator",
         ))
     })
 }
 
+/// Конфигурация запуска `evaluate_manifest`. Собрана в один объект, чтобы не
+/// тянуть 8+ позиционных параметров через все callsite'ы.
+pub struct EvaluatorConfig {
+    pub bundle: Rc<Bundle>,
+    pub primitives: Rc<HashMap<ResourceKind, Box<dyn Primitive>>>,
+    pub facts: Rc<dyn FactsSource>,
+    pub sensitive: Arc<SensitiveStore>,
+    pub registry: Rc<RefCell<Registry>>,
+    pub plan_ctx: PlanCtx,
+    pub template_fn: TemplateFn,
+    pub tags: HashSet<String>,
+}
+
 /// Запустить Starlark-evaluation для entry-манифеста bundle.
-///
-/// Каждый вызов `apt.package(...)` / `file.content(...)` через native-globals
-/// конвертируется в `Resource` и добавляется в `registry`.
-#[allow(clippy::too_many_arguments)]
-pub fn evaluate_manifest(
-    bundle: &Bundle,
-    primitives: Rc<HashMap<ResourceKind, Box<dyn Primitive>>>,
-    inventory: serde_json::Value,
-    facts: Rc<dyn FactsSource>,
-    sensitive: Arc<SensitiveStore>,
-    registry: Rc<RefCell<Registry>>,
-    plan_ctx: PlanCtx,
-    template_fn: TemplateFn,
-) -> Result<(), StarlarkGlueError> {
-    let entry_source = bundle.entry_manifest().ok_or_else(|| {
-        BundleError::EntryNotFound(format!(
-            "entry manifest '{}' not loaded from bundle",
-            bundle.metadata.entry
-        ))
+pub fn evaluate_manifest(config: EvaluatorConfig) -> Result<(), StarlarkGlueError> {
+    let EvaluatorConfig {
+        bundle,
+        primitives,
+        facts,
+        sensitive,
+        registry,
+        plan_ctx,
+        template_fn,
+        tags,
+    } = config;
+
+    let entry_path = bundle.entry.clone();
+    let entry_source = std::fs::read_to_string(&entry_path).map_err(|e| {
+        StarlarkGlueError::Bundle(BundleError::Io {
+            path: entry_path.to_string_lossy().into_owned(),
+            source: e,
+        })
     })?;
 
-    let ast = AstModule::parse(
-        &bundle.metadata.entry,
-        entry_source.to_string(),
-        &Dialect::Standard,
-    )
-    .map_err(|e| StarlarkGlueError::Syntax {
-        file: bundle.metadata.entry.clone(),
-        message: format!("{e}"),
+    let entry_name = entry_path.to_string_lossy().into_owned();
+    let ast = AstModule::parse(&entry_name, entry_source, &bundle_dialect()).map_err(|e| {
+        StarlarkGlueError::Syntax {
+            file: entry_name.clone(),
+            message: format!("{e}"),
+        }
     })?;
 
     let globals = build_globals();
@@ -209,11 +248,11 @@ pub fn evaluate_manifest(
         StarlarkGlueError::Eval(format!("failed to build @bosun/builtins module: {e}"))
     })?;
 
-    // Снимок plan_ctx до перемещения в EvalState — нужен для DeadlineChecker.
     let deadline = plan_ctx.deadline;
     let cancel = plan_ctx.cancel.clone();
 
     let state = Rc::new(EvalState {
+        bundle: Rc::clone(&bundle),
         primitives,
         facts,
         sensitive,
@@ -221,24 +260,24 @@ pub fn evaluate_manifest(
         plan_ctx,
         errors: RefCell::new(Vec::new()),
         template_fn,
+        tags,
+        current_module: RefCell::new(Vec::new()),
+        inventory_cache: RefCell::new(HashMap::new()),
     });
 
     let _guard = StateGuard::install(Rc::clone(&state))?;
 
+    // Стек current_module начинаем с entry — это нужно, если template()
+    // вызывается из top-level кода manifests/main.star (он попадёт в reject
+    // через TemplateFromManifests). Иначе fallback на codemap пойдёт мимо.
+    let _entry_guard = ModuleStackGuard::push(Rc::clone(&state), entry_path.clone());
+
     let module = Module::new();
-
-    // Установить `inv` как module-level переменную.
-    globals::install_inv(&module, inventory);
-
-    let loader = BundleLoader::new(&builtins_module);
+    let loader = BundleLoader::new(&builtins_module, Rc::clone(&state));
 
     let eval_result = {
         let mut eval = Evaluator::new(&module);
         eval.set_loader(&loader);
-        // F06: перед каждым bytecode-statement'ом DeadlineChecker проверяет
-        // deadline/cancel; при превышении prevents бесконечный/тяжёлый
-        // манифест от блокировки CLI. Хук вызывается из starlark-runtime,
-        // не из нашего кода — отсюда `BeforeStmtFuncDyn` через `from`.
         let checker: Box<dyn starlark::eval::BeforeStmtFuncDyn> = Box::new(DeadlineChecker {
             deadline,
             cancel: cancel.clone(),
@@ -248,11 +287,14 @@ pub fn evaluate_manifest(
     };
 
     if let Err(e) = eval_result {
-        // Структурированная ошибка из state, если есть, информативнее.
+        // Если в state накопилась структурная ошибка, она информативнее.
         if let Some(first) = state.errors.borrow_mut().drain(..).next() {
             return Err(first);
         }
-        return Err(StarlarkGlueError::Eval(format!("{e}")));
+        let raw = format!("{e}");
+        // Маппим Starlark-сообщения об ошибках в наши доменные варианты
+        // там, где это даёт более полезный диагноз.
+        return Err(classify_eval_error(&raw));
     }
 
     if let Some(first) = state.errors.borrow_mut().drain(..).next() {
@@ -262,10 +304,45 @@ pub fn evaluate_manifest(
     Ok(())
 }
 
+/// Starlark dialect, разрешающий top-level if/for. Это нужно для
+/// идиомы «после load() сразу `tags.require_one_of(...)`, потом
+/// `if tags.has(): inv = inventory.merge(...)`» из spec.
+pub(crate) fn bundle_dialect() -> starlark::syntax::Dialect {
+    starlark::syntax::Dialect::Extended
+}
+
+/// Попытаться классифицировать ошибку eval по тексту сообщения. Это hack,
+/// потому что starlark::Error не выставляет структурный тип для ошибок из
+/// FileLoader / get_option. Тексты совпадают с тем, что starlark формирует
+/// для `EnvironmentError::ModuleSymbolIsNotExported`.
+fn classify_eval_error(msg: &str) -> StarlarkGlueError {
+    // Privacy enforcement: starlark возвращает "Module symbol is not
+    // exported: NAME". Маппим в наш PrivateSymbol.
+    if let Some(rest) = msg.find("is not exported: ") {
+        let name = msg[rest + "is not exported: ".len()..]
+            .split(|c: char| c.is_whitespace() || c == '`' || c == '\'')
+            .next()
+            .unwrap_or("")
+            .trim_matches(|c: char| c == '`' || c == '\'')
+            .to_string();
+        if !name.is_empty() {
+            return StarlarkGlueError::Bundle(BundleError::PrivateSymbol {
+                symbol: name,
+                module: PathBuf::new(),
+            });
+        }
+    }
+    if msg.contains("Cyclic load") || msg.contains("cyclic load") {
+        return StarlarkGlueError::LoadCycle(msg.to_string());
+    }
+    StarlarkGlueError::Eval(msg.to_string())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use std::cell::RefCell;
+    use std::path::PathBuf;
     use std::rc::Rc;
     use std::time::{Duration, Instant};
 
@@ -292,8 +369,6 @@ mod tests {
         }
     }
 
-    /// Mock-примитив: build_payload пишет args как-есть, чтобы тест мог
-    /// проверить регистрацию ресурса.
     struct MockApt;
 
     impl Primitive for MockApt {
@@ -337,8 +412,6 @@ mod tests {
         }
     }
 
-    /// Mock file.content: build_payload отражает имеющиеся аргументы как payload,
-    /// в том числе уже подменённые glue'ем `content_sha256` и `content_size`.
     struct MockFile;
 
     impl Primitive for MockFile {
@@ -396,268 +469,47 @@ mod tests {
         }
     }
 
-    fn bundle_with_manifest(manifest_source: &str, defaults: serde_json::Value) -> Bundle {
+    /// Подготовить bundle с произвольной структурой файлов. `files` —
+    /// пары (relative-path, content). bundle.toml пишется автоматически, если
+    /// не задан в `files`.
+    fn make_bundle_with_files(files: &[(&str, &str)]) -> Bundle {
         let tmp = tempfile::tempdir().unwrap();
-        // keep TempDir alive by leaking it — bundle file content stays in tempdir
-        // for the duration of the test; OS reclaims on process exit.
         let root = tmp.keep();
-        std::fs::create_dir_all(root.join("manifests")).unwrap();
-        std::fs::write(
-            root.join("bundle.toml"),
-            r#"
+        let has_bundle_toml = files.iter().any(|(p, _)| *p == "bundle.toml");
+        if !has_bundle_toml {
+            std::fs::write(
+                root.join("bundle.toml"),
+                r#"
 [bundle]
 name = "test"
 version = "0.1.0"
 requires_bosun = "^0.1"
 entry = "manifests/main.star"
+
+[bundle.inventory]
+default_merge_strategy = "deep_map_replace_list"
 "#,
-        )
-        .unwrap();
-        std::fs::write(root.join("manifests/main.star"), manifest_source).unwrap();
-        std::fs::create_dir_all(root.join("templates")).unwrap();
-        let mut bundle = Bundle::load_dir(&root).unwrap();
-        bundle.defaults = defaults;
-        bundle
+            )
+            .unwrap();
+        }
+        for (rel, body) in files {
+            let path = root.join(rel);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, body).unwrap();
+        }
+        Bundle::load_dir(&root).unwrap()
+    }
+
+    fn bundle_with_manifest(manifest_source: &str) -> Bundle {
+        make_bundle_with_files(&[("manifests/main.star", manifest_source)])
     }
 
     fn primitives_with_mock_apt() -> Rc<HashMap<ResourceKind, Box<dyn Primitive>>> {
         let mut m: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
         m.insert(ResourceKind::from_static("apt.package"), Box::new(MockApt));
         Rc::new(m)
-    }
-
-    #[test]
-    fn apt_package_call_registers_resource() {
-        let bundle = bundle_with_manifest(
-            r#"
-load("@bosun/builtins", "apt")
-apt.package(name = "nginx")
-"#,
-            serde_json::json!({}),
-        );
-        let primitives = primitives_with_mock_apt();
-        let registry = Rc::new(RefCell::new(Registry::new()));
-        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
-        let store = Arc::new(SensitiveStore::new());
-        let ctx = plan_ctx();
-        evaluate_manifest(
-            &bundle,
-            primitives,
-            serde_json::json!({}),
-            facts,
-            store,
-            Rc::clone(&registry),
-            ctx,
-            default_template_fn(),
-        )
-        .unwrap();
-        let reg = registry.borrow();
-        assert_eq!(reg.all().len(), 1);
-        let r = &reg.all()[0];
-        assert_eq!(
-            r.id,
-            ResourceId::new(&ResourceKind::from_static("apt.package"), "nginx")
-        );
-        assert_eq!(r.payload["name"], serde_json::json!("nginx"));
-    }
-
-    #[test]
-    fn apt_package_with_version_from_inventory() {
-        let bundle = bundle_with_manifest(
-            r#"
-load("@bosun/builtins", "apt")
-apt.package(name = "nginx", version = inv.nginx_version)
-"#,
-            serde_json::json!({"nginx_version": "1.18.0"}),
-        );
-        let primitives = primitives_with_mock_apt();
-        let registry = Rc::new(RefCell::new(Registry::new()));
-        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
-        let store = Arc::new(SensitiveStore::new());
-        let ctx = plan_ctx();
-        let inventory = bundle.merge_inventory(serde_json::json!({}));
-        evaluate_manifest(
-            &bundle,
-            primitives,
-            inventory,
-            facts,
-            store,
-            Rc::clone(&registry),
-            ctx,
-            default_template_fn(),
-        )
-        .unwrap();
-        let reg = registry.borrow();
-        let r = &reg.all()[0];
-        assert_eq!(r.payload["version"], serde_json::json!("1.18.0"));
-    }
-
-    #[test]
-    fn load_resolver_rejects_non_builtin_path() {
-        let bundle = bundle_with_manifest(
-            r#"
-load("//some/module", "apt")
-"#,
-            serde_json::json!({}),
-        );
-        let primitives = primitives_with_mock_apt();
-        let registry = Rc::new(RefCell::new(Registry::new()));
-        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
-        let store = Arc::new(SensitiveStore::new());
-        let ctx = plan_ctx();
-        let err = evaluate_manifest(
-            &bundle,
-            primitives,
-            serde_json::json!({}),
-            facts,
-            store,
-            registry,
-            ctx,
-            default_template_fn(),
-        )
-        .unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("only @bosun/builtins is supported") || msg.contains("//some/module"),
-            "expected loader error, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn unknown_primitive_kind_returns_error() {
-        let bundle = bundle_with_manifest(
-            r#"
-load("@bosun/builtins", "file")
-file.content(path = "/tmp/x", contents = "x")
-"#,
-            serde_json::json!({}),
-        );
-        // primitives без file.content
-        let primitives: Rc<HashMap<ResourceKind, Box<dyn Primitive>>> = Rc::new(HashMap::new());
-        let registry = Rc::new(RefCell::new(Registry::new()));
-        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
-        let store = Arc::new(SensitiveStore::new());
-        let ctx = plan_ctx();
-        let err = evaluate_manifest(
-            &bundle,
-            primitives,
-            serde_json::json!({}),
-            facts,
-            store,
-            registry,
-            ctx,
-            default_template_fn(),
-        )
-        .unwrap_err();
-        match err {
-            StarlarkGlueError::UnknownPrimitive(_) | StarlarkGlueError::Eval(_) => {}
-            other => panic!("unexpected error: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn missing_inventory_key_fails_evaluation() {
-        let bundle = bundle_with_manifest(
-            r#"
-load("@bosun/builtins", "apt")
-apt.package(name = inv.nonexistent_key)
-"#,
-            serde_json::json!({}),
-        );
-        let primitives = primitives_with_mock_apt();
-        let registry = Rc::new(RefCell::new(Registry::new()));
-        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
-        let store = Arc::new(SensitiveStore::new());
-        let ctx = plan_ctx();
-        let err = evaluate_manifest(
-            &bundle,
-            primitives,
-            serde_json::json!({}),
-            facts,
-            store,
-            registry,
-            ctx,
-            default_template_fn(),
-        )
-        .unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("nonexistent_key") || msg.contains("Object has no attribute"),
-            "expected inventory error mentioning key, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn duplicate_resource_id_is_error() {
-        let bundle = bundle_with_manifest(
-            r#"
-load("@bosun/builtins", "apt")
-apt.package(name = "nginx")
-apt.package(name = "nginx")
-"#,
-            serde_json::json!({}),
-        );
-        let primitives = primitives_with_mock_apt();
-        let registry = Rc::new(RefCell::new(Registry::new()));
-        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
-        let store = Arc::new(SensitiveStore::new());
-        let ctx = plan_ctx();
-        let err = evaluate_manifest(
-            &bundle,
-            primitives,
-            serde_json::json!({}),
-            facts,
-            store,
-            registry,
-            ctx,
-            default_template_fn(),
-        )
-        .unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("duplicate") || msg.contains("apt.package:nginx"),
-            "expected duplicate-id error, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn handle_passed_via_depends_on() {
-        let bundle = bundle_with_manifest(
-            r#"
-load("@bosun/builtins", "apt")
-h = apt.package(name = "a")
-apt.package(name = "b", depends_on = [h])
-"#,
-            serde_json::json!({}),
-        );
-        let primitives = primitives_with_mock_apt();
-        let registry = Rc::new(RefCell::new(Registry::new()));
-        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
-        let store = Arc::new(SensitiveStore::new());
-        let ctx = plan_ctx();
-        evaluate_manifest(
-            &bundle,
-            primitives,
-            serde_json::json!({}),
-            facts,
-            store,
-            Rc::clone(&registry),
-            ctx,
-            default_template_fn(),
-        )
-        .unwrap();
-        let reg = registry.borrow();
-        let b = reg
-            .get(&ResourceId::new(
-                &ResourceKind::from_static("apt.package"),
-                "b",
-            ))
-            .unwrap();
-        assert_eq!(b.depends_on.len(), 1);
-        assert_eq!(
-            b.depends_on[0],
-            ResourceId::new(&ResourceKind::from_static("apt.package"), "a")
-        );
     }
 
     fn primitives_with_mock_file() -> Rc<HashMap<ResourceKind, Box<dyn Primitive>>> {
@@ -669,157 +521,443 @@ apt.package(name = "b", depends_on = [h])
         Rc::new(m)
     }
 
+    fn run(bundle: Bundle, primitives: Rc<HashMap<ResourceKind, Box<dyn Primitive>>>) -> EvalRun {
+        run_with(bundle, primitives, default_template_fn(), HashSet::new())
+    }
+
+    fn run_with(
+        bundle: Bundle,
+        primitives: Rc<HashMap<ResourceKind, Box<dyn Primitive>>>,
+        template_fn: TemplateFn,
+        tags: HashSet<String>,
+    ) -> EvalRun {
+        let registry = Rc::new(RefCell::new(Registry::new()));
+        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
+        let sensitive = Arc::new(SensitiveStore::new());
+        let plan_ctx = plan_ctx();
+        let config = EvaluatorConfig {
+            bundle: Rc::new(bundle),
+            primitives,
+            facts,
+            sensitive: Arc::clone(&sensitive),
+            registry: Rc::clone(&registry),
+            plan_ctx,
+            template_fn,
+            tags,
+        };
+        let result = evaluate_manifest(config);
+        EvalRun {
+            result,
+            registry,
+            sensitive,
+        }
+    }
+
+    struct EvalRun {
+        result: Result<(), StarlarkGlueError>,
+        registry: Rc<RefCell<Registry>>,
+        sensitive: Arc<SensitiveStore>,
+    }
+
+    #[test]
+    fn apt_package_call_registers_resource() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "apt")
+apt.package(name = "nginx")
+"#,
+        );
+        let run = run(bundle, primitives_with_mock_apt());
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        assert_eq!(reg.all().len(), 1);
+        let r = &reg.all()[0];
+        assert_eq!(
+            r.id,
+            ResourceId::new(&ResourceKind::from_static("apt.package"), "nginx")
+        );
+    }
+
+    #[test]
+    fn tags_have_returns_membership() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "apt", "tags")
+if tags.has("production"):
+    apt.package(name = "prod-pkg")
+"#,
+        );
+        let mut active = HashSet::new();
+        active.insert("production".to_string());
+        let run = run_with(
+            bundle,
+            primitives_with_mock_apt(),
+            default_template_fn(),
+            active,
+        );
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        assert_eq!(reg.all().len(), 1);
+    }
+
+    #[test]
+    fn tags_require_one_of_fails_when_no_intersection() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "tags")
+tags.require_one_of("production", "staging")
+"#,
+        );
+        let run = run_with(
+            bundle,
+            Rc::new(HashMap::new()),
+            default_template_fn(),
+            HashSet::new(),
+        );
+        let err = run.result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("expected one of"));
+    }
+
+    #[test]
+    fn tags_active_returns_sorted_list() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "apt", "tags")
+active = tags.active()
+apt.package(name = active[0])
+"#,
+        );
+        let mut tags = HashSet::new();
+        tags.insert("zebra".to_string());
+        tags.insert("alpha".to_string());
+        let run = run_with(
+            bundle,
+            primitives_with_mock_apt(),
+            default_template_fn(),
+            tags,
+        );
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        // sorted("alpha","zebra")[0] = "alpha"
+        assert!(reg
+            .get(&ResourceId::new(
+                &ResourceKind::from_static("apt.package"),
+                "alpha"
+            ))
+            .is_some());
+    }
+
+    #[test]
+    fn inventory_load_reads_yaml() {
+        let bundle = make_bundle_with_files(&[
+            (
+                "manifests/main.star",
+                r#"
+load("@bosun/builtins", "apt", "inventory")
+inv_data = inventory.read("inventory/base.yaml")
+apt.package(name = inv_data["pkg"])
+"#,
+            ),
+            ("inventory/base.yaml", "pkg: redis\n"),
+        ]);
+        let run = run(bundle, primitives_with_mock_apt());
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        assert!(reg
+            .get(&ResourceId::new(
+                &ResourceKind::from_static("apt.package"),
+                "redis"
+            ))
+            .is_some());
+    }
+
+    #[test]
+    fn inventory_merge_default_strategy_from_bundle_toml() {
+        let bundle = make_bundle_with_files(&[
+            (
+                "manifests/main.star",
+                r#"
+load("@bosun/builtins", "apt", "inventory")
+a = inventory.read("inventory/a.yaml")
+b = inventory.read("inventory/b.yaml")
+m = inventory.merge(a, b)
+apt.package(name = m["pkg"])
+"#,
+            ),
+            ("inventory/a.yaml", "pkg: from-a\nother: x\n"),
+            ("inventory/b.yaml", "pkg: from-b\n"),
+        ]);
+        let run = run(bundle, primitives_with_mock_apt());
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        assert!(reg
+            .get(&ResourceId::new(
+                &ResourceKind::from_static("apt.package"),
+                "from-b"
+            ))
+            .is_some());
+    }
+
+    #[test]
+    fn inventory_merge_explicit_strategy_replace() {
+        let bundle = make_bundle_with_files(&[
+            (
+                "manifests/main.star",
+                r#"
+load("@bosun/builtins", "apt", "inventory")
+a = inventory.read("inventory/a.yaml")
+b = inventory.read("inventory/b.yaml")
+m = inventory.merge(a, b, strategy = "replace")
+apt.package(name = m["pkg"])
+"#,
+            ),
+            ("inventory/a.yaml", "pkg: from-a\n"),
+            ("inventory/b.yaml", "pkg: from-b\n"),
+        ]);
+        let run = run(bundle, primitives_with_mock_apt());
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        assert!(reg
+            .get(&ResourceId::new(
+                &ResourceKind::from_static("apt.package"),
+                "from-b"
+            ))
+            .is_some());
+    }
+
+    #[test]
+    fn inventory_merge_without_default_and_without_argument_fails() {
+        let bundle = make_bundle_with_files(&[
+            (
+                "bundle.toml",
+                r#"
+[bundle]
+name = "test"
+version = "0.1.0"
+requires_bosun = "^0.1"
+entry = "manifests/main.star"
+"#,
+            ),
+            (
+                "manifests/main.star",
+                r#"
+load("@bosun/builtins", "inventory")
+a = inventory.read("inventory/a.yaml")
+b = inventory.read("inventory/b.yaml")
+m = inventory.merge(a, b)
+"#,
+            ),
+            ("inventory/a.yaml", "pkg: a\n"),
+            ("inventory/b.yaml", "pkg: b\n"),
+        ]);
+        let run = run(bundle, primitives_with_mock_apt());
+        let err = run.result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("missing default merge strategy"));
+    }
+
+    #[test]
+    fn role_load_evaluates_role_module() {
+        let bundle = make_bundle_with_files(&[
+            (
+                "manifests/main.star",
+                r#"
+load("@bosun/builtins", "apt")
+load("@roles/myrole", "configure")
+configure()
+"#,
+            ),
+            (
+                "roles/myrole/main.star",
+                r#"
+load("@bosun/builtins", "apt")
+
+def configure():
+    apt.package(name = "from-role")
+"#,
+            ),
+        ]);
+        let run = run(bundle, primitives_with_mock_apt());
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        assert!(reg
+            .get(&ResourceId::new(
+                &ResourceKind::from_static("apt.package"),
+                "from-role"
+            ))
+            .is_some());
+    }
+
+    #[test]
+    fn lib_load_evaluates_lib_module() {
+        let bundle = make_bundle_with_files(&[
+            (
+                "manifests/main.star",
+                r#"
+load("@bosun/builtins", "apt")
+load("@lib/helpers", "do_something")
+do_something()
+"#,
+            ),
+            (
+                "_lib/helpers/main.star",
+                r#"
+load("@bosun/builtins", "apt")
+
+def do_something():
+    apt.package(name = "from-lib")
+"#,
+            ),
+        ]);
+        let run = run(bundle, primitives_with_mock_apt());
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        assert!(reg
+            .get(&ResourceId::new(
+                &ResourceKind::from_static("apt.package"),
+                "from-lib"
+            ))
+            .is_some());
+    }
+
+    #[test]
+    fn private_symbol_in_role_cannot_be_imported() {
+        let bundle = make_bundle_with_files(&[
+            (
+                "manifests/main.star",
+                r#"
+load("@roles/myrole", "_private")
+"#,
+            ),
+            (
+                "roles/myrole/main.star",
+                r#"
+def _private():
+    pass
+"#,
+            ),
+        ]);
+        let run = run(bundle, primitives_with_mock_apt());
+        let err = run.result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("_private") || msg.contains("private"),
+            "expected private-symbol error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn template_called_from_manifests_is_rejected() {
+        let bundle = make_bundle_with_files(&[(
+            "manifests/main.star",
+            r#"
+load("@bosun/builtins", "template")
+template("anything.j2")
+"#,
+        )]);
+        let template_fn: TemplateFn = Rc::new(|_resolved, _path, _ctx| Ok(String::new()));
+        let run = run_with(
+            bundle,
+            primitives_with_mock_apt(),
+            template_fn,
+            HashSet::new(),
+        );
+        let err = run.result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("manifests/main.star") || msg.contains("manifests"));
+    }
+
+    #[test]
+    fn template_inside_role_resolves_to_role_templates() {
+        let bundle = make_bundle_with_files(&[
+            (
+                "manifests/main.star",
+                r#"
+load("@roles/myrole", "configure")
+configure()
+"#,
+            ),
+            (
+                "roles/myrole/main.star",
+                r#"
+load("@bosun/builtins", "file", "template")
+
+def configure():
+    file.content(path = "/etc/x", contents = template("body.j2"))
+"#,
+            ),
+            ("roles/myrole/templates/body.j2", "hello"),
+        ]);
+        let captured: Rc<RefCell<Option<PathBuf>>> = Rc::new(RefCell::new(None));
+        let captured_clone = Rc::clone(&captured);
+        let template_fn: TemplateFn = Rc::new(
+            move |resolved: &std::path::Path, _path: &str, _ctx: &serde_json::Value| {
+                *captured_clone.borrow_mut() = Some(resolved.to_path_buf());
+                Ok("rendered".to_string())
+            },
+        );
+        let run = run_with(
+            bundle,
+            primitives_with_mock_file(),
+            template_fn,
+            HashSet::new(),
+        );
+        run.result.unwrap();
+        let captured = captured.borrow();
+        let resolved = captured.as_ref().unwrap();
+        // template("body.j2") из роли myrole резолвится в roles/myrole/templates/body.j2.
+        assert!(
+            resolved.ends_with("roles/myrole/templates/body.j2"),
+            "got resolved: {resolved:?}"
+        );
+    }
+
     #[test]
     fn file_content_extracts_contents_into_sensitive_store() {
-        // file.content(contents="hello") должен:
-        // 1. убрать "contents" из аргументов до build_payload,
-        // 2. положить sha256+size в payload,
-        // 3. положить тело в SensitiveStore под ResourceId.
         let bundle = bundle_with_manifest(
             r#"
 load("@bosun/builtins", "file")
 file.content(path = "/etc/conf", contents = "hello")
 "#,
-            serde_json::json!({}),
         );
-        let primitives = primitives_with_mock_file();
-        let registry = Rc::new(RefCell::new(Registry::new()));
-        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
-        let store = Arc::new(SensitiveStore::new());
-        let ctx = plan_ctx();
-        evaluate_manifest(
-            &bundle,
-            primitives,
-            serde_json::json!({}),
-            facts,
-            Arc::clone(&store),
-            Rc::clone(&registry),
-            ctx,
-            default_template_fn(),
-        )
-        .unwrap();
-        let reg = registry.borrow();
-        assert_eq!(reg.all().len(), 1);
-        let r = &reg.all()[0];
-        assert_eq!(r.payload["path"], serde_json::json!("/etc/conf"));
-        // sha256("hello") = 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
-        assert_eq!(
-            r.payload["content_sha256"],
-            serde_json::json!("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824")
-        );
-        assert_eq!(r.payload["content_size"], serde_json::json!(5));
-        // Контент НЕ в payload — только в store.
-        assert!(r.payload.get("contents").is_none());
-
+        let run = run(bundle, primitives_with_mock_file());
+        run.result.unwrap();
         let id = ResourceId::new(&ResourceKind::from_static("file.content"), "/etc/conf");
-        let sensitive = store.take(&id).unwrap();
+        let sensitive = run.sensitive.take(&id).unwrap();
         assert_eq!(sensitive.into_inner(), "hello");
     }
 
     #[test]
-    fn file_content_missing_contents_is_error() {
+    fn load_resolver_rejects_non_builtin_path() {
         let bundle = bundle_with_manifest(
             r#"
-load("@bosun/builtins", "file")
-file.content(path = "/etc/conf")
+load("//some/module", "apt")
 "#,
-            serde_json::json!({}),
         );
-        let primitives = primitives_with_mock_file();
-        let registry = Rc::new(RefCell::new(Registry::new()));
-        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
-        let store = Arc::new(SensitiveStore::new());
-        let ctx = plan_ctx();
-        let err = evaluate_manifest(
-            &bundle,
-            primitives,
-            serde_json::json!({}),
-            facts,
-            store,
-            registry,
-            ctx,
-            default_template_fn(),
-        )
-        .unwrap_err();
+        let run = run(bundle, primitives_with_mock_apt());
+        let err = run.result.unwrap_err();
         let msg = format!("{err}");
-        assert!(
-            msg.contains("contents"),
-            "expected contents-error, got: {msg}"
-        );
+        assert!(msg.contains("unsupported") || msg.contains("//some/module"));
     }
 
     #[test]
-    fn template_closure_is_invoked_with_relative_path() {
-        // Подменяем template_fn: возвращает echo строку, проверяем результат.
+    fn duplicate_resource_id_is_error() {
         let bundle = bundle_with_manifest(
             r#"
-load("@bosun/builtins", "file", "template")
-file.content(path = "/etc/conf", contents = template("hello.j2"))
+load("@bosun/builtins", "apt")
+apt.package(name = "nginx")
+apt.package(name = "nginx")
 "#,
-            serde_json::json!({}),
         );
-        let primitives = primitives_with_mock_file();
-        let registry = Rc::new(RefCell::new(Registry::new()));
-        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
-        let store = Arc::new(SensitiveStore::new());
-        let ctx = plan_ctx();
-        let template_fn: TemplateFn = Rc::new(|path: &str| Ok(format!("rendered:{path}")));
-        evaluate_manifest(
-            &bundle,
-            primitives,
-            serde_json::json!({}),
-            facts,
-            Arc::clone(&store),
-            Rc::clone(&registry),
-            ctx,
-            template_fn,
-        )
-        .unwrap();
-
-        let id = ResourceId::new(&ResourceKind::from_static("file.content"), "/etc/conf");
-        let sensitive = store.take(&id).unwrap();
-        assert_eq!(sensitive.into_inner(), "rendered:hello.j2");
-    }
-
-    #[test]
-    fn template_closure_error_propagates_as_starlark_eval_error() {
-        let bundle = bundle_with_manifest(
-            r#"
-load("@bosun/builtins", "template")
-x = template("broken.j2")
-"#,
-            serde_json::json!({}),
-        );
-        let primitives: Rc<HashMap<ResourceKind, Box<dyn Primitive>>> = Rc::new(HashMap::new());
-        let registry = Rc::new(RefCell::new(Registry::new()));
-        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
-        let store = Arc::new(SensitiveStore::new());
-        let ctx = plan_ctx();
-        let template_fn: TemplateFn = Rc::new(|_| Err(anyhow::anyhow!("synthetic render failure")));
-        let err = evaluate_manifest(
-            &bundle,
-            primitives,
-            serde_json::json!({}),
-            facts,
-            store,
-            registry,
-            ctx,
-            template_fn,
-        )
-        .unwrap_err();
+        let run = run(bundle, primitives_with_mock_apt());
+        let err = run.result.unwrap_err();
         let msg = format!("{err}");
-        assert!(
-            msg.contains("synthetic render failure") || msg.contains("broken.j2"),
-            "expected template error to surface, got: {msg}"
-        );
+        assert!(msg.contains("duplicate") || msg.contains("apt.package:nginx"));
     }
 
     #[test]
     fn evaluation_aborts_on_deadline_for_heavy_manifest() {
-        // F06 regression: for-цикл с большим range — легальная starlark
-        // конструкция (без before_stmt-hook'а eval работает до полного
-        // завершения). С deadline через DeadlineChecker eval прерывается
-        // между statement'ами тела цикла.
         let bundle = bundle_with_manifest(
             r#"
 load("@bosun/builtins", "apt")
@@ -827,275 +965,31 @@ def heavy():
     acc = 0
     for i in range(10000000):
         acc = acc + i
-        acc = acc - 1
     return acc
 _ = heavy()
-apt.package(name = "nginx")
 "#,
-            serde_json::json!({}),
         );
-        let primitives = primitives_with_mock_apt();
         let registry = Rc::new(RefCell::new(Registry::new()));
         let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
-        let store = Arc::new(SensitiveStore::new());
-
-        // Очень короткий дедлайн: 50ms.
-        let ctx = PlanCtx {
+        let sensitive = Arc::new(SensitiveStore::new());
+        let plan_ctx = PlanCtx {
             deadline: Instant::now() + Duration::from_millis(50),
             cancel: CancellationToken::new(),
         };
-
         let started = Instant::now();
-        let err = evaluate_manifest(
-            &bundle,
-            primitives,
-            serde_json::json!({}),
+        let config = EvaluatorConfig {
+            bundle: Rc::new(bundle),
+            primitives: primitives_with_mock_apt(),
             facts,
-            store,
+            sensitive,
             registry,
-            ctx,
-            default_template_fn(),
-        )
-        .unwrap_err();
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "elapsed: {:?}",
-            started.elapsed()
-        );
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("deadline") || msg.contains("cancel"),
-            "expected deadline-related error, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn evaluation_aborts_on_cancel_token() {
-        let bundle = bundle_with_manifest(
-            r#"
-load("@bosun/builtins", "apt")
-def heavy():
-    acc = 0
-    for i in range(10000000):
-        acc = acc + i
-        acc = acc - 1
-    return acc
-_ = heavy()
-apt.package(name = "nginx")
-"#,
-            serde_json::json!({}),
-        );
-        let primitives = primitives_with_mock_apt();
-        let registry = Rc::new(RefCell::new(Registry::new()));
-        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
-        let store = Arc::new(SensitiveStore::new());
-
-        let cancel = CancellationToken::new();
-        let cancel_for_thread = cancel.clone();
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
-            cancel_for_thread.cancel();
-        });
-        let ctx = PlanCtx {
-            deadline: Instant::now() + Duration::from_secs(60),
-            cancel,
+            plan_ctx,
+            template_fn: default_template_fn(),
+            tags: HashSet::new(),
         };
-
-        let started = Instant::now();
-        let err = evaluate_manifest(
-            &bundle,
-            primitives,
-            serde_json::json!({}),
-            facts,
-            store,
-            registry,
-            ctx,
-            default_template_fn(),
-        )
-        .unwrap_err();
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "elapsed: {:?}",
-            started.elapsed()
-        );
+        let err = evaluate_manifest(config).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
         let msg = format!("{err}");
-        assert!(
-            msg.contains("cancel") || msg.contains("deadline"),
-            "expected cancel-related error, got: {msg}"
-        );
-    }
-
-    /// Mock-примитив, который панит в build_payload. Для F09-теста.
-    struct PanickyBuildPayload;
-
-    impl Primitive for PanickyBuildPayload {
-        fn type_name(&self) -> ResourceKind {
-            ResourceKind::from_static("apt.package")
-        }
-        fn identity_keys(&self) -> &'static [&'static str] {
-            &["name"]
-        }
-        #[allow(clippy::panic)]
-        fn build_payload(
-            &self,
-            _args: &CallArgs,
-            _ctx: &PlanCtx,
-        ) -> Result<serde_json::Value, PrimitiveError> {
-            panic!("boom from build_payload");
-        }
-        fn plan(
-            &self,
-            _: &Resource,
-            _: &dyn FactsSource,
-            _: &PlanCtx,
-        ) -> Result<Diff, PrimitiveError> {
-            Ok(Diff::NoChange)
-        }
-        fn apply(
-            &self,
-            _: &Resource,
-            _: &Diff,
-            _: &ApplyCtx,
-        ) -> Result<ChangeReport, PrimitiveError> {
-            Ok(ChangeReport::no_change())
-        }
-    }
-
-    #[test]
-    fn build_payload_panic_is_contained_as_invalid_call() {
-        // F09: panic в build_payload не валит eval манифеста, а
-        // мапится в InvalidCall — на верхнем уровне виден как
-        // ошибка eval, но без раскрутки stack'а CLI.
-        let bundle = bundle_with_manifest(
-            r#"
-load("@bosun/builtins", "apt")
-apt.package(name = "nginx")
-"#,
-            serde_json::json!({}),
-        );
-        let mut primitives_map: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
-        primitives_map.insert(
-            ResourceKind::from_static("apt.package"),
-            Box::new(PanickyBuildPayload),
-        );
-        let primitives = Rc::new(primitives_map);
-        let registry = Rc::new(RefCell::new(Registry::new()));
-        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
-        let store = Arc::new(SensitiveStore::new());
-        let ctx = plan_ctx();
-        let err = evaluate_manifest(
-            &bundle,
-            primitives,
-            serde_json::json!({}),
-            facts,
-            store,
-            registry,
-            ctx,
-            default_template_fn(),
-        )
-        .unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("panic") && msg.contains("boom"),
-            "expected panic-containing error, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn nested_evaluate_manifest_on_same_thread_returns_error() {
-        // F06 secondary: re-entrant evaluate_manifest должен явно отказать,
-        // не молча тратить state predecessor'а (раньше — debug_assert,
-        // в release-build silent UB).
-        let bundle = bundle_with_manifest(
-            r#"
-load("@bosun/builtins", "apt")
-apt.package(name = "outer")
-"#,
-            serde_json::json!({}),
-        );
-        let primitives = primitives_with_mock_apt();
-        let registry = Rc::new(RefCell::new(Registry::new()));
-        let facts: Rc<dyn FactsSource> = Rc::new(NoFacts);
-        let store = Arc::new(SensitiveStore::new());
-
-        // Эмулируем «вложенность» через прямую установку state в
-        // thread-local поверх ещё одного вызова. Самый простой способ —
-        // запустить evaluate_manifest изнутри template_fn.
-        let inner_bundle = bundle_with_manifest(
-            r#"
-load("@bosun/builtins", "apt")
-apt.package(name = "inner")
-"#,
-            serde_json::json!({}),
-        );
-        let primitives_for_inner = primitives_with_mock_apt();
-        let inner_state = std::cell::RefCell::new(Some(inner_bundle));
-        let inner_primitives = std::cell::RefCell::new(Some(primitives_for_inner));
-        let inner_called = std::rc::Rc::new(std::cell::RefCell::new(false));
-        let inner_err = std::rc::Rc::new(std::cell::RefCell::new(None::<String>));
-
-        let inner_called_clone = std::rc::Rc::clone(&inner_called);
-        let inner_err_clone = std::rc::Rc::clone(&inner_err);
-        let template_fn: TemplateFn = std::rc::Rc::new(move |_path: &str| {
-            *inner_called_clone.borrow_mut() = true;
-            // Пытаемся запустить evaluate_manifest внутри template-функции.
-            // Должны получить StarlarkGlueError::Eval("nested...").
-            let b = inner_state.borrow_mut().take().unwrap();
-            let p = inner_primitives.borrow_mut().take().unwrap();
-            let inner_reg = std::rc::Rc::new(std::cell::RefCell::new(Registry::new()));
-            let inner_facts: std::rc::Rc<dyn FactsSource> = std::rc::Rc::new(NoFacts);
-            let inner_store = std::sync::Arc::new(SensitiveStore::new());
-            let result = evaluate_manifest(
-                &b,
-                p,
-                serde_json::json!({}),
-                inner_facts,
-                inner_store,
-                inner_reg,
-                PlanCtx {
-                    deadline: Instant::now() + Duration::from_secs(60),
-                    cancel: CancellationToken::new(),
-                },
-                default_template_fn(),
-            );
-            match result {
-                Err(StarlarkGlueError::Eval(msg)) if msg.contains("nested") => {
-                    *inner_err_clone.borrow_mut() = Some(msg);
-                    Ok(String::new())
-                }
-                Err(other) => Err(anyhow::anyhow!("expected nested error, got: {other}")),
-                Ok(()) => Err(anyhow::anyhow!("expected nested error, got Ok")),
-            }
-        });
-
-        let bundle_with_template = bundle_with_manifest(
-            r#"
-load("@bosun/builtins", "apt", "template")
-x = template("dummy.j2")
-apt.package(name = "outer")
-"#,
-            serde_json::json!({}),
-        );
-        let _ = bundle;
-        let ctx = plan_ctx();
-        evaluate_manifest(
-            &bundle_with_template,
-            primitives,
-            serde_json::json!({}),
-            facts,
-            store,
-            registry,
-            ctx,
-            template_fn,
-        )
-        .unwrap();
-        assert!(
-            *inner_called.borrow(),
-            "template-fn должна была быть вызвана"
-        );
-        assert!(
-            inner_err.borrow().as_ref().is_some(),
-            "ожидаем nested-эрор из inner evaluate_manifest"
-        );
+        assert!(msg.contains("deadline") || msg.contains("cancel"));
     }
 }

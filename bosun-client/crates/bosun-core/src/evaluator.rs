@@ -10,7 +10,7 @@
 //! Starlark-evaluation.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -19,48 +19,33 @@ use crate::primitive::{FactsSource, PlanCtx, Primitive};
 use crate::registry::Registry;
 use crate::resource::ResourceKind;
 use crate::sensitive::SensitiveStore;
-use crate::starlark_glue::{evaluate_manifest, StarlarkGlueError, TemplateFn};
+use crate::starlark_glue::{evaluate_manifest, EvaluatorConfig, StarlarkGlueError, TemplateFn};
 
-/// Evaluator один раз создаётся с набором примитивов, inventory и bundle.
-/// Затем по запросу `evaluate(...)` запускает Starlark-eval и возвращает
-/// заполненный Registry.
 pub struct Evaluator {
     bundle: Bundle,
     primitives: Rc<HashMap<ResourceKind, Box<dyn Primitive>>>,
-    inventory: serde_json::Value,
 }
 
 impl Evaluator {
-    pub fn new(
-        bundle: Bundle,
-        primitives: HashMap<ResourceKind, Box<dyn Primitive>>,
-        inventory: serde_json::Value,
-    ) -> Self {
+    pub fn new(bundle: Bundle, primitives: HashMap<ResourceKind, Box<dyn Primitive>>) -> Self {
         Self {
             bundle,
             primitives: Rc::new(primitives),
-            inventory,
         }
     }
 
-    /// Bundle, c которым работает evaluator. Полезно вызывающему коду
-    /// (CLI) — например, для построения `templates_root` template-фабрики.
     pub fn bundle(&self) -> &Bundle {
         &self.bundle
     }
 
-    /// Запустить Starlark-eval entry-манифеста. Возвращает свежий Registry.
-    ///
-    /// `facts` принимаются по значению (`FactsSnapshot` / любой owned-источник),
-    /// чтобы внутри можно было обернуть в `Rc<dyn FactsSource>`. Если
-    /// вызывающему нужен исходный snapshot после evaluate, он клонирует
-    /// его сам — `FactsSnapshot: Clone`.
+    /// Запустить Starlark-eval entry-манифеста с указанным набором тэгов.
     pub fn evaluate<F>(
         &self,
         facts: F,
         sensitive: Arc<SensitiveStore>,
         template_fn: TemplateFn,
         plan_ctx: PlanCtx,
+        tags: HashSet<String>,
     ) -> Result<Registry, StarlarkGlueError>
     where
         F: FactsSource + 'static,
@@ -68,34 +53,24 @@ impl Evaluator {
         let registry = Rc::new(RefCell::new(Registry::new()));
         let facts_rc: Rc<dyn FactsSource> = Rc::new(facts);
 
-        evaluate_manifest(
-            &self.bundle,
-            Rc::clone(&self.primitives),
-            self.inventory.clone(),
-            facts_rc,
+        let config = EvaluatorConfig {
+            bundle: Rc::new(self.bundle.clone()),
+            primitives: Rc::clone(&self.primitives),
+            facts: facts_rc,
             sensitive,
-            Rc::clone(&registry),
+            registry: Rc::clone(&registry),
             plan_ctx,
             template_fn,
-        )?;
+            tags,
+        };
+        evaluate_manifest(config)?;
 
-        // Извлекаем Registry из Rc<RefCell<...>>. Rc создан и владелся только
-        // внутри этой функции и в EvalState, который дропается после
-        // evaluate_manifest. Поэтому strong_count == 1, и `Rc::try_unwrap`
-        // обязан вернуть Ok. Если кто-то когда-нибудь добавит долгоживущий
-        // Rc-клон — fallback: клонируем содержимое.
         match Rc::try_unwrap(registry) {
             Ok(cell) => Ok(cell.into_inner()),
             Err(rc) => {
-                // Strong-count > 1 — неожиданно. Защитный fallback: материализуем
-                // содержимое в новый Registry через перенос ресурсов.
                 let cell = rc.borrow();
                 let mut out = Registry::new();
                 for r in cell.all() {
-                    // add() возвращает ошибку только при дубликатах id, а
-                    // источник — Registry, где дубликаты уже отвергнуты.
-                    // Здесь намеренно теряем дубликаты, если они появятся —
-                    // это ветвь «не должно случаться» по контракту Registry.
                     let _ = out.add(r.clone());
                 }
                 Ok(out)
@@ -193,7 +168,6 @@ entry = "manifests/main.star"
         )
         .unwrap();
         std::fs::write(root.join("manifests/main.star"), manifest_source).unwrap();
-        std::fs::create_dir_all(root.join("templates")).unwrap();
         Bundle::load_dir(&root).unwrap()
     }
 
@@ -209,10 +183,16 @@ apt.package(name = "curl")
         let mut primitives: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
         primitives.insert(ResourceKind::from_static("apt.package"), Box::new(MockApt));
 
-        let evaluator = Evaluator::new(bundle, primitives, serde_json::json!({}));
+        let evaluator = Evaluator::new(bundle, primitives);
         let store = Arc::new(SensitiveStore::new());
         let registry = evaluator
-            .evaluate(NoFacts, store, default_template_fn(), plan_ctx())
+            .evaluate(
+                NoFacts,
+                store,
+                default_template_fn(),
+                plan_ctx(),
+                HashSet::new(),
+            )
             .unwrap();
 
         assert_eq!(registry.all().len(), 2);
@@ -224,33 +204,20 @@ apt.package(name = "curl")
     fn evaluate_propagates_syntax_error() {
         let bundle = make_bundle("this is = = = not starlark");
         let primitives: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
-        let evaluator = Evaluator::new(bundle, primitives, serde_json::json!({}));
+        let evaluator = Evaluator::new(bundle, primitives);
         let store = Arc::new(SensitiveStore::new());
         let err = evaluator
-            .evaluate(NoFacts, store, default_template_fn(), plan_ctx())
+            .evaluate(
+                NoFacts,
+                store,
+                default_template_fn(),
+                plan_ctx(),
+                HashSet::new(),
+            )
             .unwrap_err();
         assert!(matches!(
             err,
             StarlarkGlueError::Syntax { .. } | StarlarkGlueError::Eval(_)
         ));
-    }
-
-    #[test]
-    fn evaluate_uses_inventory() {
-        let bundle = make_bundle(
-            r#"
-load("@bosun/builtins", "apt")
-apt.package(name = inv.pkg)
-"#,
-        );
-        let mut primitives: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
-        primitives.insert(ResourceKind::from_static("apt.package"), Box::new(MockApt));
-        let evaluator = Evaluator::new(bundle, primitives, serde_json::json!({"pkg": "redis"}));
-        let store = Arc::new(SensitiveStore::new());
-        let registry = evaluator
-            .evaluate(NoFacts, store, default_template_fn(), plan_ctx())
-            .unwrap();
-        let id = ResourceId::new(&ResourceKind::from_static("apt.package"), "redis");
-        assert!(registry.get(&id).is_some());
     }
 }

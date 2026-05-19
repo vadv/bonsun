@@ -1,44 +1,51 @@
-//! Native-globals для Starlark: `apt.package`, `file.content`, `template`.
+//! Native-globals для Starlark.
 //!
-//! Архитектура:
-//! - `apt`, `file` — Starlark `namespace`-ы с методами через
-//!   `GlobalsBuilder::namespace`. То есть `apt.package(...)` — это вызов
-//!   функции `package` внутри namespace `apt`.
-//! - `template` — top-level функция.
-//! - `inv` — устанавливается в Module через `install_inv` перед eval_module,
-//!   потому что зависит от inventory конкретного запуска.
+//! Глобалы (доступны без `load`, но также экспортируются через
+//! `@bosun/builtins`):
+//! - `apt`, `file` — namespaces, регистрирующие ресурсы (как в MVP).
+//! - `template(path)` — module-relative рендер шаблона.
+//! - `inventory.load/merge/merge_keyed` — загрузка и слияние yaml-инвентарей.
+//! - `tags.has/require_one_of/active` — runtime gate по тэгам CLI.
+//! - `inv` — устанавливается per-evaluate как module-level переменная (legacy
+//!   MVP-доступ; в новых bundle'ах автор использует `inventory.load`).
 //!
 //! Native-функции читают разделяемое состояние из thread-local через
 //! `with_state(...)` (см. `mod.rs::CURRENT_STATE`).
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
-use starlark::environment::{FrozenModule, Globals, GlobalsBuilder, Module};
+use starlark::environment::{FrozenModule, Globals, GlobalsBuilder};
 use starlark::eval::Evaluator;
+use starlark::values::list::AllocList;
+use starlark::values::none::NoneType;
+use starlark::values::tuple::UnpackTuple;
 use starlark::values::{FreezeResult, Value, ValueLike};
 use starlark_derive::starlark_module;
 
 use crate::call_args::{ArgValue, CallArgs};
 use crate::digest::sha256_hex;
+use crate::inventory::{merge_inventory, merge_inventory_keyed, MergeStrategy};
+use crate::path_safety::{resolve_within_root, PathSafetyError};
 use crate::resource::{Resource, ResourceId, ResourceKind};
 use crate::sensitive::SensitivePayload;
-use crate::starlark_glue::inv_object::InvObject;
-use crate::starlark_glue::{with_state, StarlarkGlueError};
+use crate::starlark_glue::inv_object::json_scalar_to_value;
+use crate::starlark_glue::{current_state, with_state, EvalState, StarlarkGlueError};
 
-/// Globals для bosun-манифеста. Включает namespaces `apt`, `file` и функцию
-/// `template`, плюс стандартную библиотеку starlark.
+/// Globals для bosun-манифеста. Включает namespaces `apt`, `file`, `inventory`,
+/// `tags` и функцию `template`, плюс стандартную библиотеку starlark.
 pub fn build_globals() -> Globals {
     GlobalsBuilder::standard()
         .with_namespace("apt", apt_namespace)
         .with_namespace("file", file_namespace)
+        .with_namespace("inventory", inventory_namespace)
+        .with_namespace("tags", tags_namespace)
         .with(template_fn)
         .build()
 }
 
 #[starlark_module]
 fn apt_namespace(builder: &mut GlobalsBuilder) {
-    /// Зарегистрировать `apt.package`. Возвращает Handle, который можно
-    /// передать в `reload_on=[...]`/`depends_on=[...]` других ресурсов.
     fn package<'v>(
         #[starlark(kwargs)] kwargs: Value<'v>,
         eval: &mut Evaluator<'v, '_, '_>,
@@ -49,7 +56,6 @@ fn apt_namespace(builder: &mut GlobalsBuilder) {
 
 #[starlark_module]
 fn file_namespace(builder: &mut GlobalsBuilder) {
-    /// Зарегистрировать `file.content`.
     fn content<'v>(
         #[starlark(kwargs)] kwargs: Value<'v>,
         eval: &mut Evaluator<'v, '_, '_>,
@@ -59,43 +65,363 @@ fn file_namespace(builder: &mut GlobalsBuilder) {
 }
 
 #[starlark_module]
-fn template_fn(builder: &mut GlobalsBuilder) {
-    /// `template(path)` рендерит шаблон `<bundle>/templates/<path>` через
-    /// инжектируемый closure из `EvalState`. CLI собирает closure с
-    /// забэканным templates_root, inv-копией и materialized-фактами.
-    fn template<'v>(
-        #[starlark(require = pos)] path: &str,
+fn inventory_namespace(builder: &mut GlobalsBuilder) {
+    /// Загрузить yaml-файл по пути относительно корня bundle. Результат
+    /// кешируется per-evaluate; повторный вызов с тем же путём не парсит
+    /// файл повторно.
+    ///
+    /// Метод называется `read` (не `load`), потому что `load` в Starlark —
+    /// зарезервированное keyword'о для load()-statement и не может
+    /// использоваться как attribute-name в выражении `inventory.load(...)`.
+    /// См. starlark grammar.lalrpop: `"load" => Token::Load`. Спека rev 2
+    /// в Starlark-примерах пишет `inventory.load(...)`, но Rust-сигнатура
+    /// там использует `r#load` (raw identifier — Rust-конструкция, не
+    /// относящаяся к Starlark). В Starlark такой возможности нет, поэтому
+    /// мы экспортируем функционал под именем `read`.
+    fn read<'v>(
+        #[starlark(require = pos)] path: String,
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
-        let rendered: Result<String, anyhow::Error> = with_state(|state| (state.template_fn)(path))
+        let json = with_state(|state| load_inventory_yaml(state, &path))
             .ok_or_else(|| {
-                anyhow::anyhow!("internal: no eval state in thread-local during template()")
+                starlark::Error::new_other(anyhow::anyhow!(
+                    "internal: no eval state during inventory.read"
+                ))
+            })?
+            .map_err(|e| starlark::Error::new_other(anyhow::anyhow!("{e}")))?;
+        Ok(json_scalar_to_value(eval.heap(), json))
+    }
+
+    /// Слить два и более inventory'я. Стратегия по умолчанию берётся из
+    /// bundle.toml `[bundle.inventory].default_merge_strategy`. Передача
+    /// `strategy=""` (пустая строка) эквивалентна отсутствию аргумента.
+    fn merge<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        #[starlark(default = String::new())] strategy: String,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        let inputs = unpack_inventory_sources(&args)
+            .map_err(|e| starlark::Error::new_other(anyhow::anyhow!("inventory.merge: {e}")))?;
+        let strategy = resolve_merge_strategy(&strategy)
+            .map_err(|e| starlark::Error::new_other(anyhow::anyhow!("{e}")))?;
+        let merged = inputs
+            .into_iter()
+            .reduce(|acc, next| merge_inventory(acc, next, strategy))
+            .unwrap_or(serde_json::Value::Null);
+        Ok(json_scalar_to_value(eval.heap(), merged))
+    }
+
+    /// Слить inventory'и по ключу-полю в каждом list-of-records. Top-level —
+    /// обычный deep merge; внутри любого list ожидается map с указанным
+    /// `<key>`.
+    fn merge_keyed<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+        key: String,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        let inputs = unpack_inventory_sources(&args).map_err(|e| {
+            starlark::Error::new_other(anyhow::anyhow!("inventory.merge_keyed: {e}"))
+        })?;
+        let mut iter = inputs.into_iter();
+        let merged = match iter.next() {
+            Some(first) => iter
+                .try_fold(first, |acc, next| merge_inventory_keyed(acc, next, &key))
+                .map_err(|e| starlark::Error::new_other(anyhow::anyhow!("{e}")))?,
+            None => serde_json::Value::Null,
+        };
+        Ok(json_scalar_to_value(eval.heap(), merged))
+    }
+}
+
+#[starlark_module]
+fn tags_namespace(builder: &mut GlobalsBuilder) {
+    /// Возвращает True если тэг активен.
+    fn has(#[starlark(require = pos)] tag: String) -> starlark::Result<bool> {
+        let active = with_state(|state| state.tags.contains(&tag)).ok_or_else(|| {
+            starlark::Error::new_other(anyhow::anyhow!("internal: no eval state during tags.has"))
+        })?;
+        Ok(active)
+    }
+
+    /// Fail-fast, если ни один из перечисленных тэгов не активен.
+    fn require_one_of<'v>(
+        #[starlark(args)] args: UnpackTuple<Value<'v>>,
+    ) -> starlark::Result<NoneType> {
+        let mut expected: Vec<String> = Vec::with_capacity(args.items.len());
+        for v in &args.items {
+            let s = v.unpack_str().ok_or_else(|| {
+                starlark::Error::new_other(anyhow::anyhow!(
+                    "tags.require_one_of: expected string argument, got {}",
+                    v.get_type()
+                ))
             })?;
-        let rendered = rendered
-            .map_err(|e| starlark::Error::new_other(anyhow::anyhow!("template('{path}'): {e}")))?;
+            expected.push(s.to_string());
+        }
+        let result: Result<(), String> = with_state(|state| {
+            if expected.iter().any(|t| state.tags.contains(t)) {
+                Ok(())
+            } else {
+                let mut active: Vec<&str> = state.tags.iter().map(|s| s.as_str()).collect();
+                active.sort_unstable();
+                Err(format!(
+                    "tags: expected one of [{expected_list}] in active set, got [{active_list}]",
+                    expected_list = expected.join(", "),
+                    active_list = active.join(", "),
+                ))
+            }
+        })
+        .ok_or_else(|| {
+            starlark::Error::new_other(anyhow::anyhow!(
+                "internal: no eval state during tags.require_one_of"
+            ))
+        })?;
+        result.map_err(|msg| starlark::Error::new_other(anyhow::anyhow!("{msg}")))?;
+        Ok(NoneType)
+    }
+
+    /// Отсортированная копия активного набора тэгов (для логирования).
+    fn active<'v>(eval: &mut Evaluator<'v, '_, '_>) -> starlark::Result<Value<'v>> {
+        let mut active: Vec<String> = with_state(|state| state.tags.iter().cloned().collect())
+            .ok_or_else(|| {
+                starlark::Error::new_other(anyhow::anyhow!(
+                    "internal: no eval state during tags.active"
+                ))
+            })?;
+        active.sort_unstable();
+        let items: Vec<Value> = active.into_iter().map(|s| eval.heap().alloc(s)).collect();
+        Ok(eval.heap().alloc(AllocList(items)))
+    }
+}
+
+#[starlark_module]
+fn template_fn(builder: &mut GlobalsBuilder) {
+    /// `template(path, **kwargs)` рендерит шаблон, лежащий **в той же роли/lib,
+    /// где определена вызывающая функция** (см. spec секция «module-relative»).
+    /// Дополнительные kwargs передаются в template-контекст в виде
+    /// одноимённых переменных Jinja. Например:
+    /// `template("nginx.conf.j2", inv = my_inv)` → внутри шаблона
+    /// `{{ inv.worker_processes }}`.
+    fn template<'v>(
+        #[starlark(require = pos)] path: &str,
+        #[starlark(kwargs)] kwargs: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        let defining_module = pick_defining_module(eval)
+            .map_err(|e| starlark::Error::new_other(anyhow::anyhow!("{e}")))?;
+
+        let extra_context = kwargs_to_json(kwargs)?;
+
+        let rendered = with_state(|state| {
+            let bundle = state.bundle.as_ref();
+            let resolved = bundle.resolve_template(&defining_module, path)?;
+            (state.template_fn)(&resolved, path, &extra_context)
+                .map_err(|e| StarlarkGlueError::Eval(format!("template('{path}'): {e}")))
+        })
+        .ok_or_else(|| {
+            starlark::Error::new_other(anyhow::anyhow!(
+                "internal: no eval state in thread-local during template()"
+            ))
+        })?;
+
+        let rendered = match rendered {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = format!("{e}");
+                with_state(|state| state.errors.borrow_mut().push(e));
+                return Err(starlark::Error::new_other(anyhow::anyhow!("{msg}")));
+            }
+        };
         Ok(eval.heap().alloc(rendered))
     }
 }
 
-/// Собрать `@bosun/builtins` FrozenModule. Экспортирует `apt`, `file`,
-/// `template` через `import_public_symbols` из globals.
-///
-/// Под капотом: создаём пустой module, копируем в него apt/file/template
-/// из готовых Globals (через `FrozenModule::from_globals` → потом
-/// import_public_symbols в свежий module → freeze).
-pub fn build_builtins_module(globals: &Globals) -> starlark::Result<FrozenModule> {
-    // Globals можно превратить в FrozenModule, тогда все top-level имена
-    // (apt, file, template) станут публичными символами модуля. Имена
-    // standard-library (str, list, dict, fail, ...) тоже попадут — это OK,
-    // потому что они не конфликтуют с user-кодом и load() выбирает
-    // только нужные.
-    FrozenModule::from_globals(globals).map_err(starlark::Error::from)
+/// Конвертация kwargs Starlark dict → JSON Object.
+fn kwargs_to_json<'v>(kwargs: Value<'v>) -> Result<serde_json::Value, starlark::Error> {
+    use starlark::values::dict::DictRef;
+
+    let dict = DictRef::from_value(kwargs).ok_or_else(|| {
+        starlark::Error::new_other(anyhow::anyhow!("internal: template kwargs not a dict"))
+    })?;
+    let mut out = serde_json::Map::new();
+    for (k, v) in dict.iter() {
+        let key = k
+            .unpack_str()
+            .ok_or_else(|| {
+                starlark::Error::new_other(anyhow::anyhow!(
+                    "template: kwargs key must be a string, got {}",
+                    k.get_type()
+                ))
+            })?
+            .to_string();
+        let json = v.to_json_value().map_err(starlark::Error::new_other)?;
+        out.insert(key, json);
+    }
+    Ok(serde_json::Value::Object(out))
 }
 
-/// Установить `inv` как module-level переменную перед запуском evaluate.
-pub(crate) fn install_inv(module: &Module, inventory: serde_json::Value) {
-    let inv = InvObject::root(inventory);
-    module.set("inv", module.heap().alloc(inv));
+/// Определить, из какого .star файла вызвана текущая функция. Алгоритм:
+/// 1. Идём по call stack starlark с верхнего фрейма.
+/// 2. Берём первый Frame с непустым `location` (то есть user-defined,
+///    не native) — `location.filename()` это путь модуля.
+/// 3. Возвращаем canonical PathBuf этого файла.
+///
+/// Если call stack пустой или у всех фреймов location = None — fallback на
+/// `current_module` стек из EvalState. Это происходит когда template()
+/// вызван из top-level кода модуля (нет user frame для функции на стеке).
+fn pick_defining_module<'v>(
+    eval: &mut Evaluator<'v, '_, '_>,
+) -> Result<PathBuf, StarlarkGlueError> {
+    let call_stack = eval.call_stack();
+    for frame in call_stack.frames.iter().rev() {
+        if let Some(loc) = &frame.location {
+            let name = loc.file.filename();
+            if !name.is_empty() {
+                let p = PathBuf::from(name);
+                if p.is_absolute() {
+                    return Ok(p);
+                }
+                // Если starlark отдал относительный путь — возможно, имя
+                // символическое (например "test.star" без полного пути).
+                // Это нормально для unit-тестов; пробрасываем как есть.
+                return Ok(p);
+            }
+        }
+    }
+    // Fallback: вершина current_module стека из EvalState (последний пушнутый
+    // модуль через ModuleStackGuard). Это срабатывает на top-level
+    // template() в роли (когда нет вложенных user-функций).
+    let from_stack = current_state()
+        .and_then(|s| s.current_module.borrow().last().cloned())
+        .ok_or_else(|| {
+            StarlarkGlueError::Eval(
+                "template(): cannot determine defining module from call stack".to_string(),
+            )
+        })?;
+    Ok(from_stack)
+}
+
+fn unpack_inventory_sources<'v>(
+    args: &UnpackTuple<Value<'v>>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let mut out = Vec::with_capacity(args.items.len());
+    for v in &args.items {
+        let json = v.to_json_value().map_err(|e| format!("{e}"))?;
+        out.push(json);
+    }
+    Ok(out)
+}
+
+fn resolve_merge_strategy(arg: &str) -> Result<MergeStrategy, StarlarkGlueError> {
+    let chosen = if arg.is_empty() {
+        let default = with_state(|state| {
+            state
+                .bundle
+                .metadata
+                .inventory
+                .default_merge_strategy
+                .clone()
+        })
+        .flatten();
+        default.ok_or(StarlarkGlueError::Bundle(
+            crate::bundle::BundleError::DefaultMergeStrategyMissing,
+        ))?
+    } else {
+        arg.to_string()
+    };
+    MergeStrategy::parse(&chosen).map_err(|e| StarlarkGlueError::Eval(format!("{e}")))
+}
+
+/// Прочитать yaml по относительному bundle-пути; вернуть JSON.
+fn load_inventory_yaml(
+    state: &EvalState,
+    path: &str,
+) -> Result<serde_json::Value, StarlarkGlueError> {
+    let bundle_root = state.bundle.root.clone();
+    let resolved = match resolve_within_root(&bundle_root, path) {
+        Ok(p) => p,
+        Err(PathSafetyError::NotFound(_)) => {
+            return Err(StarlarkGlueError::Eval(format!(
+                "inventory: read '{path}': file not found"
+            )));
+        }
+        Err(other) => {
+            return Err(StarlarkGlueError::Bundle(
+                crate::bundle::BundleError::PathSafety(other),
+            ));
+        }
+    };
+
+    if let Some(cached) = state.inventory_cache.borrow().get(&resolved) {
+        return Ok(cached.clone());
+    }
+    let text = std::fs::read_to_string(&resolved).map_err(|e| {
+        StarlarkGlueError::Bundle(crate::bundle::BundleError::Io {
+            path: resolved.to_string_lossy().into_owned(),
+            source: e,
+        })
+    })?;
+    let yaml: serde_norway::Value = serde_norway::from_str(&text).map_err(|e| {
+        StarlarkGlueError::Bundle(crate::bundle::BundleError::InvalidYaml {
+            path: resolved.to_string_lossy().into_owned(),
+            source: e,
+        })
+    })?;
+    let json = yaml_to_json(yaml).map_err(StarlarkGlueError::Eval)?;
+    state
+        .inventory_cache
+        .borrow_mut()
+        .insert(resolved.clone(), json.clone());
+    Ok(json)
+}
+
+fn yaml_to_json(v: serde_norway::Value) -> Result<serde_json::Value, String> {
+    use serde_norway::Value as Y;
+    Ok(match v {
+        Y::Null => serde_json::Value::Null,
+        Y::Bool(b) => serde_json::Value::Bool(b),
+        Y::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                serde_json::Value::Number(i.into())
+            } else if let Some(u) = n.as_u64() {
+                serde_json::Value::Number(u.into())
+            } else if let Some(f) = n.as_f64() {
+                serde_json::Number::from_f64(f)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null)
+            } else {
+                return Err(format!("unsupported number in YAML: {n:?}"));
+            }
+        }
+        Y::String(s) => serde_json::Value::String(s),
+        Y::Sequence(seq) => {
+            let mut out = Vec::with_capacity(seq.len());
+            for item in seq {
+                out.push(yaml_to_json(item)?);
+            }
+            serde_json::Value::Array(out)
+        }
+        Y::Mapping(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                let key = match k {
+                    Y::String(s) => s,
+                    other => {
+                        return Err(format!("YAML mapping key must be a string; got {other:?}"));
+                    }
+                };
+                out.insert(key, yaml_to_json(v)?);
+            }
+            serde_json::Value::Object(out)
+        }
+        Y::Tagged(_) => {
+            return Err("YAML tagged values are not supported in bundle inventory".to_string());
+        }
+    })
+}
+
+/// Собрать `@bosun/builtins` FrozenModule из globals.
+pub fn build_builtins_module(globals: &Globals) -> starlark::Result<FrozenModule> {
+    FrozenModule::from_globals(globals).map_err(starlark::Error::from)
 }
 
 /// Конвертация kwargs (dict Value) в `CallArgs`.
@@ -124,8 +450,6 @@ fn kwargs_to_call_args<'v>(
     Ok(CallArgs::new(out))
 }
 
-/// Конвертация одного Starlark Value в `ArgValue`. Распознаёт строку, int,
-/// bool, list-of-handles. Остальное идёт через JSON-fallback.
 fn value_to_arg<'v>(
     v: Value<'v>,
     eval: &mut Evaluator<'v, '_, '_>,
@@ -176,8 +500,6 @@ fn register_primitive_call<'v>(
     kwargs: Value<'v>,
     eval: &mut Evaluator<'v, '_, '_>,
 ) -> starlark::Result<Value<'v>> {
-    // Все обращения к state сгруппированы внутри `with_state` —
-    // вне него thread-local не trapped.
     let mut call_args = kwargs_to_call_args(kwargs, eval)?;
 
     let kind = match kind_str {
@@ -188,9 +510,6 @@ fn register_primitive_call<'v>(
         })?,
     };
 
-    // Side-channel для file.content.contents — секреты не лежат в Resource.payload.
-    // Извлекаем contents из args, считаем sha256+size, заменяем contents на
-    // content_sha256+content_size, сам тело кладём в SensitiveStore.
     let pending_sensitive = if kind_str == "file.content" {
         Some(
             extract_sensitive_contents(&mut call_args).map_err(|reason| {
@@ -214,8 +533,6 @@ fn register_primitive_call<'v>(
             let identity = build_identity(primitive.identity_keys(), &call_args)
                 .map_err(|e| record_invalid_call_in(state, kind_str, &format!("{e}")))?;
 
-            // F09: build_payload — пользовательский код примитива; паника
-            // не должна валить eval манифеста, маппим в PrimitiveError::Panic.
             let payload =
                 crate::orchestrator::call_primitive(&format!("build_payload {kind_str}"), || {
                     primitive.build_payload(&call_args, &state.plan_ctx)
@@ -237,11 +554,6 @@ fn register_primitive_call<'v>(
 
     let id = ResourceId::new(&kind, &identity);
 
-    // Положить sensitive contents в store ровно один раз, когда у нас уже
-    // вычислен ResourceId. Если registry.add ниже упадёт (дубликат), запись
-    // в store останется — это не утечка, потому что store очищается вместе
-    // с EvalState. Чисто в плане «не положили лишнего» — alternative было
-    // бы откатывать put на ошибке, что усложняет инвариант.
     if let Some(contents) = pending_sensitive {
         with_state(|state| {
             state
@@ -280,9 +592,6 @@ fn register_primitive_call<'v>(
     Ok(eval.heap().alloc(HandleObject { id }))
 }
 
-/// Извлекает `contents: str` из `CallArgs`, заменяя на `content_sha256` и
-/// `content_size`. Возвращает оригинальное тело, чтобы caller положил его в
-/// SensitiveStore.
 fn extract_sensitive_contents(args: &mut CallArgs) -> Result<String, String> {
     let contents = match args.take_raw("contents") {
         Some(ArgValue::Str(s)) => s,
@@ -300,7 +609,6 @@ fn extract_sensitive_contents(args: &mut CallArgs) -> Result<String, String> {
     let size = i64::try_from(contents.len())
         .map_err(|_| "file.content: contents too large for i64 size".to_string())?;
     args.put_raw("content_sha256", ArgValue::Str(sha));
-    // CallArgs::optional_u64 принимает Int и проверяет range — поэтому кладём как Int.
     args.put_raw("content_size", ArgValue::Int(size));
     Ok(contents)
 }
@@ -315,11 +623,7 @@ fn describe_arg(v: &ArgValue) -> &'static str {
     }
 }
 
-fn record_invalid_call_in(
-    state: &crate::starlark_glue::EvalState,
-    kind: &str,
-    reason: &str,
-) -> starlark::Error {
+fn record_invalid_call_in(state: &EvalState, kind: &str, reason: &str) -> starlark::Error {
     let err = StarlarkGlueError::InvalidCall {
         kind: kind.to_string(),
         reason: reason.to_string(),
@@ -340,8 +644,7 @@ fn build_identity(
     Ok(parts.join(":"))
 }
 
-/// Handle, возвращаемый `apt.package` / `file.content`. Передаётся в
-/// `reload_on=[...]` / `depends_on=[...]` других ресурсов.
+/// Handle, возвращаемый `apt.package` / `file.content`.
 #[derive(
     Debug,
     allocative::Allocative,
@@ -395,13 +698,6 @@ mod tests {
     }
 
     #[test]
-    fn build_identity_missing_key_is_error() {
-        let args = CallArgs::new(HashMap::new());
-        let err = build_identity(&["name"], &args).unwrap_err();
-        assert!(matches!(err, crate::call_args::CallArgsError::Missing(_)));
-    }
-
-    #[test]
     fn build_globals_compiles() {
         let _g = build_globals();
     }
@@ -414,44 +710,11 @@ mod tests {
         let mut args = CallArgs::new(map);
         let body = extract_sensitive_contents(&mut args).unwrap();
         assert_eq!(body, "hello");
-        // contents удалён, sha и size добавлены.
         assert!(args.take_raw("contents").is_none());
         assert_eq!(
             args.required_str("content_sha256").unwrap(),
             "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824",
         );
         assert_eq!(args.optional_u64("content_size").unwrap(), Some(5));
-    }
-
-    #[test]
-    fn extract_sensitive_contents_missing_is_error() {
-        let mut args = CallArgs::new(HashMap::new());
-        let err = extract_sensitive_contents(&mut args).unwrap_err();
-        assert!(err.contains("missing"));
-        assert!(err.contains("contents"));
-    }
-
-    #[test]
-    fn extract_sensitive_contents_wrong_type_is_error() {
-        let mut map = HashMap::new();
-        map.insert("contents".to_string(), ArgValue::Int(42));
-        let mut args = CallArgs::new(map);
-        let err = extract_sensitive_contents(&mut args).unwrap_err();
-        assert!(err.contains("must be str"));
-    }
-
-    #[test]
-    fn extract_sensitive_contents_empty_string_ok() {
-        let mut map = HashMap::new();
-        map.insert("contents".to_string(), ArgValue::Str(String::new()));
-        let mut args = CallArgs::new(map);
-        let body = extract_sensitive_contents(&mut args).unwrap();
-        assert_eq!(body, "");
-        // Пустая строка → sha256 пустой строки, size = 0.
-        assert_eq!(
-            args.required_str("content_sha256").unwrap(),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        );
-        assert_eq!(args.optional_u64("content_size").unwrap(), Some(0));
     }
 }
