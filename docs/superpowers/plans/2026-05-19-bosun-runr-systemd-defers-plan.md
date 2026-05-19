@@ -481,66 +481,81 @@ defers модуля (Phase C).
 
 ---
 
-## Phase G: bosun-primitives `command.run`
+## Phase G: bosun-primitives `process.signal`
 
-**Цель:** Аналог chiit's `command.New().Execute()` плюс
-`defers.AddCommand` — синхронный run с `only_if/not_if` и опциональный
-`deferred=True`.
+**Цель (переоформлено 2026-05-19):** Универсальный `command.run` в Starlark
+давал бы автору бандла полный escape-hatch к shell — это ломает sandbox-
+гарантии. Вместо одного command.run заводим **узкий** примитив
+`process.signal` под конкретный chiit-кейс: `defers.AddCommand(ctx,
+"hup-pg-doorman", "pkill -HUP pg_doorman")` и
+`defers.AddCommand(ctx, "blind-reload-postgresql-via-sighup", "pkill
+--signal SIGHUP -u postgres")`. Семантика «послать сигнал процессу по
+имени или uid» — типизирована, без shell, с deferred-вариантом.
+
+Прочие shell-сценарии из chiit накрываются другими узкими хелперами —
+`apt.package(state="absent"/"purged")`, `apt.update_cache`, `apt.key`,
+`cert.tls`, `validate_with`, `sysctl.apply` (см. gap-анализ от 2026-05-19,
+секция «Категория A»).
 
 **Acceptance criteria:**
 
-- [ ] Модуль `bosun-primitives/src/command_run/` с `mod.rs`, `spec.rs`,
+- [ ] Модуль `bosun-primitives/src/process_signal/` с `mod.rs`, `spec.rs`,
   `plan.rs`, `apply.rs`.
-- [ ] `CommandRunSpec`:
-  - `name: String` (required, unique для дедупа в defers)
-  - `cmd: Vec<String>` (argv, не shell)
-  - `deferred: bool` (default false)
-  - `only_if: Option<Vec<String>>` (argv)
-  - `not_if: Option<Vec<String>>` (argv)
-  - `timeout_sec: Option<u32>` (default 60)
-  - `working_directory: Option<String>`
-  - `environment: Option<BTreeMap<String, String>>`
+- [ ] `ProcessSignalSpec`:
+  - `name: String` (required, unique для дедупа в defers — играет ту же
+    роль, что `name` у `defers.AddCommand` в chiit).
+  - `signal: String` (required, одно из `"HUP"`/`"TERM"`/`"INT"`/`"USR1"`/
+    `"USR2"`/`"SIGHUP"`/... — allowlist валидных POSIX-сигналов, без
+    `KILL`/`STOP` чтобы автор не вырубал процессы вне Stop-primitive).
+  - Selector — ровно один из двух:
+    - `process_name: Option<String>` — pgrep-style по имени процесса
+      (`pgrep -f` под капотом запрещён, ищем только по `comm`).
+    - `process_user: Option<String>` — uid/uname owner процесса (как
+      `pkill -u postgres`).
+  - `deferred: bool` (default true — в chiit-практике 100% этих вызовов
+    идут через `defers.AddCommand`).
 - [ ] `plan`:
-  - Если `only_if` задан и `run_predicate(only_if) == false` → `NoChange`
-    (skipped).
-  - Если `not_if` задан и `run_predicate(not_if) == true` → `NoChange`.
-  - Иначе → `Update`.
-- [ ] `run_predicate(argv)`:
-  - spawn argv через `std::process::Command`.
-  - wait с таймаутом (default 10s).
-  - exit 0 → `true`; иначе → `false`.
-  - On exec error → `false` (предикат считается отрицательным; alternative
-    `Err` сделает primitive не-идемпотентным).
+  - Если ресурс новый → `Update`.
+  - Если ресурс уже стоял в журнале defers с тем же id → `NoChange`
+    (дедуп через `Journal::enqueue` всё равно гарантирует, но plan
+    показывает идемпотентность сразу).
 - [ ] `apply`:
-  - Re-eval предикаты (на случай если состояние изменилось между plan и
-    apply).
-  - Если `spec.deferred == false` → выполнить argv через
-    `std::process::Command`, capture stdout/stderr (max 4KiB excerpt),
-    проверить exit code. Success → `ChangeReport::changed(format!("ran
-    {name}"))`. Failure → `PrimitiveError::Apply { stderr_excerpt }`.
-  - Если `spec.deferred == true` → enqueue
-    `DeferEntry { action: Command { argv: spec.cmd }, id: "command.run:<name>", ... }`
-    через `ctx.defers.enqueue`. ChangeReport::deferred.
+  - Если `deferred=true` → enqueue `DeferEntry { action: Command { argv:
+    build_signal_argv(spec) }, id: "process.signal:<name>", ... }` через
+    `ctx.defers.enqueue`. `ChangeReport::deferred`.
+  - Если `deferred=false` → синхронно `build_signal_argv(spec)` →
+    `std::process::Command` → wait с таймаутом 5s. Exit 0 → `ChangeReport::
+    changed`. Прочее → `PrimitiveError::Apply { stderr_excerpt }`.
+- [ ] `build_signal_argv(spec) -> Vec<String>` — pure helper:
+  - При `process_name=N` → `["pkill", "--signal", spec.signal, N]`.
+  - При `process_user=U` → `["pkill", "--signal", spec.signal, "-u", U]`.
+  - Аллоулист сигналов проверяется до построения argv; невалидный сигнал
+    → `PrimitiveError::InvalidPayload`.
 - [ ] Unit-тесты:
-  - `only_if=[true]` → run; `only_if=[false]` → skip.
-  - `not_if=[true]` → skip; `not_if=[false]` → run.
-  - exec timeout → `PrimitiveError::Apply { reason: "timeout" }`.
-  - `deferred=true` → enqueue (через mock journal), реальный exec НЕ
-    вызван.
-  - stdout/stderr capturing: spawn `sh -c 'echo a >&2; exit 0'` → success
-    + stderr capture в логе.
+  - `build_signal_argv` matrix — все ветки, allowlist валидаций.
+  - `apply` deferred=true с mock journal → один defer-файл, реальный
+    `Command::spawn` НЕ вызван (через DI-трейт `ProcessSignalRunner`).
+  - `apply` deferred=false + mock runner возвращает Ok → `Changed`.
+  - `apply` deferred=false + mock runner возвращает Err → `Apply error`.
+  - `apply` ctx.defers недоступен (None?) — по факту defers всегда есть,
+    так что этот кейс смотри по реализации ApplyCtx.
+  - Невалидный сигнал (`signal="KILL"`) → InvalidPayload до spawn.
+  - Передан и `process_name`, и `process_user` (или ни тот, ни другой) →
+    `InvalidPayload` с понятным сообщением «exactly one of
+    process_name/process_user required».
 
 **Что НЕ в scope:**
-- Shell-через-стрку (`cmd: "sysctl -p"` без массива) — намеренно
-  заставляем массив для безопасности от инъекций.
-- Restart-on-change для command.run (notify-цели для command.run сейчас
-  только через `reload_on`/`restart_on` в Resource).
+- Произвольные команды (`command.run`-стиль) — намеренно не делаем.
+- `only_if/not_if` — узкая семантика signal не требует.
+- Сигналы по PID — мы не управляем PID'ами напрямую, это работа
+  service.unit / runr.service.
 
 **Hard constraints:**
-- `Command::new` принимает только argv-массив. Никаких `sh -c`.
-- Все exec'и через child + timeout-wait (`std::process::Child::try_wait`
-  + sleep loop, или `wait-timeout` крейт — но мы избегаем deps, поэтому
-  custom loop).
+- `Command::new("pkill")`. Никаких `sh -c`.
+- Allowlist сигналов hardcoded в коде (`HUP`, `TERM`, `INT`, `USR1`,
+  `USR2`, `WINCH`, `PIPE` — без `KILL`/`STOP`/`CONT`).
+- DI через trait `ProcessSignalRunner` для testability — реальный
+  `RealRunner` использует `std::process::Command`, mock — простой recorder.
 
 ---
 
