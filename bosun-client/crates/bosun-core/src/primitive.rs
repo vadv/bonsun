@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::defers::Journal;
 use crate::diff::{ChangeReport, Diff};
+use crate::health_check::{HealthCheckRunner, NoopHealthCheckRunner};
 use crate::resource::{Resource, ResourceId};
 use crate::sensitive::SensitiveStore;
 use crate::validate::{RealValidateRunner, ValidateRunner};
@@ -69,6 +70,14 @@ pub struct PlanCtx {
 ///
 /// `validator` — исполнитель `validate_with`-команд. Передаётся в Arc, чтобы
 /// тесты подменяли spawn без зависимости от системных бинарей.
+///
+/// `health_check_runner` — исполнитель post-action health-probe'ов (Phase I).
+/// Production CLI подключает `RealHealthCheckRunner` из `bosun-primitives`;
+/// тесты подменяют mock; default — `NoopHealthCheckRunner` (см. TODO ниже).
+///
+/// TODO: число полей перевалило за 13 — необходим builder-pattern, чтобы
+/// конструкторы не разрастались дальше. Не блокирует Phase I; запланирован
+/// отдельной задачей в Phase J/K.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct ApplyCtx {
@@ -111,6 +120,12 @@ pub struct ApplyCtx {
     /// результат. Используется и `file.content` (validate перед swap), и
     /// `runr/systemd.service` (validate перед enqueue defer'а).
     pub validator: Arc<dyn ValidateRunner>,
+    /// Исполнитель health-check'ов после restart/reload. В sync-пути
+    /// (`Start`/`Stop` от desired-state-diff) запускается прямо в apply'е;
+    /// в defer-replay вызывается после успешного dispatch'а defer'а. См.
+    /// `bosun-core::health_check` (контракт) и
+    /// `bosun-primitives::health_check::RealHealthCheckRunner` (production).
+    pub health_check_runner: Arc<dyn HealthCheckRunner>,
 }
 
 impl PlanCtx {
@@ -147,7 +162,7 @@ impl ApplyCtx {
         runr: Option<Arc<dyn RunrHandle>>,
         systemd: Option<Arc<dyn SystemdHandle>>,
     ) -> Self {
-        Self::with_validator(
+        Self::with_runners(
             deadline,
             cancel,
             log_span,
@@ -158,6 +173,7 @@ impl ApplyCtx {
             runr,
             systemd,
             Arc::new(RealValidateRunner),
+            Arc::new(NoopHealthCheckRunner),
         )
     }
 
@@ -178,6 +194,40 @@ impl ApplyCtx {
         systemd: Option<Arc<dyn SystemdHandle>>,
         validator: Arc<dyn ValidateRunner>,
     ) -> Self {
+        Self::with_runners(
+            deadline,
+            cancel,
+            log_span,
+            sensitive,
+            backup_root,
+            log_dir,
+            defers,
+            runr,
+            systemd,
+            validator,
+            Arc::new(NoopHealthCheckRunner),
+        )
+    }
+
+    /// Phase I: ApplyCtx с явными validator'ом и health-check runner'ом.
+    /// Production CLI собирает `RealHealthCheckRunner` (поверх ureq +
+    /// `std::process::Command`); тесты Phase I подменяют mock-runner,
+    /// чтобы проверять retry-логику и cancellation без зависимости от
+    /// сети и системных бинарей.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_runners(
+        deadline: Instant,
+        cancel: CancellationToken,
+        log_span: tracing::Span,
+        sensitive: Arc<SensitiveStore>,
+        backup_root: PathBuf,
+        log_dir: PathBuf,
+        defers: Arc<Journal>,
+        runr: Option<Arc<dyn RunrHandle>>,
+        systemd: Option<Arc<dyn SystemdHandle>>,
+        validator: Arc<dyn ValidateRunner>,
+        health_check_runner: Arc<dyn HealthCheckRunner>,
+    ) -> Self {
         Self {
             deadline,
             cancel,
@@ -193,6 +243,7 @@ impl ApplyCtx {
             systemd_daemon_reload_done: Arc::new(AtomicBool::new(false)),
             runr_service_statuses: Arc::new(OnceLock::new()),
             validator,
+            health_check_runner,
         }
     }
 

@@ -343,8 +343,11 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
  "tokio-util",
  "tracing",
+ "ureq",
+ "wiremock",
  "zbus",
 ]
 

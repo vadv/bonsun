@@ -41,6 +41,9 @@ rand = { workspace = true }
 # в external-command runner (F05-фикс). Это часть public API trait'а
 # CommandRunner, поэтому в [dependencies], не [dev-dependencies].
 tokio-util = { workspace = true }
+# ureq — Phase I health_check::url. Отдельный Agent (не из runr-client),
+# чтобы health-check работал на systemd-only нодах без runr.
+ureq = { workspace = true }
 
 [dev-dependencies]
 # Нужен в Phase E unit-тестах: конструируем `SystemdError::BusUnavailable`
@@ -48,3 +51,7 @@ tokio-util = { workspace = true }
 # относит этот класс к `is_deferrable=true`. В production-коде bosun-primitives
 # никак не зависит от zbus — все нужные типы re-exported через bosun-handles.
 zbus = { workspace = true }
+# wiremock — Phase I integration test для url-health-check'а. Поднимаем
+# мок-сервер с заранее заданными status code'ами и проверяем retry-логику.
+wiremock = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }

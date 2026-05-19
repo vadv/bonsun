@@ -27,7 +27,10 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bosun_core::defers::{make_id, DeferAction, DeferEntry, DeferPriority, CURRENT_SPEC_VERSION};
-use bosun_core::{ApplyCtx, ChangeReport, Diff, PrimitiveError, Resource, ValidateError};
+use bosun_core::{
+    ApplyCtx, ChangeReport, Diff, HealthCheck, HealthCheckError, PrimitiveError, Resource,
+    ValidateError,
+};
 use bosun_handles::{SystemdError, SystemdHandle, UnitInfo};
 
 use super::plan::{decide_action_systemd, Action};
@@ -123,7 +126,11 @@ pub fn run(
 
     match action {
         Action::NoChange => Ok(ChangeReport::no_change()),
-        Action::Start => execute_start(systemd.as_ref(), &spec, before.as_ref()),
+        Action::Start => {
+            let report = execute_start(systemd.as_ref(), &spec, before.as_ref())?;
+            run_health_check_if_configured(&spec, ctx)?;
+            Ok(report)
+        }
         Action::Stop => execute_stop(systemd.as_ref(), &spec),
         Action::Restart => {
             // Phase H: validate_with запускается ДО enqueue. Failure →
@@ -190,6 +197,61 @@ fn run_validate_if_configured(
             );
             Err(map_validate_error(err, &validator_name))
         }
+    }
+}
+
+/// Phase I: запустить health-check после успешного синхронного Start.
+/// Симметрично `runr_service::run_health_check_if_configured`. Restart/
+/// Reload идут через defer и проверяются в `replay_with_health_check`.
+fn run_health_check_if_configured(
+    spec: &SystemdServiceSpec,
+    ctx: &ApplyCtx,
+) -> Result<(), PrimitiveError> {
+    let Some(check) = spec.health_check.as_ref() else {
+        return Ok(());
+    };
+    let kind = health_check_kind(check);
+    tracing::info!(
+        unit = %spec.name,
+        kind = %kind,
+        "systemd.service: running health-check after sync start",
+    );
+    match ctx.health_check_runner.run(check, &ctx.cancel) {
+        Ok(()) => {
+            tracing::info!(
+                unit = %spec.name,
+                kind = %kind,
+                "systemd.service: health-check passed",
+            );
+            Ok(())
+        }
+        Err(HealthCheckError::Cancelled) => {
+            tracing::warn!(
+                unit = %spec.name,
+                "systemd.service: health-check cancelled (deadline/SIGTERM)",
+            );
+            Err(PrimitiveError::Cancelled)
+        }
+        Err(err) => {
+            tracing::warn!(
+                unit = %spec.name,
+                error = %err,
+                "systemd.service: health-check failed",
+            );
+            Err(PrimitiveError::HealthCheckFailed {
+                target: spec.name.as_str().to_string(),
+                reason: err.to_string(),
+            })
+        }
+    }
+}
+
+/// Описать вариант health-check'а строкой для логов (`cmd`/`url`).
+fn health_check_kind(check: &HealthCheck) -> &'static str {
+    match check {
+        HealthCheck::Cmd { .. } => "cmd",
+        HealthCheck::Url { .. } => "url",
+        _ => "unknown",
     }
 }
 
@@ -1309,5 +1371,249 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().ends_with(".deferred"))
             .collect();
         assert_eq!(entries.len(), 1);
+    }
+
+    // ===== Phase I: health_check =====
+
+    use bosun_core::{HealthCheck, HealthCheckError, HealthCheckRunner};
+
+    /// Mock health-check runner: записывает количество вызовов и
+    /// возвращает заданный результат.
+    struct MockHealthCheck {
+        calls: Mutex<u32>,
+        response: Mutex<Result<(), HealthCheckError>>,
+    }
+
+    impl MockHealthCheck {
+        fn ok() -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(0),
+                response: Mutex::new(Ok(())),
+            })
+        }
+        fn failing(err: HealthCheckError) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(0),
+                response: Mutex::new(Err(err)),
+            })
+        }
+        fn calls(&self) -> u32 {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    impl HealthCheckRunner for MockHealthCheck {
+        fn run(
+            &self,
+            _check: &HealthCheck,
+            _cancel: &tokio_util::sync::CancellationToken,
+        ) -> Result<(), HealthCheckError> {
+            *self.calls.lock().unwrap() += 1;
+            std::mem::replace(&mut *self.response.lock().unwrap(), Ok(()))
+        }
+    }
+
+    fn make_ctx_with_hc(
+        systemd: Option<Arc<dyn SystemdHandle>>,
+        health_check: Arc<dyn HealthCheckRunner>,
+    ) -> (TempDir, ApplyCtx) {
+        let tmp = TempDir::new().unwrap();
+        let defers = Arc::new(Journal::open(tmp.path()).unwrap());
+        let ctx = ApplyCtx::with_runners(
+            Instant::now() + Duration::from_secs(60),
+            CancellationToken::new(),
+            tracing::Span::none(),
+            Arc::new(SensitiveStore::new()),
+            PathBuf::from("/tmp/backup"),
+            PathBuf::from("/tmp/log"),
+            defers,
+            None,
+            systemd,
+            Arc::new(bosun_core::RealValidateRunner),
+            health_check,
+        );
+        (tmp, ctx)
+    }
+
+    fn make_resource_with_hc(
+        name: &str,
+        state: ServiceState,
+        enable: bool,
+        hc: HealthCheck,
+    ) -> Resource {
+        let kind = ResourceKind::from_static("systemd.service");
+        let id = ResourceId::new(&kind, name);
+        let state_str = match state {
+            ServiceState::Running => "running",
+            ServiceState::Stopped => "stopped",
+            ServiceState::Absent => "absent",
+        };
+        Resource {
+            id,
+            kind,
+            spec_version: 1,
+            payload: serde_json::json!({
+                "name": name,
+                "state": state_str,
+                "enable": enable,
+                "health_check": hc,
+            }),
+            reload_on: Vec::new(),
+            restart_on: Vec::new(),
+            depends_on: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn health_check_runs_after_sync_start_and_passes() {
+        let mock = Arc::new(MockSystemd::new());
+        // Pre: NoSuchUnit → trace as not-active, выбираем Start.
+        mock.enqueue_unit_info(Err(SystemdError::NoSuchUnit("nginx.service".into())));
+        // After: active, новый invocation_id.
+        mock.enqueue_unit_info(Ok(make_unit("nginx", "active", "fresh")));
+        let hc = MockHealthCheck::ok();
+        let r = make_resource_with_hc(
+            "nginx.service",
+            ServiceState::Running,
+            false,
+            HealthCheck::Url {
+                url: "http://localhost/h".to_string(),
+                expected_status: Some(200),
+                timeout_sec: Some(1),
+                retry_count: Some(1),
+                retry_interval_sec: Some(0),
+            },
+        );
+        let (_tmp, ctx) =
+            make_ctx_with_hc(Some(mock.clone()), hc.clone() as Arc<dyn HealthCheckRunner>);
+        let report = run(&r, &force_update(&r), &ctx).unwrap();
+        assert!(report.changed);
+        assert_eq!(hc.calls(), 1);
+    }
+
+    #[test]
+    fn health_check_failure_returns_health_check_failed_after_sync_start() {
+        let mock = Arc::new(MockSystemd::new());
+        mock.enqueue_unit_info(Err(SystemdError::NoSuchUnit("nginx.service".into())));
+        mock.enqueue_unit_info(Ok(make_unit("nginx", "active", "fresh")));
+        let hc = MockHealthCheck::failing(HealthCheckError::UrlBadStatus {
+            url: "http://localhost/h".to_string(),
+            actual: 500,
+            expected: 200,
+            attempts: 3,
+        });
+        let r = make_resource_with_hc(
+            "nginx.service",
+            ServiceState::Running,
+            false,
+            HealthCheck::Url {
+                url: "http://localhost/h".to_string(),
+                expected_status: Some(200),
+                timeout_sec: Some(1),
+                retry_count: Some(3),
+                retry_interval_sec: Some(0),
+            },
+        );
+        let (_tmp, ctx) =
+            make_ctx_with_hc(Some(mock.clone()), hc.clone() as Arc<dyn HealthCheckRunner>);
+        let err = run(&r, &force_update(&r), &ctx).unwrap_err();
+        match err {
+            PrimitiveError::HealthCheckFailed { target, .. } => {
+                assert_eq!(target, "nginx.service");
+            }
+            other => panic!("expected HealthCheckFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn health_check_cancelled_maps_to_primitive_cancelled() {
+        let mock = Arc::new(MockSystemd::new());
+        mock.enqueue_unit_info(Err(SystemdError::NoSuchUnit("nginx.service".into())));
+        mock.enqueue_unit_info(Ok(make_unit("nginx", "active", "fresh")));
+        let hc = MockHealthCheck::failing(HealthCheckError::Cancelled);
+        let r = make_resource_with_hc(
+            "nginx.service",
+            ServiceState::Running,
+            false,
+            HealthCheck::Cmd {
+                cmd: vec!["true".to_string()],
+                timeout_sec: None,
+                retry_count: None,
+                retry_interval_sec: None,
+            },
+        );
+        let (_tmp, ctx) =
+            make_ctx_with_hc(Some(mock.clone()), hc.clone() as Arc<dyn HealthCheckRunner>);
+        let err = run(&r, &force_update(&r), &ctx).unwrap_err();
+        assert!(matches!(err, PrimitiveError::Cancelled));
+    }
+
+    #[test]
+    fn health_check_not_called_when_no_spec() {
+        let mock = Arc::new(MockSystemd::new());
+        mock.enqueue_unit_info(Err(SystemdError::NoSuchUnit("nginx.service".into())));
+        mock.enqueue_unit_info(Ok(make_unit("nginx", "active", "fresh")));
+        let hc = MockHealthCheck::ok();
+        let r = make_resource("nginx.service", ServiceState::Running, false);
+        let (_tmp, ctx) =
+            make_ctx_with_hc(Some(mock.clone()), hc.clone() as Arc<dyn HealthCheckRunner>);
+        let report = run(&r, &force_update(&r), &ctx).unwrap();
+        assert!(report.changed);
+        assert_eq!(hc.calls(), 0);
+    }
+
+    #[test]
+    fn health_check_not_called_for_stop_action() {
+        let mock = Arc::new(MockSystemd::new());
+        mock.enqueue_unit_info(Ok(make_unit("nginx", "active", "abc")));
+        let hc = MockHealthCheck::ok();
+        let r = make_resource_with_hc(
+            "nginx.service",
+            ServiceState::Stopped,
+            false,
+            HealthCheck::Cmd {
+                cmd: vec!["true".to_string()],
+                timeout_sec: None,
+                retry_count: None,
+                retry_interval_sec: None,
+            },
+        );
+        let (_tmp, ctx) =
+            make_ctx_with_hc(Some(mock.clone()), hc.clone() as Arc<dyn HealthCheckRunner>);
+        let report = run(&r, &force_update(&r), &ctx).unwrap();
+        assert!(report.changed);
+        assert_eq!(hc.calls(), 0);
+    }
+
+    #[test]
+    fn health_check_not_called_for_deferred_restart() {
+        // Restart-triggered → defer enqueue, health-check НЕ запускается
+        // в apply'е (это делает replay-цикл с replay_with_health_check).
+        let mock = Arc::new(MockSystemd::new());
+        mock.enqueue_unit_info(Ok(make_unit("nginx", "active", "abc")));
+        let hc = MockHealthCheck::ok();
+        let r = {
+            let mut r = make_resource_with_hc(
+                "nginx.service",
+                ServiceState::Running,
+                false,
+                HealthCheck::Cmd {
+                    cmd: vec!["true".to_string()],
+                    timeout_sec: None,
+                    retry_count: None,
+                    retry_interval_sec: None,
+                },
+            );
+            let src_kind = ResourceKind::from_static("file.content");
+            r.restart_on
+                .push(ResourceId::new(&src_kind, "/etc/nginx.conf"));
+            r
+        };
+        let (_tmp, ctx) =
+            make_ctx_with_hc(Some(mock.clone()), hc.clone() as Arc<dyn HealthCheckRunner>);
+        ctx.record_changed(&r.restart_on[0]);
+        let report = run(&r, &force_update(&r), &ctx).unwrap();
+        assert!(report.deferred);
+        assert_eq!(hc.calls(), 0);
     }
 }

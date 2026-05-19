@@ -28,4 +28,4 @@ pub use action::{dispatch, DispatchClient, DispatchError};
 pub use format::{make_id, DeferAction, DeferEntry, HealthCheck, CURRENT_SPEC_VERSION};
 pub use journal::{DeferError, EnqueueResult, Journal};
 pub use priority::{sortkey, DeferPriority};
-pub use replay::{replay, ReplayReport};
+pub use replay::{replay, replay_with_health_check, ReplayReport};

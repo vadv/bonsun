@@ -21,6 +21,7 @@ use bosun_core::{
 use bosun_facts::FactsCollector;
 use bosun_primitives::{
     template::render_template, AptPrimitive, FilePrimitive, ProcessSignalPrimitive,
+    RealHealthCheckRunner,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -190,7 +191,13 @@ pub fn run(args: &ApplyArgs) -> i32 {
             return exit_code::CLI_ENV_ERROR;
         }
     };
-    let apply_ctx = ApplyCtx::new(
+    // Phase I: подключаем production health_check runner (cmd + url).
+    // Validate-runner оставляем дефолтным (RealValidateRunner внутри
+    // ApplyCtx::with_runners сам не выставится — передаём явно).
+    let validator: Arc<dyn bosun_core::ValidateRunner> = Arc::new(bosun_core::RealValidateRunner);
+    let health_check_runner: Arc<dyn bosun_core::HealthCheckRunner> =
+        Arc::new(RealHealthCheckRunner::new());
+    let apply_ctx = ApplyCtx::with_runners(
         deadline,
         cancel.clone(),
         tracing::Span::current(),
@@ -200,6 +207,8 @@ pub fn run(args: &ApplyArgs) -> i32 {
         defers,
         None,
         None,
+        validator,
+        health_check_runner,
     );
 
     let view = facts.view();

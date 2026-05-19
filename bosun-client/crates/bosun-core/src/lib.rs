@@ -7,6 +7,7 @@ pub mod diff;
 pub mod digest;
 pub mod evaluator;
 pub mod facts;
+pub mod health_check;
 pub mod inventory;
 pub mod orchestrator;
 pub mod path_safety;
@@ -26,10 +27,16 @@ pub mod tracing_test_util;
 
 pub use bundle::{Bundle, BundleError, BundleInventoryConfig, BundleMetadata};
 pub use call_args::{ArgValue, CallArgs, CallArgsError};
+pub use defers::HealthCheck;
 pub use diff::{ChangeReport, Diff};
 pub use digest::sha256_hex;
 pub use evaluator::Evaluator;
 pub use facts::{FactCategory, FactValue, RefreshPolicy};
+pub use health_check::{
+    cancellable_sleep, resolve_defaults as resolve_health_check_defaults, HealthCheckError,
+    HealthCheckRunner, NoopHealthCheckRunner, DEFAULT_RETRY_COUNT, DEFAULT_RETRY_INTERVAL_SEC,
+    DEFAULT_TIMEOUT_SEC, EXCERPT_LIMIT as HEALTH_CHECK_EXCERPT_LIMIT,
+};
 pub use inventory::{
     merge_inventory, merge_inventory_keyed, InventoryError, InventorySource, JsonInventory,
     MergeStrategy,

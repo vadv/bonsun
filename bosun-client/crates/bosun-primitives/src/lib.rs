@@ -6,6 +6,7 @@
 
 pub mod apt_package;
 pub mod file_content;
+pub mod health_check;
 pub mod process_signal;
 pub mod runr_cgroup;
 pub mod runr_service;
@@ -16,6 +17,7 @@ pub mod template;
 
 pub use apt_package::{AptPackageSpec, AptPrimitive};
 pub use file_content::{sha256_hex, FileContentSpec, FilePrimitive};
+pub use health_check::RealHealthCheckRunner;
 pub use process_signal::{
     build_signal_argv, ProcessSignalPrimitive, ProcessSignalRunner, ProcessSignalSpec,
     RealProcessSignalRunner,
