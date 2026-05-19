@@ -49,7 +49,7 @@ debversion = "0.4"
 libc = "0.2"
 starlark = "~0.13"
 minijinja = "2"
-toml = "0.8"
+toml = "1.1"
 fs4 = "0.13"
 chrono = { version = "0.4", features = ["clock"] }
 signal-hook = "0.3"
