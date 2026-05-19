@@ -24,11 +24,15 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bosun_core::defers::{make_id, DeferAction, DeferEntry, DeferPriority, CURRENT_SPEC_VERSION};
-use bosun_core::{ApplyCtx, ChangeReport, Diff, PrimitiveError, Resource};
+use bosun_core::{ApplyCtx, ChangeReport, Diff, PrimitiveError, Resource, ValidateError};
 use bosun_runr_client::{RunrError, ServiceStatus};
 
 use super::plan::{decide_action_runr, Action};
 use super::spec::RunrServiceSpec;
+
+/// Таймаут на validate-команду перед enqueue restart/reload defer'а.
+/// Совпадает с тем, что используется в file.content (Phase H).
+const VALIDATE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Поллинг-интервал для `verify_start` после синхронного Start.
 const VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -99,20 +103,92 @@ pub fn run(
         Action::NoChange => Ok(ChangeReport::no_change()),
         Action::Start => execute_start(runr.as_ref(), &spec, current),
         Action::Stop => execute_stop(runr.as_ref(), &spec),
-        Action::Restart => enqueue_defer(
-            ctx,
-            &spec,
-            DeferAction::Restart,
-            DeferPriority::Restart,
-            sources,
-        ),
-        Action::Reload => enqueue_defer(
-            ctx,
-            &spec,
-            DeferAction::Reload,
-            DeferPriority::Reload,
-            sources,
-        ),
+        Action::Restart => {
+            // Phase H: validate_with запускается ДО enqueue. На failure
+            // defer не появляется и оператор видит ошибку синхронно.
+            run_validate_if_configured(&spec, ctx)?;
+            enqueue_defer(
+                ctx,
+                &spec,
+                DeferAction::Restart,
+                DeferPriority::Restart,
+                sources,
+            )
+        }
+        Action::Reload => {
+            run_validate_if_configured(&spec, ctx)?;
+            enqueue_defer(
+                ctx,
+                &spec,
+                DeferAction::Reload,
+                DeferPriority::Reload,
+                sources,
+            )
+        }
+    }
+}
+
+/// Запустить `validate_with` (если задан) перед enqueue defer'а
+/// restart/reload. У service.unit нет файла `.new`, validator работает
+/// против текущего target config'а (тот, что уже на месте — file.content
+/// уже валидировал свой `.new` до swap'а).
+///
+/// Возвращает `Ok(())` если validate_with отсутствует, пустой массив
+/// игнорируется (защита от bundle-bug: пустой validate_with в
+/// `file.content` — это InvalidPayload, но на service.unit мы более
+/// либеральны, потому что эта секция — операторская подсказка). Любая
+/// ошибка validator'а → `PrimitiveError::Validation`, defer не
+/// enqueue'ится.
+fn run_validate_if_configured(
+    spec: &RunrServiceSpec,
+    ctx: &ApplyCtx,
+) -> Result<(), PrimitiveError> {
+    let Some(argv) = spec.validate_with.as_deref() else {
+        return Ok(());
+    };
+    if argv.is_empty() {
+        return Ok(());
+    }
+    let validator_name = argv[0].clone();
+    tracing::info!(
+        unit = %spec.name,
+        validator = %validator_name,
+        "runr.service: running validate_with before defer enqueue",
+    );
+    match ctx.validator.run(argv, VALIDATE_TIMEOUT) {
+        Ok(()) => {
+            tracing::info!(
+                unit = %spec.name,
+                validator = %validator_name,
+                "runr.service: validate_with passed",
+            );
+            Ok(())
+        }
+        Err(err) => {
+            tracing::warn!(
+                unit = %spec.name,
+                validator = %validator_name,
+                error = %err,
+                "runr.service: validate_with failed; defer not enqueued",
+            );
+            Err(map_validate_error(err, &validator_name))
+        }
+    }
+}
+
+/// Маппинг `ValidateError` → `PrimitiveError::Validation`. Совпадает с
+/// тем, что делает `file_content::apply`; повторяется здесь, чтобы не
+/// тащить общий хелпер через граничный крейт.
+fn map_validate_error(err: ValidateError, validator: &str) -> PrimitiveError {
+    let stderr_excerpt = match err {
+        ValidateError::ExitNonZero { stderr_excerpt, .. } => stderr_excerpt,
+        ValidateError::Timeout(d) => format!("timeout after {d:?}"),
+        ValidateError::Spawn(e) => format!("failed to spawn: {e}"),
+        other => format!("validator error: {other}"),
+    };
+    PrimitiveError::Validation {
+        validator: validator.to_string(),
+        stderr_excerpt,
     }
 }
 
@@ -943,5 +1019,287 @@ mod tests {
         let mapped = map_runr_error(err, "x", "op");
         assert!(matches!(mapped, PrimitiveError::Apply { .. }));
         assert!(!mapped.is_deferrable());
+    }
+
+    // ===== Phase H: validate_with =====
+
+    use bosun_core::{ValidateError, ValidateRunner};
+
+    /// Mock-validator для runr_service: записывает argv и возвращает
+    /// заданный ответ. Отдельный от file_content::tests::MockValidator,
+    /// чтобы тесты крейтов не зависели друг от друга.
+    struct MockValidator {
+        calls: Mutex<Vec<Vec<String>>>,
+        response: Mutex<MockValidatorResponse>,
+    }
+
+    #[derive(Clone)]
+    enum MockValidatorResponse {
+        Ok,
+        Fail { stderr: String },
+    }
+
+    impl MockValidator {
+        fn ok() -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                response: Mutex::new(MockValidatorResponse::Ok),
+            })
+        }
+        fn failing(stderr: &str) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                response: Mutex::new(MockValidatorResponse::Fail {
+                    stderr: stderr.to_string(),
+                }),
+            })
+        }
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl ValidateRunner for MockValidator {
+        fn run(&self, argv: &[String], _timeout: Duration) -> Result<(), ValidateError> {
+            self.calls.lock().unwrap().push(argv.to_vec());
+            match self.response.lock().unwrap().clone() {
+                MockValidatorResponse::Ok => Ok(()),
+                MockValidatorResponse::Fail { stderr } => Err(ValidateError::ExitNonZero {
+                    exit_code: 1,
+                    stderr_excerpt: stderr,
+                }),
+            }
+        }
+    }
+
+    fn make_ctx_with_runr_and_validator(
+        runr: Option<Arc<dyn RunrHandle>>,
+        validator: Arc<dyn ValidateRunner>,
+    ) -> (TempDir, ApplyCtx) {
+        let tmp = TempDir::new().unwrap();
+        let defers = Arc::new(Journal::open(tmp.path()).unwrap());
+        let ctx = ApplyCtx::with_validator(
+            Instant::now() + Duration::from_secs(60),
+            CancellationToken::new(),
+            tracing::Span::none(),
+            Arc::new(SensitiveStore::new()),
+            PathBuf::from("/tmp/backup"),
+            PathBuf::from("/tmp/log"),
+            defers,
+            runr,
+            None,
+            validator,
+        );
+        (tmp, ctx)
+    }
+
+    /// Сделать resource с validate_with в payload — без него serde
+    /// прокидывает default None.
+    fn make_resource_with_validate(
+        name: &str,
+        state: ServiceState,
+        validate_with: Vec<String>,
+    ) -> Resource {
+        let kind = ResourceKind::from_static("runr.service");
+        let id = ResourceId::new(&kind, name);
+        let state_str = match state {
+            ServiceState::Running => "running",
+            ServiceState::Stopped => "stopped",
+            ServiceState::Absent => "absent",
+        };
+        Resource {
+            id,
+            kind,
+            spec_version: 1,
+            payload: serde_json::json!({
+                "name": name,
+                "state": state_str,
+                "validate_with": validate_with,
+            }),
+            reload_on: Vec::new(),
+            restart_on: Vec::new(),
+            depends_on: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn validate_with_success_allows_restart_defer_enqueue() {
+        // validate_with пройден → defer restart enqueue'ится, validator
+        // вызван один раз.
+        let mock = Arc::new(MockRunr::new(vec![status("svc", "Running", 0)]));
+        let validator = MockValidator::ok();
+        let r = {
+            let mut r = make_resource_with_validate(
+                "svc",
+                ServiceState::Running,
+                vec!["pg_doorman".into(), "-t".into()],
+            );
+            let src_kind = ResourceKind::from_static("file.content");
+            r.restart_on.push(ResourceId::new(&src_kind, "/etc/cfg"));
+            r
+        };
+        let (tmp, ctx) = make_ctx_with_runr_and_validator(
+            Some(mock.clone()),
+            validator.clone() as Arc<dyn ValidateRunner>,
+        );
+        ctx.record_changed(&r.restart_on[0]);
+
+        let report = run(&r, &force_update_diff(&r), &ctx).unwrap();
+        assert!(report.deferred);
+        // validator должен быть вызван один раз с argv из spec.
+        assert_eq!(validator.calls().len(), 1);
+        assert_eq!(validator.calls()[0], vec!["pg_doorman", "-t"]);
+        // Defer-файл создан.
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".deferred"))
+            .collect();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn validate_with_failure_blocks_restart_defer_enqueue() {
+        // validate_with failed → PrimitiveError::Validation, defer НЕ
+        // enqueue'ится. Это критический инвариант: оператор видит ошибку
+        // синхронно и не запускает restart с битым конфигом.
+        let mock = Arc::new(MockRunr::new(vec![status("svc", "Running", 0)]));
+        let validator = MockValidator::failing("config invalid");
+        let r = {
+            let mut r = make_resource_with_validate(
+                "svc",
+                ServiceState::Running,
+                vec!["pg_doorman".into(), "-t".into()],
+            );
+            let src_kind = ResourceKind::from_static("file.content");
+            r.restart_on.push(ResourceId::new(&src_kind, "/etc/cfg"));
+            r
+        };
+        let (tmp, ctx) = make_ctx_with_runr_and_validator(
+            Some(mock.clone()),
+            validator.clone() as Arc<dyn ValidateRunner>,
+        );
+        ctx.record_changed(&r.restart_on[0]);
+
+        let err = run(&r, &force_update_diff(&r), &ctx).unwrap_err();
+        match err {
+            PrimitiveError::Validation {
+                validator: v,
+                stderr_excerpt,
+            } => {
+                assert_eq!(v, "pg_doorman");
+                assert!(
+                    stderr_excerpt.contains("config invalid"),
+                    "stderr должен быть в reason, got: {stderr_excerpt}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        // service_restart НЕ должен быть вызван (defer не enqueue'ится).
+        assert!(!mock.calls().iter().any(|c| c == "service_restart:svc"));
+        // Defer-файлы отсутствуют — defer не enqueue'ился.
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".deferred"))
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "defer не должен enqueue'иться при failed validation, got {entries:?}"
+        );
+    }
+
+    #[test]
+    fn validate_with_failure_blocks_reload_defer_enqueue() {
+        // Симметрично restart, но для reload.
+        let mock = Arc::new(MockRunr::new(vec![status("svc", "Running", 0)]));
+        let validator = MockValidator::failing("bad");
+        let r = {
+            let mut r = make_resource_with_validate(
+                "svc",
+                ServiceState::Running,
+                vec!["nginx".into(), "-t".into()],
+            );
+            let src_kind = ResourceKind::from_static("file.content");
+            r.reload_on.push(ResourceId::new(&src_kind, "/etc/cfg"));
+            r
+        };
+        let (tmp, ctx) = make_ctx_with_runr_and_validator(
+            Some(mock.clone()),
+            validator.clone() as Arc<dyn ValidateRunner>,
+        );
+        ctx.record_changed(&r.reload_on[0]);
+
+        let err = run(&r, &force_update_diff(&r), &ctx).unwrap_err();
+        assert!(matches!(err, PrimitiveError::Validation { .. }));
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".deferred"))
+            .collect();
+        assert!(entries.is_empty(), "reload-defer не должен enqueue'иться");
+    }
+
+    #[test]
+    fn validate_with_not_called_for_start_action() {
+        // Start идёт синхронно, validate_with не запускается. Это намеренно:
+        // semantically validate — это «проверка config'а перед инвазивным
+        // изменением running сервиса», а start уже из inactive — отдельная
+        // история. Если хочется проверить config до старта — это работа
+        // file.content's validate_with.
+        let mock = Arc::new(MockRunr::new(vec![])); // нет статусов → Start
+        let validator = MockValidator::failing("would block start");
+        let r = make_resource_with_validate(
+            "svc",
+            ServiceState::Running,
+            vec!["nginx".into(), "-t".into()],
+        );
+        let (_tmp, ctx) = make_ctx_with_runr_and_validator(
+            Some(mock.clone()),
+            validator.clone() as Arc<dyn ValidateRunner>,
+        );
+
+        let report = run(&r, &force_update_diff(&r), &ctx).unwrap();
+        assert!(report.changed);
+        // validator НЕ должен быть вызван.
+        assert!(
+            validator.calls().is_empty(),
+            "validator не должен вызываться при Start, got {:?}",
+            validator.calls()
+        );
+        // service_start был вызван.
+        assert!(mock.calls().iter().any(|c| c == "service_start:svc"));
+    }
+
+    #[test]
+    fn no_validate_with_path_unchanged() {
+        // Без validate_with restart defer enqueue'ится напрямую, validator
+        // не дёргается.
+        let mock = Arc::new(MockRunr::new(vec![status("svc", "Running", 0)]));
+        let validator = MockValidator::ok();
+        let r = {
+            let mut r = make_resource("svc", ServiceState::Running);
+            let src_kind = ResourceKind::from_static("file.content");
+            r.restart_on.push(ResourceId::new(&src_kind, "/etc/cfg"));
+            r
+        };
+        let (tmp, ctx) = make_ctx_with_runr_and_validator(
+            Some(mock.clone()),
+            validator.clone() as Arc<dyn ValidateRunner>,
+        );
+        ctx.record_changed(&r.restart_on[0]);
+
+        let report = run(&r, &force_update_diff(&r), &ctx).unwrap();
+        assert!(report.deferred);
+        assert!(
+            validator.calls().is_empty(),
+            "validator не должен вызываться без validate_with"
+        );
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".deferred"))
+            .collect();
+        assert_eq!(entries.len(), 1);
     }
 }

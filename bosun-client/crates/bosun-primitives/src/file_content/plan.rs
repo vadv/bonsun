@@ -96,6 +96,7 @@ mod tests {
             group: None,
             content_sha256: "abc".into(),
             content_size: 3,
+            validate_with: None,
         };
         let obs = FileObservation {
             sha256_hex: "abc".into(),
@@ -116,6 +117,7 @@ mod tests {
             group: None,
             content_sha256: "abc".into(),
             content_size: 3,
+            validate_with: None,
         };
         let obs = FileObservation {
             sha256_hex: "different".into(),
@@ -136,6 +138,7 @@ mod tests {
             group: None,
             content_sha256: "abc".into(),
             content_size: 3,
+            validate_with: None,
         };
         let obs = FileObservation {
             sha256_hex: "abc".into(),
@@ -156,6 +159,7 @@ mod tests {
             group: None,
             content_sha256: "abc".into(),
             content_size: 4,
+            validate_with: None,
         };
         let obs = FileObservation {
             sha256_hex: "abc".into(),
@@ -176,6 +180,7 @@ mod tests {
             group: None,
             content_sha256: "abc".into(),
             content_size: 3,
+            validate_with: None,
         };
         let obs = FileObservation {
             sha256_hex: "abc".into(),
@@ -196,6 +201,7 @@ mod tests {
             group: None,
             content_sha256: "abc".into(),
             content_size: 3,
+            validate_with: None,
         };
         let obs = FileObservation {
             sha256_hex: "abc".into(),

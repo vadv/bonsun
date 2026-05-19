@@ -29,6 +29,7 @@ use crate::defers::Journal;
 use crate::diff::{ChangeReport, Diff};
 use crate::resource::{Resource, ResourceId};
 use crate::sensitive::SensitiveStore;
+use crate::validate::{RealValidateRunner, ValidateRunner};
 
 /// Контекст plan-фазы: дедлайн + cancel token. Передаётся by value
 /// (поля Clone-дешёвые, CancellationToken — Arc внутри).
@@ -65,6 +66,9 @@ pub struct PlanCtx {
 /// apply: одного HTTP-call'а хватает на сравнение plan/apply для всех
 /// `runr.service` ресурсов в манифесте. `OnceLock` обеспечивает lazy-init и
 /// безопасную инициализацию single-shot.
+///
+/// `validator` — исполнитель `validate_with`-команд. Передаётся в Arc, чтобы
+/// тесты подменяли spawn без зависимости от системных бинарей.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct ApplyCtx {
@@ -101,6 +105,12 @@ pub struct ApplyCtx {
     /// Кэш ответа `runr.service_statuses()` на весь apply. См. описание
     /// поля.
     pub runr_service_statuses: Arc<OnceLock<Vec<ServiceStatus>>>,
+    /// Исполнитель `validate_with`-команд (`nginx -t`, etc). В production
+    /// CLI собирает `RealValidateRunner`; в тестах примитивы подменяют
+    /// mock, который записывает argv и возвращает заранее заданный
+    /// результат. Используется и `file.content` (validate перед swap), и
+    /// `runr/systemd.service` (validate перед enqueue defer'а).
+    pub validator: Arc<dyn ValidateRunner>,
 }
 
 impl PlanCtx {
@@ -137,6 +147,37 @@ impl ApplyCtx {
         runr: Option<Arc<dyn RunrHandle>>,
         systemd: Option<Arc<dyn SystemdHandle>>,
     ) -> Self {
+        Self::with_validator(
+            deadline,
+            cancel,
+            log_span,
+            sensitive,
+            backup_root,
+            log_dir,
+            defers,
+            runr,
+            systemd,
+            Arc::new(RealValidateRunner),
+        )
+    }
+
+    /// То же, что `new`, но с явным `ValidateRunner`. Production CLI
+    /// использует `new` (выбирает `RealValidateRunner` по умолчанию);
+    /// тестам Phase H нужен mock-runner для проверки validate_with без
+    /// зависимости от системных бинарей вроде `nginx`/`pgbouncer`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_validator(
+        deadline: Instant,
+        cancel: CancellationToken,
+        log_span: tracing::Span,
+        sensitive: Arc<SensitiveStore>,
+        backup_root: PathBuf,
+        log_dir: PathBuf,
+        defers: Arc<Journal>,
+        runr: Option<Arc<dyn RunrHandle>>,
+        systemd: Option<Arc<dyn SystemdHandle>>,
+        validator: Arc<dyn ValidateRunner>,
+    ) -> Self {
         Self {
             deadline,
             cancel,
@@ -151,6 +192,7 @@ impl ApplyCtx {
             runr_daemon_reload_done: Arc::new(AtomicBool::new(false)),
             systemd_daemon_reload_done: Arc::new(AtomicBool::new(false)),
             runr_service_statuses: Arc::new(OnceLock::new()),
+            validator,
         }
     }
 

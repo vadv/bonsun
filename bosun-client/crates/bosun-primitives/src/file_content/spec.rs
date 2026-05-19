@@ -23,6 +23,15 @@ pub struct FileContentSpec {
     pub content_sha256: String,
     /// Длина тела в байтах.
     pub content_size: u64,
+    /// Validate-команда, запускаемая на `<path>.new` ДО atomic swap'а
+    /// в `<path>`. `{new_path}` в argv подменяется на реальный путь.
+    /// Пусто или None — старый flow `<path>.tmp` → rename без
+    /// промежуточной валидации (MVP-совместимый путь).
+    ///
+    /// Семантика — Phase H design «Validation pattern»: на failure
+    /// `<path>.new` ОСТАЁТСЯ на диске для forensics, target не трогается.
+    #[serde(default)]
+    pub validate_with: Option<Vec<String>>,
 }
 
 const fn default_mode() -> u32 {
@@ -142,7 +151,42 @@ mod tests {
             group: None,
             content_sha256: "x".into(),
             content_size: 0,
+            validate_with: None,
         }
+    }
+
+    #[test]
+    fn deserialize_with_validate_with() {
+        let json = serde_json::json!({
+            "path": "/etc/nginx/nginx.conf",
+            "content_sha256": "x",
+            "content_size": 0_u64,
+            "validate_with": ["nginx", "-t", "-c", "{new_path}"],
+        });
+        let spec: FileContentSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            spec.validate_with.as_deref(),
+            Some(
+                [
+                    "nginx".to_string(),
+                    "-t".into(),
+                    "-c".into(),
+                    "{new_path}".into(),
+                ]
+                .as_slice(),
+            ),
+        );
+    }
+
+    #[test]
+    fn deserialize_without_validate_with_is_none() {
+        let json = serde_json::json!({
+            "path": "/x",
+            "content_sha256": "x",
+            "content_size": 0_u64,
+        });
+        let spec: FileContentSpec = serde_json::from_value(json).unwrap();
+        assert!(spec.validate_with.is_none());
     }
 
     #[test]

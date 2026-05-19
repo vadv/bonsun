@@ -1,10 +1,19 @@
 //! Apply-фаза `file.content`: atomic write через tempfile в той же FS.
+//!
+//! Phase H ввела расщепление flow по наличию `validate_with`:
+//! - validate_with=None — старый MVP-путь через `tempfile.persist()`
+//!   (atomic rename из `.tmp` файла в той же FS).
+//! - validate_with=Some — render-to-`<path>.new` → validator → rename.
+//!   На провал validator'а `.new` ОСТАЁТСЯ на диске для forensics,
+//!   target не трогается, `record_changed` не вызывается.
 
 use std::io::Write as _;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use bosun_core::{ApplyCtx, ChangeReport, Diff, PrimitiveError, Resource};
+use bosun_core::validate::substitute_new_path;
+use bosun_core::{ApplyCtx, ChangeReport, Diff, PrimitiveError, Resource, ValidateError};
 use tempfile::NamedTempFile;
 
 use super::backup::backup_with_rotation;
@@ -15,13 +24,21 @@ use super::spec::FileContentSpec;
 /// Сколько последних бэкапов хранить. Спека требует ровно 5.
 const KEEP_BACKUPS: usize = 5;
 
+/// Таймаут на validate-команду. 30 секунд — хватает даже самым тяжёлым
+/// валидаторам (`nginx -t` обычно отвечает за миллисекунды, но
+/// `pg_doorman -t` на больших pool-конфигах может тянуться). Бóльше —
+/// смысла нет: validator всё равно ждёт ответа sync, и admit time
+/// проседает.
+const VALIDATE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Главная функция apply. Шаги:
 /// 1. Достать сенситивные contents из `ctx.sensitive`.
 /// 2. Re-stat: убедиться, что target не стал symlink между plan и apply.
 /// 3. Re-plan: возможно, файл уже совпадает — отдадим NoChange.
-/// 4. Backup при Update.
-/// 5. Atomic write через `NamedTempFile + persist`.
-/// 6. chmod + chown.
+/// 4. Backup при Update + atomic write — выбор пути:
+///    - без `validate_with`: tempfile.persist() напрямую в target;
+///    - с `validate_with`: render-to-`<path>.new` → validator → rename.
+/// 5. chmod + chown — внутри write-helper'ов.
 pub fn apply(
     resource: &Resource,
     diff: &Diff,
@@ -87,16 +104,6 @@ pub fn apply(
         None => false,
     };
 
-    // Backup при Update — до записи. При Add бэкапить нечего.
-    if is_update {
-        let backup_path = backup_with_rotation(target, &ctx.backup_root, KEEP_BACKUPS)?;
-        tracing::debug!(
-            path = %target.display(),
-            backup = %backup_path.display(),
-            "backup created",
-        );
-    }
-
     // Diff используется только для лог-сообщения — на этом шаге мы уже
     // приняли решение по re-plan. Игнорируем как информацию, но оставляем
     // в сигнатуре, потому что Primitive::apply требует это.
@@ -112,13 +119,248 @@ pub fn apply(
     });
 
     tracing::info!(path = %target.display(), "writing file");
-    write_atomic(target, contents.as_bytes(), &spec, existing_owner)?;
 
+    // Phase H: validate_with расщепляет flow.
+    // - None — старый MVP-путь: backup (Update) → tempfile.persist()
+    //   (атомарный rename `.tmp` → target).
+    // - Some — render-to-`<path>.new` → validator → backup → rename.
+    //   На provoque validator'а `<path>.new` ОСТАЁТСЯ на диске, target
+    //   не трогается, `record_changed` НЕ вызывается (early return Err).
+    match spec.validate_with.as_deref() {
+        None => {
+            if is_update {
+                let backup_path = backup_with_rotation(target, &ctx.backup_root, KEEP_BACKUPS)?;
+                tracing::debug!(
+                    path = %target.display(),
+                    backup = %backup_path.display(),
+                    "backup created",
+                );
+            }
+            write_atomic(target, contents.as_bytes(), &spec, existing_owner)?;
+        }
+        Some([]) => {
+            // Пустой массив (`validate_with=[]`) — bundle-bug, отлавливаем
+            // здесь до spawn'а. Альтернатива «считать пустой как None»
+            // была бы враждебной: оператор явно вписал поле, ожидает
+            // выполнения, тихий пропуск — это сюрприз.
+            return Err(PrimitiveError::InvalidPayload(
+                "file.content.validate_with is empty; remove the field or list a command"
+                    .to_string(),
+            ));
+        }
+        Some(argv) => {
+            write_with_validation(
+                target,
+                contents.as_bytes(),
+                &spec,
+                existing_owner,
+                argv,
+                is_update,
+                ctx,
+            )?;
+        }
+    }
+
+    // record_changed вызывает оркестратор на основании
+    // ChangeReport::changed — здесь не дёргаем сами, чтобы не дублировать.
     Ok(ChangeReport::changed(format!(
         "wrote {} (sha256={})",
         target.display(),
         spec.content_sha256,
     )))
+}
+
+/// Phase H путь: рендерим `<path>.new`, запускаем validator, при успехе
+/// делаем backup и атомарно rename'им в `<path>`.
+///
+/// На failure validator'а `<path>.new` остаётся на диске для forensics;
+/// мы возвращаем `PrimitiveError::Validation`. Главный `apply` не
+/// успеет вызвать `record_changed`, поэтому notify-источники не дёрнут
+/// restart/reload пустыми руками.
+fn write_with_validation(
+    target: &Path,
+    body: &[u8],
+    spec: &FileContentSpec,
+    existing_owner: Option<(u32, u32)>,
+    argv: &[String],
+    is_update: bool,
+    ctx: &ApplyCtx,
+) -> Result<(), PrimitiveError> {
+    let new_path = new_path_for(target);
+
+    let parent = target.parent().ok_or_else(|| {
+        PrimitiveError::InvalidPayload(format!(
+            "target {} has no parent directory",
+            target.display(),
+        ))
+    })?;
+    if !parent.exists() {
+        std::fs::create_dir_all(parent).map_err(|e| PrimitiveError::Io {
+            context: format!("create_dir_all {}", parent.display()),
+            source: e,
+        })?;
+    }
+
+    // Этап 1. Пишем в `<path>.new`: tempfile в parent → chmod → chown →
+    // persist по точному имени `<path>.new`. Атомарность rename'а
+    // гарантируется тем, что `.new` и target живут в одной FS.
+    let written = write_to_new_path(target, &new_path, body, spec, existing_owner)?;
+    debug_assert_eq!(written, new_path);
+
+    // Этап 2. Подставляем `{new_path}` в argv и запускаем validator.
+    let real_argv = substitute_new_path(argv, &new_path.to_string_lossy());
+    let validator_name = real_argv
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "<empty>".to_string());
+
+    tracing::info!(
+        target = %target.display(),
+        new_path = %new_path.display(),
+        validator = %validator_name,
+        "running validate_with",
+    );
+
+    match ctx.validator.run(&real_argv, VALIDATE_TIMEOUT) {
+        Ok(()) => {
+            tracing::info!(
+                target = %target.display(),
+                validator = %validator_name,
+                "validate_with passed",
+            );
+        }
+        Err(err) => {
+            // `<path>.new` ОСТАЁТСЯ. Это hard-constraint Phase H: оператор
+            // открывает его, видит rendered config и причину провала в
+            // логе. Стирать здесь означало бы потерять forensics.
+            tracing::warn!(
+                target = %target.display(),
+                new_path = %new_path.display(),
+                validator = %validator_name,
+                error = %err,
+                "validate_with failed; .new kept for forensics",
+            );
+            return Err(map_validate_error(err, &validator_name));
+        }
+    }
+
+    // Этап 3. Backup существующего target'а — после validation, чтобы не
+    // плодить пустые backup'ы на failed apply.
+    if is_update {
+        let backup_path = backup_with_rotation(target, &ctx.backup_root, KEEP_BACKUPS)?;
+        tracing::debug!(
+            path = %target.display(),
+            backup = %backup_path.display(),
+            "backup created",
+        );
+    }
+
+    // Этап 4. Атомарный rename `.new` → target. system call rename
+    // в той же FS даёт atomicity.
+    std::fs::rename(&new_path, target).map_err(|e| PrimitiveError::Io {
+        context: format!("rename {} -> {}", new_path.display(), target.display()),
+        source: e,
+    })?;
+
+    Ok(())
+}
+
+/// Собрать путь `<path>.new`. Если target — `/etc/nginx.conf`, .new будет
+/// `/etc/nginx.conf.new` в той же родительской директории.
+fn new_path_for(target: &Path) -> PathBuf {
+    let mut name = target
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(".new");
+    target
+        .parent()
+        .map(|p| p.join(&name))
+        .unwrap_or_else(|| PathBuf::from(&name))
+}
+
+/// Записать body в `<path>.new`: tempfile → chmod → chown → persist
+/// под точное имя `.new`. После этой функции `<path>.new` существует на
+/// диске с финальными permissions/owner.
+fn write_to_new_path(
+    target: &Path,
+    new_path: &Path,
+    body: &[u8],
+    spec: &FileContentSpec,
+    existing_owner: Option<(u32, u32)>,
+) -> Result<PathBuf, PrimitiveError> {
+    let parent = target.parent().ok_or_else(|| {
+        PrimitiveError::InvalidPayload(format!(
+            "target {} has no parent directory",
+            target.display(),
+        ))
+    })?;
+
+    let mut tmp = NamedTempFile::new_in(parent).map_err(|e| PrimitiveError::Io {
+        context: format!("tempfile in {} (validate flow)", parent.display()),
+        source: e,
+    })?;
+    tmp.write_all(body).map_err(|e| PrimitiveError::Io {
+        context: format!("write to tempfile in {}", parent.display()),
+        source: e,
+    })?;
+    tmp.as_file().sync_all().map_err(|e| PrimitiveError::Io {
+        context: format!("sync_all on tempfile in {}", parent.display()),
+        source: e,
+    })?;
+
+    let perms = std::fs::Permissions::from_mode(spec.mode & 0o7777);
+    std::fs::set_permissions(tmp.path(), perms).map_err(|e| PrimitiveError::Io {
+        context: format!("chmod tempfile {}", tmp.path().display()),
+        source: e,
+    })?;
+
+    let want_uid = match &spec.owner {
+        Some(name) => Some(resolve_owner(name)?),
+        None => existing_owner.map(|(u, _)| u),
+    };
+    let want_gid = match &spec.group {
+        Some(name) => Some(resolve_group(name)?),
+        None => existing_owner.map(|(_, g)| g),
+    };
+    if want_uid.is_some() || want_gid.is_some() {
+        let final_uid = match want_uid {
+            Some(u) => u,
+            None => unix_meta_uid(tmp.path())?,
+        };
+        let final_gid = match want_gid {
+            Some(g) => g,
+            None => unix_meta_gid(tmp.path())?,
+        };
+        let is_root = current_euid() == 0;
+        chown_if_needed(tmp.path(), final_uid, final_gid, is_root)?;
+    }
+
+    let new_path_buf = new_path.to_path_buf();
+    tmp.persist(&new_path_buf).map_err(|e| PrimitiveError::Io {
+        context: format!("persist tempfile to {}", new_path_buf.display()),
+        source: e.error,
+    })?;
+    Ok(new_path_buf)
+}
+
+/// Преобразование `ValidateError` в `PrimitiveError::Validation`. Excerpt
+/// stderr попадает в reason; для timeout — fixed-string с длительностью,
+/// для spawn-ошибки — описание io::Error.
+fn map_validate_error(err: ValidateError, validator: &str) -> PrimitiveError {
+    let stderr_excerpt = match err {
+        ValidateError::ExitNonZero { stderr_excerpt, .. } => stderr_excerpt,
+        ValidateError::Timeout(d) => format!("timeout after {d:?}"),
+        ValidateError::Spawn(e) => format!("failed to spawn: {e}"),
+        // ValidateError помечен `#[non_exhaustive]`: новые варианты
+        // мапим в общий бакет, чтобы не падать compile-time, но и не
+        // молчать в логах.
+        other => format!("validator error: {other}"),
+    };
+    PrimitiveError::Validation {
+        validator: validator.to_string(),
+        stderr_excerpt,
+    }
 }
 
 /// Запись через `tempfile` в той же родительской директории, `fsync`, `chmod`,
@@ -678,5 +920,560 @@ mod tests {
             5,
             "expected exactly 5 backups after rotation"
         );
+    }
+
+    // ===== Phase H: validate_with =====
+
+    use std::sync::Mutex;
+
+    use bosun_core::validate::{
+        substitute_new_path, RealValidateRunner, ValidateError, ValidateRunner,
+    };
+
+    /// Mock-validator: записывает вызовы и возвращает заданный результат.
+    /// Использует `MockResponse`-перечисление, чтобы тесты могли симулировать
+    /// разные сценарии (success, fail с stderr, timeout, spawn-fail).
+    struct MockValidator {
+        calls: Mutex<Vec<Vec<String>>>,
+        response: Mutex<MockResponse>,
+    }
+
+    #[derive(Clone)]
+    enum MockResponse {
+        Ok,
+        ExitNonZero { code: i32, stderr: String },
+        Timeout,
+    }
+
+    impl MockValidator {
+        fn ok() -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                response: Mutex::new(MockResponse::Ok),
+            })
+        }
+        fn failing(stderr: &str) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                response: Mutex::new(MockResponse::ExitNonZero {
+                    code: 1,
+                    stderr: stderr.to_string(),
+                }),
+            })
+        }
+        fn timing_out() -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                response: Mutex::new(MockResponse::Timeout),
+            })
+        }
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl ValidateRunner for MockValidator {
+        fn run(&self, argv: &[String], _timeout: Duration) -> Result<(), ValidateError> {
+            self.calls.lock().unwrap().push(argv.to_vec());
+            match self.response.lock().unwrap().clone() {
+                MockResponse::Ok => Ok(()),
+                MockResponse::ExitNonZero { code, stderr } => Err(ValidateError::ExitNonZero {
+                    exit_code: code,
+                    stderr_excerpt: stderr,
+                }),
+                MockResponse::Timeout => Err(ValidateError::Timeout(Duration::from_secs(30))),
+            }
+        }
+    }
+
+    /// ApplyCtx с подменяемым validator'ом — нужен для проверки validate_with
+    /// без зависимости от системного nginx/pg_doorman.
+    fn ctx_with_validator(
+        store: Arc<SensitiveStore>,
+        backup_root: std::path::PathBuf,
+        validator: Arc<dyn ValidateRunner>,
+    ) -> ApplyCtx {
+        let defers_root = std::env::temp_dir().join("bosun-file-test-defers");
+        let defers = Arc::new(bosun_core::defers::Journal::open(&defers_root).unwrap());
+        ApplyCtx::with_validator(
+            Instant::now() + Duration::from_secs(60),
+            CancellationToken::new(),
+            tracing::Span::none(),
+            store,
+            backup_root,
+            std::path::PathBuf::from("/tmp"),
+            defers,
+            None,
+            None,
+            validator,
+        )
+    }
+
+    /// Сделать resource с заданным validate_with.
+    fn make_resource_with_validate(
+        path: &str,
+        contents: &str,
+        mode: u32,
+        validate_with: Option<Vec<String>>,
+    ) -> Resource {
+        let sha = sha256_hex(contents.as_bytes());
+        let payload = serde_json::json!({
+            "path": path,
+            "mode": mode,
+            "content_sha256": sha,
+            "content_size": contents.len() as u64,
+            "validate_with": validate_with,
+        });
+        let kind = ResourceKind::from_static("file.content");
+        let id = ResourceId::new(&kind, path);
+        Resource {
+            id,
+            kind,
+            spec_version: 1,
+            payload,
+            reload_on: Vec::new(),
+            restart_on: Vec::new(),
+            depends_on: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn validate_with_success_swaps_file_and_calls_validator() {
+        // Validator (mock = Ok) → swap проходит, target обновлён, .new
+        // исчезает (потому что rename переместил его в target).
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("conf");
+        let validator = MockValidator::ok();
+        let resource = make_resource_with_validate(
+            target.to_str().unwrap(),
+            "new content",
+            0o644,
+            Some(vec!["true".to_string()]),
+        );
+        let store = Arc::new(SensitiveStore::new());
+        store.put(
+            resource.id.clone(),
+            SensitivePayload::new("new content".into()),
+        );
+        let ctx = ctx_with_validator(
+            Arc::clone(&store),
+            tmp.path().join("backup"),
+            validator.clone() as Arc<dyn ValidateRunner>,
+        );
+        let diff = Diff::Add {
+            description: "create".into(),
+            payload: resource.payload.clone(),
+        };
+        let report = apply(&resource, &diff, &ctx).unwrap();
+        assert!(report.changed);
+        assert_eq!(std::fs::read(&target).unwrap(), b"new content");
+        let new_path = target.with_extension("new");
+        assert!(
+            !new_path.exists(),
+            "<path>.new должен быть переименован в target, остался: {}",
+            new_path.display(),
+        );
+        // Validator должен быть вызван один раз с переданным argv.
+        assert_eq!(validator.calls().len(), 1);
+        assert_eq!(validator.calls()[0], vec!["true"]);
+    }
+
+    #[test]
+    fn validate_with_substitution_passes_real_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("conf");
+        let validator = MockValidator::ok();
+        let resource = make_resource_with_validate(
+            target.to_str().unwrap(),
+            "body",
+            0o644,
+            Some(vec![
+                "sh".to_string(),
+                "-c".into(),
+                "echo {new_path}".into(),
+                "{new_path}".into(),
+            ]),
+        );
+        let store = Arc::new(SensitiveStore::new());
+        store.put(resource.id.clone(), SensitivePayload::new("body".into()));
+        let ctx = ctx_with_validator(
+            Arc::clone(&store),
+            tmp.path().join("backup"),
+            validator.clone() as Arc<dyn ValidateRunner>,
+        );
+        let diff = Diff::Add {
+            description: "create".into(),
+            payload: resource.payload.clone(),
+        };
+        apply(&resource, &diff, &ctx).unwrap();
+        let calls = validator.calls();
+        assert_eq!(calls.len(), 1);
+        let new_path_str = target.with_extension("new").to_string_lossy().to_string();
+        assert_eq!(calls[0][0], "sh");
+        assert_eq!(calls[0][1], "-c");
+        // Оба плейсхолдера подставились.
+        assert_eq!(calls[0][2], format!("echo {new_path_str}"));
+        assert_eq!(calls[0][3], new_path_str);
+    }
+
+    #[test]
+    fn validate_with_failure_keeps_new_file_and_does_not_swap() {
+        // Это самый важный инвариант: validator failed → <path>.new ОСТАЁТСЯ,
+        // target не изменён, ошибка PrimitiveError::Validation.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("conf");
+        std::fs::write(&target, b"original").unwrap();
+
+        let validator = MockValidator::failing("syntax error at line 1");
+        let resource = make_resource_with_validate(
+            target.to_str().unwrap(),
+            "broken config",
+            0o644,
+            Some(vec!["nginx".to_string(), "-t".into(), "{new_path}".into()]),
+        );
+        let store = Arc::new(SensitiveStore::new());
+        store.put(
+            resource.id.clone(),
+            SensitivePayload::new("broken config".into()),
+        );
+        let ctx = ctx_with_validator(
+            Arc::clone(&store),
+            tmp.path().join("backup"),
+            validator.clone() as Arc<dyn ValidateRunner>,
+        );
+        let diff = Diff::Update {
+            from: serde_json::json!({}),
+            to: serde_json::json!({}),
+            description: "x".into(),
+        };
+        let err = apply(&resource, &diff, &ctx).unwrap_err();
+        match err {
+            PrimitiveError::Validation {
+                validator: v,
+                stderr_excerpt,
+            } => {
+                assert_eq!(v, "nginx");
+                assert!(
+                    stderr_excerpt.contains("syntax error"),
+                    "stderr должен быть в reason, got: {stderr_excerpt}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        // Target НЕ изменён.
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"original",
+            "target не должен быть изменён при validation failure",
+        );
+        // <path>.new ОСТАЁТСЯ для forensics.
+        let new_path = target.with_extension("new");
+        assert!(
+            new_path.exists(),
+            "<path>.new должен остаться для forensics: {}",
+            new_path.display(),
+        );
+        let new_contents = std::fs::read(&new_path).unwrap();
+        assert_eq!(
+            new_contents, b"broken config",
+            ".new должен содержать rendered config",
+        );
+    }
+
+    #[test]
+    fn validate_with_failure_does_not_create_backup() {
+        // Failed validation НЕ должен создавать backup target'а: backup
+        // делается ТОЛЬКО после успешного validation, чтобы failed apply
+        // не плодил мусор. Конкретный backup_dir для этого target —
+        // `<backup_root>/<target_parent>/`. Если он отсутствует или пустой,
+        // значит backup_with_rotation не дёргали.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("etc/conf");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"original").unwrap();
+
+        let validator = MockValidator::failing("bad");
+        let resource = make_resource_with_validate(
+            target.to_str().unwrap(),
+            "new",
+            0o644,
+            Some(vec!["false".to_string()]),
+        );
+        let store = Arc::new(SensitiveStore::new());
+        store.put(resource.id.clone(), SensitivePayload::new("new".into()));
+        let backup_root = tmp.path().join("backup");
+        let ctx = ctx_with_validator(
+            Arc::clone(&store),
+            backup_root.clone(),
+            validator.clone() as Arc<dyn ValidateRunner>,
+        );
+        let diff = Diff::Update {
+            from: serde_json::json!({}),
+            to: serde_json::json!({}),
+            description: "x".into(),
+        };
+        let _ = apply(&resource, &diff, &ctx).unwrap_err();
+        // backup_dir = backup_root + target_parent (strip leading `/`).
+        let target_parent = target.parent().unwrap();
+        let backup_dir = backup_root.join(target_parent.strip_prefix("/").unwrap_or(target_parent));
+        if backup_dir.exists() {
+            let count = std::fs::read_dir(&backup_dir).unwrap().count();
+            assert_eq!(
+                count, 0,
+                "backup_dir не должен содержать файлов при failed validation"
+            );
+        }
+        // Backup-root всё ещё может быть создан (например, ensure_dirs в
+        // CLI), но сам конкретный backup_dir под target — нет.
+    }
+
+    #[test]
+    fn validate_with_timeout_maps_to_validation_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("conf");
+
+        let validator = MockValidator::timing_out();
+        let resource = make_resource_with_validate(
+            target.to_str().unwrap(),
+            "body",
+            0o644,
+            Some(vec!["slow-validator".to_string()]),
+        );
+        let store = Arc::new(SensitiveStore::new());
+        store.put(resource.id.clone(), SensitivePayload::new("body".into()));
+        let ctx = ctx_with_validator(
+            Arc::clone(&store),
+            tmp.path().join("backup"),
+            validator.clone() as Arc<dyn ValidateRunner>,
+        );
+        let diff = Diff::Add {
+            description: "create".into(),
+            payload: resource.payload.clone(),
+        };
+        let err = apply(&resource, &diff, &ctx).unwrap_err();
+        match err {
+            PrimitiveError::Validation {
+                validator: v,
+                stderr_excerpt,
+            } => {
+                assert_eq!(v, "slow-validator");
+                assert!(
+                    stderr_excerpt.contains("timeout"),
+                    "timeout reason должен попадать в stderr_excerpt, got: {stderr_excerpt}",
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        let new_path = target.with_extension("new");
+        assert!(new_path.exists(), ".new должен остаться при timeout");
+    }
+
+    #[test]
+    fn no_validate_with_uses_mvp_path() {
+        // Regression: validate_with=None → старый flow через tempfile.persist().
+        // Никаких <path>.new файлов не создаётся ни при успехе, ни в случае
+        // failure (которого тут нет — без validator'а ничего не валится).
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("conf");
+        let validator = MockValidator::ok(); // не должен быть вызван
+        let resource =
+            make_resource_with_validate(target.to_str().unwrap(), "mvp body", 0o644, None);
+        let store = Arc::new(SensitiveStore::new());
+        store.put(
+            resource.id.clone(),
+            SensitivePayload::new("mvp body".into()),
+        );
+        let ctx = ctx_with_validator(
+            Arc::clone(&store),
+            tmp.path().join("backup"),
+            validator.clone() as Arc<dyn ValidateRunner>,
+        );
+        let diff = Diff::Add {
+            description: "create".into(),
+            payload: resource.payload.clone(),
+        };
+        let report = apply(&resource, &diff, &ctx).unwrap();
+        assert!(report.changed);
+        assert_eq!(std::fs::read(&target).unwrap(), b"mvp body");
+        let new_path = target.with_extension("new");
+        assert!(!new_path.exists(), "MVP-путь не должен создавать .new файл");
+        // Validator вообще не вызывался.
+        assert!(
+            validator.calls().is_empty(),
+            "validator не должен быть вызван при validate_with=None"
+        );
+    }
+
+    #[test]
+    fn empty_validate_with_array_is_invalid_payload() {
+        // validate_with=[] — bundle-bug; должен быть отвергнут с
+        // InvalidPayload до spawn'а validator'а.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("conf");
+        let validator = MockValidator::ok();
+        let resource =
+            make_resource_with_validate(target.to_str().unwrap(), "x", 0o644, Some(vec![]));
+        let store = Arc::new(SensitiveStore::new());
+        store.put(resource.id.clone(), SensitivePayload::new("x".into()));
+        let ctx = ctx_with_validator(
+            Arc::clone(&store),
+            tmp.path().join("backup"),
+            validator.clone() as Arc<dyn ValidateRunner>,
+        );
+        let diff = Diff::Add {
+            description: "create".into(),
+            payload: resource.payload.clone(),
+        };
+        let err = apply(&resource, &diff, &ctx).unwrap_err();
+        match err {
+            PrimitiveError::InvalidPayload(msg) => {
+                assert!(msg.contains("validate_with"), "got: {msg}");
+            }
+            other => panic!("expected InvalidPayload, got {other:?}"),
+        }
+        assert!(
+            validator.calls().is_empty(),
+            "validator не должен быть вызван при пустом argv"
+        );
+    }
+
+    #[test]
+    fn validate_with_creates_new_file_with_correct_mode() {
+        // Permissions на .new ставятся через `O_CREAT + chmod` до persist —
+        // должны совпадать с spec.mode (0o600 в этом тесте).
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("conf");
+        let validator = MockValidator::ok();
+        let resource = make_resource_with_validate(
+            target.to_str().unwrap(),
+            "secret",
+            0o600,
+            Some(vec!["true".to_string()]),
+        );
+        let store = Arc::new(SensitiveStore::new());
+        store.put(resource.id.clone(), SensitivePayload::new("secret".into()));
+        let ctx = ctx_with_validator(
+            Arc::clone(&store),
+            tmp.path().join("backup"),
+            validator.clone() as Arc<dyn ValidateRunner>,
+        );
+        let diff = Diff::Add {
+            description: "create".into(),
+            payload: resource.payload.clone(),
+        };
+        apply(&resource, &diff, &ctx).unwrap();
+        let perms = std::fs::metadata(&target).unwrap().permissions();
+        assert_eq!(
+            perms.mode() & 0o7777,
+            0o600,
+            "perms должны соответствовать spec.mode после swap'а"
+        );
+    }
+
+    #[test]
+    fn real_validator_with_sh_test_exists_succeeds() {
+        // Smoke-тест с реальным валидатором: `test -f` на свежесозданном .new.
+        // RealValidateRunner запускает sh -c, файл существует, exit=0,
+        // swap проходит.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("conf");
+        let resource = make_resource_with_validate(
+            target.to_str().unwrap(),
+            "hello",
+            0o644,
+            Some(vec![
+                "sh".to_string(),
+                "-c".into(),
+                "test -f {new_path}".into(),
+            ]),
+        );
+        let store = Arc::new(SensitiveStore::new());
+        store.put(resource.id.clone(), SensitivePayload::new("hello".into()));
+        // Производственный runner; mock не используем.
+        let ctx = ctx_with_validator(
+            Arc::clone(&store),
+            tmp.path().join("backup"),
+            Arc::new(RealValidateRunner) as Arc<dyn ValidateRunner>,
+        );
+        let diff = Diff::Add {
+            description: "create".into(),
+            payload: resource.payload.clone(),
+        };
+        let report = apply(&resource, &diff, &ctx).unwrap();
+        assert!(report.changed);
+        assert_eq!(std::fs::read(&target).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn real_validator_with_sh_exit_1_fails() {
+        // Smoke-тест: реальный validator завершается с exit=1 → Validation,
+        // target не изменён, .new остаётся.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("conf");
+        std::fs::write(&target, b"original").unwrap();
+        let resource = make_resource_with_validate(
+            target.to_str().unwrap(),
+            "new",
+            0o644,
+            Some(vec![
+                "sh".to_string(),
+                "-c".into(),
+                "echo bad >&2; exit 1".into(),
+            ]),
+        );
+        let store = Arc::new(SensitiveStore::new());
+        store.put(resource.id.clone(), SensitivePayload::new("new".into()));
+        let ctx = ctx_with_validator(
+            Arc::clone(&store),
+            tmp.path().join("backup"),
+            Arc::new(RealValidateRunner) as Arc<dyn ValidateRunner>,
+        );
+        let diff = Diff::Update {
+            from: serde_json::json!({}),
+            to: serde_json::json!({}),
+            description: "x".into(),
+        };
+        let err = apply(&resource, &diff, &ctx).unwrap_err();
+        match err {
+            PrimitiveError::Validation {
+                validator,
+                stderr_excerpt,
+            } => {
+                assert_eq!(validator, "sh");
+                assert!(
+                    stderr_excerpt.contains("bad"),
+                    "stderr должен содержать 'bad', got: {stderr_excerpt}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"original");
+        let new_path = target.with_extension("new");
+        assert!(new_path.exists());
+    }
+
+    #[test]
+    fn new_path_for_appends_dot_new() {
+        // Регрессия: имя должно быть `<original>.new`, не `<dirname>.new`.
+        let target = Path::new("/etc/nginx/nginx.conf");
+        let got = new_path_for(target);
+        assert_eq!(got, Path::new("/etc/nginx/nginx.conf.new"));
+    }
+
+    #[test]
+    fn new_path_for_handles_extension_path() {
+        // Path без расширения.
+        let target = Path::new("/etc/hosts");
+        let got = new_path_for(target);
+        assert_eq!(got, Path::new("/etc/hosts.new"));
+    }
+
+    #[test]
+    fn substitute_new_path_module_re_export_works() {
+        // Защита от регрессии: substitute_new_path импортируется из
+        // bosun_core::validate; если переименуют — тест укажет на нужный путь.
+        let argv = vec!["x".to_string(), "{new_path}".into()];
+        let out = substitute_new_path(&argv, "/y");
+        assert_eq!(out, vec!["x", "/y"]);
     }
 }

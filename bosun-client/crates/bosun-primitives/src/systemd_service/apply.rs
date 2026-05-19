@@ -24,13 +24,18 @@
 //!      `RestartNotObserved` → `Apply` (non-deferrable).
 
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use bosun_core::defers::{make_id, DeferAction, DeferEntry, DeferPriority, CURRENT_SPEC_VERSION};
-use bosun_core::{ApplyCtx, ChangeReport, Diff, PrimitiveError, Resource};
+use bosun_core::{ApplyCtx, ChangeReport, Diff, PrimitiveError, Resource, ValidateError};
 use bosun_handles::{SystemdError, SystemdHandle, UnitInfo};
 
 use super::plan::{decide_action_systemd, Action};
 use super::spec::SystemdServiceSpec;
+
+/// Таймаут на validate-команду перед enqueue restart/reload defer'а.
+/// Совпадает с runr.service / file.content.
+const VALIDATE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Максимум попыток в защёлкивающем defer'е до промоушена в `.manual_clear`.
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
@@ -120,20 +125,86 @@ pub fn run(
         Action::NoChange => Ok(ChangeReport::no_change()),
         Action::Start => execute_start(systemd.as_ref(), &spec, before.as_ref()),
         Action::Stop => execute_stop(systemd.as_ref(), &spec),
-        Action::Restart => enqueue_defer(
-            ctx,
-            &spec,
-            DeferAction::Restart,
-            DeferPriority::Restart,
-            sources,
-        ),
-        Action::Reload => enqueue_defer(
-            ctx,
-            &spec,
-            DeferAction::Reload,
-            DeferPriority::Reload,
-            sources,
-        ),
+        Action::Restart => {
+            // Phase H: validate_with запускается ДО enqueue. Failure →
+            // defer не появляется, оператор видит синхронную ошибку.
+            run_validate_if_configured(&spec, ctx)?;
+            enqueue_defer(
+                ctx,
+                &spec,
+                DeferAction::Restart,
+                DeferPriority::Restart,
+                sources,
+            )
+        }
+        Action::Reload => {
+            run_validate_if_configured(&spec, ctx)?;
+            enqueue_defer(
+                ctx,
+                &spec,
+                DeferAction::Reload,
+                DeferPriority::Reload,
+                sources,
+            )
+        }
+    }
+}
+
+/// Запустить `validate_with` (если задан) перед enqueue defer'а
+/// restart/reload. У service.unit нет `<path>.new`: validator проверяет
+/// текущий target config (он уже на месте — file.content валидировал
+/// свой `.new` до swap'а ранее в apply'е).
+///
+/// Failure → `PrimitiveError::Validation`, defer не enqueue'ится.
+fn run_validate_if_configured(
+    spec: &SystemdServiceSpec,
+    ctx: &ApplyCtx,
+) -> Result<(), PrimitiveError> {
+    let Some(argv) = spec.validate_with.as_deref() else {
+        return Ok(());
+    };
+    if argv.is_empty() {
+        return Ok(());
+    }
+    let validator_name = argv[0].clone();
+    tracing::info!(
+        unit = %spec.name,
+        validator = %validator_name,
+        "systemd.service: running validate_with before defer enqueue",
+    );
+    match ctx.validator.run(argv, VALIDATE_TIMEOUT) {
+        Ok(()) => {
+            tracing::info!(
+                unit = %spec.name,
+                validator = %validator_name,
+                "systemd.service: validate_with passed",
+            );
+            Ok(())
+        }
+        Err(err) => {
+            tracing::warn!(
+                unit = %spec.name,
+                validator = %validator_name,
+                error = %err,
+                "systemd.service: validate_with failed; defer not enqueued",
+            );
+            Err(map_validate_error(err, &validator_name))
+        }
+    }
+}
+
+/// Маппинг `ValidateError` → `PrimitiveError::Validation`. Зеркалит
+/// `runr_service::map_validate_error`.
+fn map_validate_error(err: ValidateError, validator: &str) -> PrimitiveError {
+    let stderr_excerpt = match err {
+        ValidateError::ExitNonZero { stderr_excerpt, .. } => stderr_excerpt,
+        ValidateError::Timeout(d) => format!("timeout after {d:?}"),
+        ValidateError::Spawn(e) => format!("failed to spawn: {e}"),
+        other => format!("validator error: {other}"),
+    };
+    PrimitiveError::Validation {
+        validator: validator.to_string(),
+        stderr_excerpt,
     }
 }
 
@@ -953,5 +1024,290 @@ mod tests {
         let mapped = map_systemd_error(err, "x");
         assert!(!mapped.is_deferrable());
         assert!(matches!(mapped, PrimitiveError::Io { .. }));
+    }
+
+    // ===== Phase H: validate_with =====
+
+    use bosun_core::{ValidateError, ValidateRunner};
+
+    /// Mock-validator: записывает argv, возвращает Ok или Fail.
+    struct MockValidator {
+        calls: Mutex<Vec<Vec<String>>>,
+        response: Mutex<MockValidatorResponse>,
+    }
+
+    #[derive(Clone)]
+    enum MockValidatorResponse {
+        Ok,
+        Fail { stderr: String },
+    }
+
+    impl MockValidator {
+        fn ok() -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                response: Mutex::new(MockValidatorResponse::Ok),
+            })
+        }
+        fn failing(stderr: &str) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                response: Mutex::new(MockValidatorResponse::Fail {
+                    stderr: stderr.to_string(),
+                }),
+            })
+        }
+        fn calls(&self) -> Vec<Vec<String>> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl ValidateRunner for MockValidator {
+        fn run(&self, argv: &[String], _timeout: Duration) -> Result<(), ValidateError> {
+            self.calls.lock().unwrap().push(argv.to_vec());
+            match self.response.lock().unwrap().clone() {
+                MockValidatorResponse::Ok => Ok(()),
+                MockValidatorResponse::Fail { stderr } => Err(ValidateError::ExitNonZero {
+                    exit_code: 1,
+                    stderr_excerpt: stderr,
+                }),
+            }
+        }
+    }
+
+    fn make_ctx_with_systemd_and_validator(
+        systemd: Option<Arc<dyn SystemdHandle>>,
+        validator: Arc<dyn ValidateRunner>,
+    ) -> (TempDir, ApplyCtx) {
+        let tmp = TempDir::new().unwrap();
+        let defers = Arc::new(Journal::open(tmp.path()).unwrap());
+        let ctx = ApplyCtx::with_validator(
+            Instant::now() + Duration::from_secs(60),
+            CancellationToken::new(),
+            tracing::Span::none(),
+            Arc::new(SensitiveStore::new()),
+            PathBuf::from("/tmp/backup"),
+            PathBuf::from("/tmp/log"),
+            defers,
+            None,
+            systemd,
+            validator,
+        );
+        (tmp, ctx)
+    }
+
+    fn make_resource_with_validate(
+        name: &str,
+        state: ServiceState,
+        enable: bool,
+        validate_with: Vec<String>,
+    ) -> Resource {
+        let kind = ResourceKind::from_static("systemd.service");
+        let id = ResourceId::new(&kind, name);
+        let state_str = match state {
+            ServiceState::Running => "running",
+            ServiceState::Stopped => "stopped",
+            ServiceState::Absent => "absent",
+        };
+        Resource {
+            id,
+            kind,
+            spec_version: 1,
+            payload: serde_json::json!({
+                "name": name,
+                "state": state_str,
+                "enable": enable,
+                "validate_with": validate_with,
+            }),
+            reload_on: Vec::new(),
+            restart_on: Vec::new(),
+            depends_on: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn validate_with_success_allows_restart_defer_enqueue() {
+        let mock = Arc::new(MockSystemd::new());
+        mock.enqueue_unit_info(Ok(make_unit("nginx", "active", "abc")));
+        let validator = MockValidator::ok();
+        let r = {
+            let mut r = make_resource_with_validate(
+                "nginx.service",
+                ServiceState::Running,
+                false,
+                vec!["nginx".into(), "-t".into()],
+            );
+            let src_kind = ResourceKind::from_static("file.content");
+            r.restart_on
+                .push(ResourceId::new(&src_kind, "/etc/nginx.conf"));
+            r
+        };
+        let (tmp, ctx) = make_ctx_with_systemd_and_validator(
+            Some(mock.clone()),
+            validator.clone() as Arc<dyn ValidateRunner>,
+        );
+        ctx.record_changed(&r.restart_on[0]);
+
+        let report = run(&r, &force_update(&r), &ctx).unwrap();
+        assert!(report.deferred);
+        // validator вызван один раз с argv из spec.
+        assert_eq!(validator.calls().len(), 1);
+        assert_eq!(validator.calls()[0], vec!["nginx", "-t"]);
+        // Defer-файл создан.
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".deferred"))
+            .collect();
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[test]
+    fn validate_with_failure_blocks_restart_defer_enqueue() {
+        // Главный инвариант: failed validator → defer НЕ enqueue'ится,
+        // оператор видит синхронную ошибку. restart_unit на mock'е
+        // тоже не должен дёргаться.
+        let mock = Arc::new(MockSystemd::new());
+        mock.enqueue_unit_info(Ok(make_unit("nginx", "active", "abc")));
+        let validator = MockValidator::failing("nginx: configuration test failed");
+        let r = {
+            let mut r = make_resource_with_validate(
+                "nginx.service",
+                ServiceState::Running,
+                false,
+                vec!["nginx".into(), "-t".into()],
+            );
+            let src_kind = ResourceKind::from_static("file.content");
+            r.restart_on
+                .push(ResourceId::new(&src_kind, "/etc/nginx.conf"));
+            r
+        };
+        let (tmp, ctx) = make_ctx_with_systemd_and_validator(
+            Some(mock.clone()),
+            validator.clone() as Arc<dyn ValidateRunner>,
+        );
+        ctx.record_changed(&r.restart_on[0]);
+
+        let err = run(&r, &force_update(&r), &ctx).unwrap_err();
+        match err {
+            PrimitiveError::Validation {
+                validator: v,
+                stderr_excerpt,
+            } => {
+                assert_eq!(v, "nginx");
+                assert!(
+                    stderr_excerpt.contains("configuration test failed"),
+                    "stderr должен быть в reason, got: {stderr_excerpt}"
+                );
+            }
+            other => panic!("expected Validation, got {other:?}"),
+        }
+        // restart_unit НЕ вызывался — defer не enqueue'ился и replay
+        // тоже не запускался.
+        assert!(!mock
+            .calls()
+            .iter()
+            .any(|c| c == "restart_unit:nginx.service"));
+        // Defer-файлы отсутствуют.
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".deferred"))
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "defer не должен enqueue'иться, got {entries:?}"
+        );
+    }
+
+    #[test]
+    fn validate_with_failure_blocks_reload_defer_enqueue() {
+        // То же самое для reload-action.
+        let mock = Arc::new(MockSystemd::new());
+        mock.enqueue_unit_info(Ok(make_unit("nginx", "active", "abc")));
+        let validator = MockValidator::failing("bad reload");
+        let r = {
+            let mut r = make_resource_with_validate(
+                "nginx.service",
+                ServiceState::Running,
+                false,
+                vec!["nginx".into(), "-t".into()],
+            );
+            let src_kind = ResourceKind::from_static("file.content");
+            r.reload_on
+                .push(ResourceId::new(&src_kind, "/etc/nginx.conf"));
+            r
+        };
+        let (tmp, ctx) = make_ctx_with_systemd_and_validator(
+            Some(mock.clone()),
+            validator.clone() as Arc<dyn ValidateRunner>,
+        );
+        ctx.record_changed(&r.reload_on[0]);
+
+        let err = run(&r, &force_update(&r), &ctx).unwrap_err();
+        assert!(matches!(err, PrimitiveError::Validation { .. }));
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".deferred"))
+            .collect();
+        assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn validate_with_not_called_for_start_action() {
+        // Start не запускает validate_with: семантически validate — про
+        // restart/reload running-сервиса. Запуск из inactive с битым
+        // конфигом обнаружится при start_unit либо в file.content's
+        // validate_with до swap'а.
+        let mock = Arc::new(MockSystemd::new());
+        mock.enqueue_unit_info(Ok(make_unit("nginx", "inactive", "")));
+        mock.enqueue_unit_info(Ok(make_unit("nginx", "active", "new")));
+        let validator = MockValidator::failing("would block start");
+        let r = make_resource_with_validate(
+            "nginx.service",
+            ServiceState::Running,
+            false,
+            vec!["nginx".into(), "-t".into()],
+        );
+        let (_tmp, ctx) = make_ctx_with_systemd_and_validator(
+            Some(mock.clone()),
+            validator.clone() as Arc<dyn ValidateRunner>,
+        );
+
+        let report = run(&r, &force_update(&r), &ctx).unwrap();
+        assert!(report.changed);
+        // validator НЕ должен быть вызван.
+        assert!(validator.calls().is_empty(),);
+    }
+
+    #[test]
+    fn no_validate_with_path_unchanged() {
+        // Без validate_with restart-defer enqueue'ится напрямую.
+        let mock = Arc::new(MockSystemd::new());
+        mock.enqueue_unit_info(Ok(make_unit("nginx", "active", "abc")));
+        let validator = MockValidator::ok();
+        let r = {
+            let mut r = make_resource("nginx.service", ServiceState::Running, false);
+            let src_kind = ResourceKind::from_static("file.content");
+            r.restart_on
+                .push(ResourceId::new(&src_kind, "/etc/nginx.conf"));
+            r
+        };
+        let (tmp, ctx) = make_ctx_with_systemd_and_validator(
+            Some(mock.clone()),
+            validator.clone() as Arc<dyn ValidateRunner>,
+        );
+        ctx.record_changed(&r.restart_on[0]);
+
+        let report = run(&r, &force_update(&r), &ctx).unwrap();
+        assert!(report.deferred);
+        assert!(validator.calls().is_empty());
+        let entries: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".deferred"))
+            .collect();
+        assert_eq!(entries.len(), 1);
     }
 }

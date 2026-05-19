@@ -16,6 +16,7 @@ pub mod resource;
 pub mod sensitive;
 pub mod starlark_glue;
 pub mod unit_name;
+pub mod validate;
 // Тестовая утилита для tracing-recording. Не должна попадать в
 // production-сборку, но крайне нужна в `#[cfg(test)]` соседних крейтов
 // — там примитивы прогоняют apply под per-thread recorder'ом. Поэтому
@@ -46,3 +47,6 @@ pub use starlark_glue::{
     default_template_fn, evaluate_manifest, EvaluatorConfig, StarlarkGlueError, TemplateFn,
 };
 pub use unit_name::{UnitName, UnitNameError, UNIT_NAME_MAX_BYTES};
+pub use validate::{
+    substitute_new_path, RealValidateRunner, ValidateError, ValidateRunner, STDERR_EXCERPT_LIMIT,
+};
