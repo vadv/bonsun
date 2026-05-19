@@ -19,10 +19,10 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use bosun_handles::{RunrHandle, ServiceStatus, SystemdHandle, TimerStatus};
+use bosun_handles::{RunrHandle, SystemdHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::defers::Journal;
@@ -63,13 +63,13 @@ pub struct PlanCtx {
 /// не требует ручной синхронизации (даже с однопоточным apply это
 /// корректно — атомарный compare-and-set дешёв).
 ///
-/// `runr_service_statuses` — кэш ответа `runr.service_statuses()` на весь
-/// apply: одного HTTP-call'а хватает на сравнение plan/apply для всех
-/// `runr.service` ресурсов в манифесте. `OnceLock` обеспечивает lazy-init и
-/// безопасную инициализацию single-shot.
-///
-/// `runr_timer_statuses` — аналогичный кэш для `runr.timer_statuses()`:
-/// на 10 таймерах в одном bundle экономит 9 HTTP round-trip'ов.
+/// Снимки состояния от runr/systemd (`service_statuses`, `timer_statuses`,
+/// `unit_info`) **не кэшируются** в ApplyCtx. Каждый примитив делает свой
+/// read-only вызов перед apply: HTTP к runr и dbus к systemd дёшевы
+/// (loopback и локальный сокет), а кэш per-apply ломает кросс-ресурсные
+/// notify-цепочки — primitive, ловящий `restart_on` после синхронного
+/// `service_start` соседа, должен видеть post-start snapshot, не stale
+/// pre-start версию. См. memory `feedback_bosun_no_cache_for_runr_systemd`.
 ///
 /// `validator` — исполнитель `validate_with`-команд. Передаётся в Arc, чтобы
 /// тесты подменяли spawn без зависимости от системных бинарей.
@@ -114,12 +114,6 @@ pub struct ApplyCtx {
     pub runr_daemon_reload_done: Arc<AtomicBool>,
     /// Throttle для `systemd.daemon_reload()` — один вызов на apply.
     pub systemd_daemon_reload_done: Arc<AtomicBool>,
-    /// Кэш ответа `runr.service_statuses()` на весь apply. См. описание
-    /// поля.
-    pub runr_service_statuses: Arc<OnceLock<Vec<ServiceStatus>>>,
-    /// Кэш ответа `runr.timer_statuses()` на весь apply. См. описание
-    /// поля.
-    pub runr_timer_statuses: Arc<OnceLock<Vec<TimerStatus>>>,
     /// Исполнитель `validate_with`-команд (`nginx -t`, etc). В production
     /// CLI собирает `RealValidateRunner`; в тестах примитивы подменяют
     /// mock, который записывает argv и возвращает заранее заданный
@@ -400,8 +394,6 @@ impl ApplyCtxBuilder {
             systemd: self.systemd,
             runr_daemon_reload_done: Arc::new(AtomicBool::new(false)),
             systemd_daemon_reload_done: Arc::new(AtomicBool::new(false)),
-            runr_service_statuses: Arc::new(OnceLock::new()),
-            runr_timer_statuses: Arc::new(OnceLock::new()),
             validator: self
                 .validator
                 .unwrap_or_else(|| Arc::new(RealValidateRunner)),

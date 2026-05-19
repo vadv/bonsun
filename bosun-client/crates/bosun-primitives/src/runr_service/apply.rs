@@ -6,8 +6,11 @@
 //! 2. Throttle `daemon_reload`: первый ресурс на apply вызывает
 //!    `runr.daemon_reload()`, остальные пропускают (флаг в
 //!    `ApplyCtx.runr_daemon_reload_done`).
-//! 3. Сделать snapshot всех сервисов один раз: вызов `service_statuses`
-//!    кэшируется в `ApplyCtx.runr_service_statuses` (OnceLock).
+//! 3. Запросить свежий snapshot `service_statuses` для каждого ресурса.
+//!    Кэш per-apply отсутствует намеренно: HTTP к runr на loopback стоит
+//!    миллисекунды, а stale snapshot ломает кросс-ресурсные notify —
+//!    primitive, ловящий `restart_on` после синхронного `service_start`
+//!    соседа, должен видеть post-start состояние.
 //! 4. Прогнать `decide_action_runr(spec, snapshot, notify-флаги)`.
 //! 5. На `Action::Restart` / `Action::Reload` — enqueue defer ДО реального
 //!    вызова runr (at-least-once: при крэше после enqueue replay подберёт).
@@ -100,8 +103,12 @@ pub fn run(
         }
     }
 
-    // 2. Snapshot service statuses (один HTTP-call на весь apply).
-    let statuses = get_or_fetch_statuses(runr.as_ref(), &ctx.runr_service_statuses)?;
+    // 2. Свежий snapshot service_statuses под этот ресурс. Без кэша:
+    // соседний primitive мог только что синхронно стартануть/остановить
+    // сервис, и notify-логика должна видеть post-call состояние.
+    let statuses = runr
+        .service_statuses()
+        .map_err(|e| map_runr_error(e, runr.base_url(), "service_statuses"))?;
     let current = statuses.iter().find(|s| s.name == spec.name.as_str());
 
     // 3. Тригеры notify из `restart_on` / `reload_on`.
@@ -267,25 +274,6 @@ fn map_validate_error(err: ValidateError, validator: &str) -> PrimitiveError {
         validator: validator.to_string(),
         stderr_excerpt,
     }
-}
-
-/// Получить snapshot service_statuses один раз на apply. Кэшируется в
-/// `OnceLock`. Ошибка transport → RunrUnavailable, остальные → Apply.
-fn get_or_fetch_statuses<R: bosun_handles::RunrHandle + ?Sized>(
-    runr: &R,
-    cache: &std::sync::OnceLock<Vec<ServiceStatus>>,
-) -> Result<Vec<ServiceStatus>, PrimitiveError> {
-    if let Some(cached) = cache.get() {
-        return Ok(cached.clone());
-    }
-    let fresh = runr
-        .service_statuses()
-        .map_err(|e| map_runr_error(e, runr.base_url(), "service_statuses"))?;
-    // get_or_init может проиграть гонку (если кто-то параллельно тоже
-    // дёргал runr), но это безопасно: значения от двух одинаковых snapshot'ов
-    // эквивалентны для нашей цели.
-    let stored = cache.get_or_init(|| fresh.clone());
-    Ok(stored.clone())
 }
 
 /// Синхронно запустить unit и убедиться, что он добрался до `Running`.
@@ -1018,9 +1006,11 @@ mod tests {
     }
 
     #[test]
-    fn apply_service_statuses_cached_once_per_apply() {
-        // Несколько runr.service ресурсов в одном apply должны брать snapshot
-        // ровно один раз через ctx.runr_service_statuses (OnceLock).
+    fn apply_calls_service_statuses_once_per_resource() {
+        // Снимок service_statuses делается на каждый ресурс отдельно: кэш
+        // снят, чтобы кросс-ресурсные notify видели свежие состояния (после
+        // start/stop соседнего primitive). Здесь фиксируем именно эту
+        // инвариант: два ресурса дают ровно два HTTP-вызова.
         let mock = Arc::new(MockRunr::new(vec![
             status("a", "Running", 0),
             status("b", "Running", 0),
@@ -1037,8 +1027,8 @@ mod tests {
             .count();
         assert_eq!(
             snapshot_calls,
-            1,
-            "service_statuses должен быть вызван один раз, calls: {:?}",
+            2,
+            "service_statuses ожидается ровно по одному на ресурс, calls: {:?}",
             mock.calls()
         );
     }

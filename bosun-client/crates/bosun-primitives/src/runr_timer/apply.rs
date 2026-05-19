@@ -3,13 +3,14 @@
 //! Логика проще, чем для service: таймеры не требуют notify-семантики,
 //! enable/disable — desired-state операции. Все вызовы синхронные.
 //!
-//! Snapshot всех таймеров берётся один раз на apply и кэшируется в
-//! `ApplyCtx.runr_timer_statuses` (OnceLock), симметрично
-//! `runr_service_statuses` — на 10 таймерах в одном bundle экономит 9
-//! HTTP round-trip'ов.
+//! Snapshot `timer_statuses` запрашивается заново на каждый ресурс. Кэш
+//! per-apply снят сознательно (см. `runr_service::apply` и memory
+//! `feedback_bosun_no_cache_for_runr_systemd`): HTTP к runr на loopback
+//! дёшев, а stale snapshot мешает корректно реагировать на изменения,
+//! которые соседние примитивы сделали в этом же apply.
 
 use bosun_core::{ApplyCtx, ChangeReport, Diff, PrimitiveError, Resource};
-use bosun_runr_client::{RunrError, TimerStatus};
+use bosun_runr_client::RunrError;
 
 use super::plan::{decide_timer_action, TimerAction};
 use super::spec::RunrTimerSpec;
@@ -31,7 +32,9 @@ pub fn run(
         });
     };
 
-    let timers = get_or_fetch_timer_statuses(runr.as_ref(), &ctx.runr_timer_statuses)?;
+    let timers = runr
+        .timer_statuses()
+        .map_err(|e| map_runr_error(e, runr.base_url(), "timer_statuses"))?;
     let current = timers.iter().find(|t| t.name == spec.name);
     let action = decide_timer_action(&spec, current);
 
@@ -65,25 +68,6 @@ pub fn run(
             )))
         }
     }
-}
-
-/// Получить snapshot timer_statuses один раз на apply. Кэшируется в
-/// `OnceLock` на ApplyCtx. Симметрично `runr_service::get_or_fetch_statuses`.
-/// Ошибки transport → RunrUnavailable, остальные → Apply.
-fn get_or_fetch_timer_statuses<R: bosun_handles::RunrHandle + ?Sized>(
-    runr: &R,
-    cache: &std::sync::OnceLock<Vec<TimerStatus>>,
-) -> Result<Vec<TimerStatus>, PrimitiveError> {
-    if let Some(cached) = cache.get() {
-        return Ok(cached.clone());
-    }
-    let fresh = runr
-        .timer_statuses()
-        .map_err(|e| map_runr_error(e, runr.base_url(), "timer_statuses"))?;
-    // get_or_init может проиграть гонку (два параллельных apply), но
-    // snapshot'ы эквивалентны для текущей цели — берём что есть в кэше.
-    let stored = cache.get_or_init(|| fresh.clone());
-    Ok(stored.clone())
 }
 
 /// Маппинг идентичен `runr_service::apply::map_runr_error`. Вынесено в
@@ -127,6 +111,7 @@ mod tests {
     use bosun_core::defers::Journal;
     use bosun_core::{ApplyCtx, Diff, Resource, ResourceId, ResourceKind, SensitiveStore};
     use bosun_handles::{ActionAck, DaemonInfo, RunrHandle, ServiceStatus, UnitListItem};
+    use bosun_runr_client::TimerStatus;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
@@ -292,9 +277,10 @@ mod tests {
     }
 
     #[test]
-    fn apply_caches_timer_statuses_across_resources() {
-        // Два таймера в одном ctx → timer_statuses должен быть вызван
-        // ровно один раз (OnceLock-кэш).
+    fn apply_calls_timer_statuses_once_per_resource() {
+        // Кэш per-apply снят: каждый ресурс делает свой свежий
+        // timer_statuses, чтобы видеть изменения соседних примитивов в
+        // том же прогоне. Фиксируем именно N запросов на N ресурсов.
         let mock = Arc::new(MockRunr::new(vec![
             status("a.timer", Some(false)),
             status("b.timer", Some(false)),
@@ -306,8 +292,8 @@ mod tests {
         }
         assert_eq!(
             mock.timer_statuses_count.load(Ordering::Acquire),
-            1,
-            "timer_statuses должен быть вызван 1 раз, calls: {:?}",
+            2,
+            "timer_statuses ожидается ровно по одному на ресурс, calls: {:?}",
             mock.calls()
         );
     }
