@@ -66,6 +66,22 @@ fn apt_namespace(builder: &mut GlobalsBuilder) {
     ) -> starlark::Result<Value<'v>> {
         register_primitive_call("apt.package", kwargs, eval)
     }
+
+    /// `apt.update_cache(name=, max_age_sec=?, force=?,
+    /// cleanup_old_debs_days=?, skip_cleanup=?)` — ленивый `apt-get update`.
+    ///
+    /// План смотрит mtime `/var/cache/apt/pkgcache.bin`; если кеш моложе
+    /// `max_age_sec` (default 3600) и `force=false` — пропускает действие.
+    /// После успешного update'а удаляет `.deb` из
+    /// `/var/cache/apt/archives` старше `cleanup_old_debs_days` дней
+    /// (default 1). chiit-аналог — `apt.Update` + `find ... -mtime +1
+    /// -name "*.deb" -delete`.
+    fn update_cache<'v>(
+        #[starlark(kwargs)] kwargs: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        register_primitive_call("apt.update_cache", kwargs, eval)
+    }
 }
 
 #[starlark_module]
@@ -828,6 +844,7 @@ fn register_primitive_call<'v>(
 
     let kind = match kind_str {
         "apt.package" => ResourceKind::from_static("apt.package"),
+        "apt.update_cache" => ResourceKind::from_static("apt.update_cache"),
         "cert.tls" => ResourceKind::from_static("cert.tls"),
         "file.content" => ResourceKind::from_static("file.content"),
         "file.delete" => ResourceKind::from_static("file.delete"),

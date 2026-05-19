@@ -6,6 +6,7 @@
 //! `file.delete`/`file.symlink` (+ `apt.package` state=absent/purged).
 
 pub mod apt_package;
+pub mod apt_update_cache;
 pub mod cert_tls;
 pub mod dispatch;
 pub mod file_content;
@@ -26,6 +27,9 @@ pub mod users_group;
 pub mod users_user;
 
 pub use apt_package::{AptPackageSpec, AptPackageState, AptPrimitive};
+pub use apt_update_cache::{
+    AptCacheBackend, AptUpdateCachePrimitive, AptUpdateCacheSpec, RealAptCacheBackend,
+};
 pub use cert_tls::{
     decide_action_cert, Action as CertTlsAction, CertAlgorithm, CertTlsPrimitive, CertTlsSpec,
 };

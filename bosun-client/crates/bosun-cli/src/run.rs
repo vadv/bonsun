@@ -23,11 +23,11 @@ use bosun_core::{
 use bosun_facts::FactsCollector;
 use bosun_handles::{RunrHandle, SystemdHandle};
 use bosun_primitives::{
-    dispatch::RealDispatchClient, template::render_template, AptPrimitive, CertTlsPrimitive,
-    FileDeletePrimitive, FilePrimitive, FileSymlinkPrimitive, GroupPrimitive, PgSqlExecPrimitive,
-    PgSqlQueryPrimitive, ProcessSignalPrimitive, RealHealthCheckRunner, RunrCgroupPrimitive,
-    RunrServicePrimitive, RunrTimerPrimitive, SystemdServicePrimitive, SystemdTimerPrimitive,
-    UserPrimitive,
+    dispatch::RealDispatchClient, template::render_template, AptPrimitive, AptUpdateCachePrimitive,
+    CertTlsPrimitive, FileDeletePrimitive, FilePrimitive, FileSymlinkPrimitive, GroupPrimitive,
+    PgSqlExecPrimitive, PgSqlQueryPrimitive, ProcessSignalPrimitive, RealHealthCheckRunner,
+    RunrCgroupPrimitive, RunrServicePrimitive, RunrTimerPrimitive, SystemdServicePrimitive,
+    SystemdTimerPrimitive, UserPrimitive,
 };
 use bosun_runr_client::Client as RunrClient;
 use bosun_systemd_client::BlockingSystemdManager;
@@ -481,6 +481,10 @@ fn build_primitives() -> HashMap<ResourceKind, Box<dyn Primitive>> {
         Box::new(AptPrimitive::new()),
     );
     m.insert(
+        ResourceKind::from_static("apt.update_cache"),
+        Box::new(AptUpdateCachePrimitive::with_real_backend()),
+    );
+    m.insert(
         ResourceKind::from_static("cert.tls"),
         Box::new(CertTlsPrimitive),
     );
@@ -824,6 +828,7 @@ mod tests {
         let m = build_primitives();
         for kind in [
             "apt.package",
+            "apt.update_cache",
             "cert.tls",
             "file.content",
             "file.delete",
@@ -844,7 +849,7 @@ mod tests {
                 "primitive {kind} not registered",
             );
         }
-        assert_eq!(m.len(), 15);
+        assert_eq!(m.len(), 16);
     }
 
     #[test]

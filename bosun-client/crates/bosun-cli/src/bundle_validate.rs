@@ -160,6 +160,13 @@ fn build_validate_primitives() -> HashMap<ResourceKind, Box<dyn Primitive>> {
         }),
     );
     m.insert(
+        ResourceKind::from_static("apt.update_cache"),
+        Box::new(NoopPrimitive {
+            kind: "apt.update_cache",
+            identity_keys: &["name"],
+        }),
+    );
+    m.insert(
         ResourceKind::from_static("file.content"),
         Box::new(NoopPrimitive {
             kind: "file.content",

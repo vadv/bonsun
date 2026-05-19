@@ -12,7 +12,7 @@
 
 mod apply;
 pub mod exec;
-mod lock_probe;
+pub(crate) mod lock_probe;
 mod plan;
 pub mod recovery;
 mod spec;
