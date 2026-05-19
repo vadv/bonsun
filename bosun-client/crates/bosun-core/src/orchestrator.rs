@@ -1991,4 +1991,57 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, RegistryError::Cycle { .. }));
     }
+
+    // ---- panic_message ----
+
+    #[test]
+    fn panic_message_from_str_static_payload() {
+        // panic с &'static str — downcast_ref::<&'static str> срабатывает,
+        // содержимое возвращается как String.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            panic!("static text panic");
+        }));
+        let payload = match result {
+            Ok(()) => panic!("closure should have panicked"),
+            Err(p) => p,
+        };
+        let msg = panic_message(payload.as_ref());
+        assert_eq!(msg, "static text panic");
+    }
+
+    #[test]
+    fn panic_message_from_string_payload() {
+        // panic с String — &'static str downcast не сработает,
+        // String downcast возвращает clone содержимого. Без этой ветки
+        // оператор бы видел маркер «non-string panic payload» вместо
+        // реального сообщения, что критично при сбоях с динамически
+        // отформатированным текстом (например, panic!("{e}")).
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let owned: String = format!("dynamic {}", "panic");
+            panic!("{owned}");
+        }));
+        let payload = match result {
+            Ok(()) => panic!("closure should have panicked"),
+            Err(p) => p,
+        };
+        let msg = panic_message(payload.as_ref());
+        assert_eq!(msg, "dynamic panic");
+    }
+
+    #[test]
+    fn panic_message_from_non_string_payload_returns_fallback_marker() {
+        // panic с произвольным non-string значением — ни один downcast
+        // не сработает, возвращается специальный маркер. Это даёт
+        // оператору сигнал «упало не строковым payload» вместо
+        // непрозрачной пустой строки.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::panic::panic_any(42_u64);
+        }));
+        let payload = match result {
+            Ok(()) => panic!("closure should have panicked"),
+            Err(p) => p,
+        };
+        let msg = panic_message(payload.as_ref());
+        assert_eq!(msg, "<non-string panic payload>");
+    }
 }
