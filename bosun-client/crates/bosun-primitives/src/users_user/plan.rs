@@ -235,4 +235,57 @@ mod tests {
             other => panic!("expected Update, got {other:?}"),
         }
     }
+
+    #[test]
+    fn collect_diffs_shell_only_mismatch_yields_single_diff() {
+        // Spec задаёт только shell, отличный от факта: остальные поля spec'а
+        // None, поэтому не должны порождать diff. Проверяем, что список ровно
+        // [Shell] и порядок зафиксирован.
+        let mut s = base_spec(UserState::Present);
+        s.shell = Some("/bin/zsh".into());
+        let action = decide_action_user(&s, Some(&info()));
+        match action {
+            Action::Update { diffs } => assert_eq!(diffs, vec![FieldDiff::Shell]),
+            other => panic!("expected Update with shell-only diff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collect_diffs_home_only_mismatch_yields_single_diff() {
+        let mut s = base_spec(UserState::Present);
+        s.home = Some(PathBuf::from("/elsewhere"));
+        let action = decide_action_user(&s, Some(&info()));
+        match action {
+            Action::Update { diffs } => assert_eq!(diffs, vec![FieldDiff::Home]),
+            other => panic!("expected Update with home-only diff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn collect_diffs_comment_only_mismatch_yields_single_diff() {
+        let mut s = base_spec(UserState::Present);
+        s.comment = Some("Different comment".into());
+        let action = decide_action_user(&s, Some(&info()));
+        match action {
+            Action::Update { diffs } => assert_eq!(diffs, vec![FieldDiff::Comment]),
+            other => panic!("expected Update with comment-only diff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_with_gid_fallback_name_yields_mismatch_when_spec_uses_name() {
+        // Когда /etc/group битый, getgrgid возвращает None → backend подставит
+        // "gid=N" вместо имени. spec.group = "postgres" даст Group-mismatch,
+        // потому что сравнение идёт по строке. Это намеренно — оператор
+        // увидит «несоответствие, нужно чинить /etc/group или GID».
+        let mut s = base_spec(UserState::Present);
+        s.group = Some("postgres".into());
+        let mut bad_info = info();
+        bad_info.primary_group_name = "gid=5432".into();
+        let action = decide_action_user(&s, Some(&bad_info));
+        match action {
+            Action::Update { diffs } => assert_eq!(diffs, vec![FieldDiff::Group]),
+            other => panic!("expected Update with group-only diff, got {other:?}"),
+        }
+    }
 }

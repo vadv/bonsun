@@ -319,4 +319,202 @@ mod tests {
             );
         }
     }
+
+    // -- маппинг ошибок ------------------------------------------------------
+    //
+    // `map_runr_error` дублирует логику runr_service::apply::map_runr_error,
+    // но имеет свою копию (private). Поэтому тесты повторяем — регрессия в
+    // одной копии не отлавливается тестом другой.
+
+    #[test]
+    fn map_runr_error_unavailable_is_runr_unavailable_deferrable() {
+        let err = RunrError::Unavailable {
+            base_url: "http://mock".into(),
+            source: Box::new(std::io::Error::other("refused")),
+        };
+        let mapped = map_runr_error(err, "http://mock", "timer_enable");
+        assert!(mapped.is_deferrable());
+        assert!(matches!(mapped, PrimitiveError::RunrUnavailable { .. }));
+    }
+
+    #[test]
+    fn map_runr_error_not_found_is_apply() {
+        let err = RunrError::NotFound {
+            kind: "timer".into(),
+            name: "nope.timer".into(),
+        };
+        let mapped = map_runr_error(err, "http://mock", "timer_disable");
+        assert!(!mapped.is_deferrable());
+        match mapped {
+            PrimitiveError::Apply { reason } => {
+                assert!(reason.contains("nope.timer"), "reason: {reason}");
+                assert!(reason.contains("timer_disable"), "op: {reason}");
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_runr_error_api_error_is_apply_with_status_and_body() {
+        let err = RunrError::ApiError {
+            status: 502,
+            body: "gateway error".into(),
+        };
+        let mapped = map_runr_error(err, "http://mock", "timer_enable");
+        assert!(!mapped.is_deferrable());
+        match mapped {
+            PrimitiveError::Apply { reason } => {
+                assert!(reason.contains("502"), "status: {reason}");
+                assert!(reason.contains("gateway error"), "body: {reason}");
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_runr_error_bad_response_is_apply() {
+        let err = RunrError::BadResponse("schema mismatch".into());
+        let mapped = map_runr_error(err, "http://mock", "timer_statuses");
+        assert!(!mapped.is_deferrable());
+        assert!(matches!(mapped, PrimitiveError::Apply { .. }));
+    }
+
+    #[test]
+    fn map_runr_error_restart_not_observed_is_apply() {
+        // У таймера эта ошибка маловероятна (verify_restart не вызывается),
+        // но через map проходит и должна попасть в Apply, не deferrable.
+        let err = RunrError::RestartNotObserved {
+            unit: "x.timer".into(),
+        };
+        let mapped = map_runr_error(err, "http://mock", "op");
+        assert!(!mapped.is_deferrable());
+        match mapped {
+            PrimitiveError::Apply { reason } => {
+                assert!(reason.contains("x.timer"), "reason: {reason}");
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_runr_error_io_is_runr_unavailable_deferrable() {
+        let err = RunrError::Io(std::io::Error::other("EOF"));
+        let mapped = map_runr_error(err, "http://mock", "timer_stop");
+        assert!(mapped.is_deferrable());
+        match mapped {
+            PrimitiveError::RunrUnavailable { base_url, .. } => {
+                assert_eq!(base_url, "http://mock");
+            }
+            other => panic!("expected RunrUnavailable, got {other:?}"),
+        }
+    }
+
+    // -- apply paths: Enable / Disable / StopAndDisable -----------------------
+
+    /// Спец для теста с настраиваемым start_now (фикстура make_resource
+    /// зафиксирован на false).
+    fn resource_with_start_now(name: &str, state: TimerState, start_now: bool) -> Resource {
+        let kind = ResourceKind::from_static("runr.timer");
+        let id = ResourceId::new(&kind, name);
+        let state_str = match state {
+            TimerState::Enabled => "enabled",
+            TimerState::Disabled => "disabled",
+            TimerState::Absent => "absent",
+        };
+        Resource {
+            id,
+            kind,
+            spec_version: 1,
+            payload: serde_json::json!({
+                "name": name,
+                "state": state_str,
+                "start_now": start_now,
+            }),
+            reload_on: Vec::new(),
+            restart_on: Vec::new(),
+            depends_on: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn apply_enable_calls_timer_enable_with_start_now_true_flag() {
+        // Таймер выключен, spec.state=Enabled, start_now=true → ожидаем один
+        // вызов timer_enable:x.timer:true и ни одного start/stop/disable.
+        let mock = Arc::new(MockRunr::new(vec![status("x.timer", Some(false))]));
+        let r = resource_with_start_now("x.timer", TimerState::Enabled, true);
+        let (_tmp, ctx) = make_ctx(Some(mock.clone()));
+        let report = run(&r, &force_update(&r), &ctx).unwrap();
+        assert!(report.changed);
+        let calls = mock.calls();
+        assert!(
+            calls.iter().any(|c| c == "timer_enable:x.timer:true"),
+            "ожидался timer_enable:x.timer:true, got {calls:?}"
+        );
+        for forbidden in &["timer_start", "timer_stop", "timer_disable"] {
+            assert!(
+                !calls.iter().any(|c| c.starts_with(forbidden)),
+                "{forbidden} не должен вызываться на Enable path, got {calls:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_enable_calls_timer_enable_with_start_now_false_flag() {
+        let mock = Arc::new(MockRunr::new(vec![status("x.timer", Some(false))]));
+        let r = resource_with_start_now("x.timer", TimerState::Enabled, false);
+        let (_tmp, ctx) = make_ctx(Some(mock.clone()));
+        let report = run(&r, &force_update(&r), &ctx).unwrap();
+        assert!(report.changed);
+        let calls = mock.calls();
+        assert!(
+            calls.iter().any(|c| c == "timer_enable:x.timer:false"),
+            "ожидался timer_enable:x.timer:false, got {calls:?}"
+        );
+    }
+
+    #[test]
+    fn apply_disable_calls_timer_disable_no_now_flag() {
+        // Таймер включён, spec=Disabled → timer_disable, без stop.
+        let mock = Arc::new(MockRunr::new(vec![status("x.timer", Some(true))]));
+        let r = make_resource("x.timer", TimerState::Disabled);
+        let (_tmp, ctx) = make_ctx(Some(mock.clone()));
+        let report = run(&r, &force_update(&r), &ctx).unwrap();
+        assert!(report.changed);
+        let calls = mock.calls();
+        // timer_disable:name:now — для Disable передаём now=false.
+        assert!(
+            calls.iter().any(|c| c == "timer_disable:x.timer:false"),
+            "ожидался timer_disable:x.timer:false, got {calls:?}"
+        );
+        // timer_stop не должен вызываться (для Disable только disable).
+        assert!(
+            !calls.iter().any(|c| c.starts_with("timer_stop")),
+            "timer_stop не должен вызываться на Disable path, got {calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.starts_with("timer_enable")));
+    }
+
+    #[test]
+    fn apply_stop_and_disable_calls_stop_then_disable_in_that_order() {
+        // Таймер включён, spec=Absent → stop первым, disable вторым.
+        // Порядок принципиален: между stop и disable не должен отлететь тик.
+        let mock = Arc::new(MockRunr::new(vec![status("x.timer", Some(true))]));
+        let r = make_resource("x.timer", TimerState::Absent);
+        let (_tmp, ctx) = make_ctx(Some(mock.clone()));
+        let report = run(&r, &force_update(&r), &ctx).unwrap();
+        assert!(report.changed);
+        let calls = mock.calls();
+        let stop_idx = calls
+            .iter()
+            .position(|c| c == "timer_stop:x.timer")
+            .unwrap_or_else(|| panic!("ожидался timer_stop:x.timer, got {calls:?}"));
+        let disable_idx = calls
+            .iter()
+            .position(|c| c == "timer_disable:x.timer:true")
+            .unwrap_or_else(|| panic!("ожидался timer_disable:x.timer:true, got {calls:?}"));
+        assert!(
+            stop_idx < disable_idx,
+            "stop должен идти ДО disable, calls={calls:?}"
+        );
+    }
 }

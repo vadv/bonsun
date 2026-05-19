@@ -378,4 +378,136 @@ mod tests {
         assert!(calls.iter().any(|c| c == "enable_unit:x.timer"));
         assert!(calls.iter().any(|c| c == "start_unit:x.timer"));
     }
+
+    // -- маппинг ошибок ------------------------------------------------------
+    //
+    // `map_systemd_error` дублирован из systemd_service::apply без direct-тестов
+    // в systemd_timer (audit 2026-05-19). Регрессия в одной копии не отлавливается
+    // через тесты другой. Проверяем все 8 веток match'а.
+
+    #[test]
+    fn map_systemd_error_for_bus_unavailable_returns_systemd_unavailable() {
+        let err = SystemdError::BusUnavailable {
+            reason: "socket missing".into(),
+            source: zbus::Error::Address("unix:path=/nonexistent".into()),
+        };
+        let mapped = map_systemd_error(err, "unit_info");
+        assert!(mapped.is_deferrable());
+        match mapped {
+            PrimitiveError::SystemdUnavailable { reason } => {
+                assert!(reason.contains("unit_info"), "op: {reason}");
+                assert!(reason.contains("socket missing"), "reason inner: {reason}");
+            }
+            other => panic!("expected SystemdUnavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_systemd_error_for_dbus_returns_systemd_unavailable() {
+        let err = SystemdError::Dbus(zbus::Error::Failure("transient".into()));
+        let mapped = map_systemd_error(err, "start_unit");
+        assert!(mapped.is_deferrable());
+        match mapped {
+            PrimitiveError::SystemdUnavailable { reason } => {
+                assert!(reason.contains("dbus error"), "reason: {reason}");
+            }
+            other => panic!("expected SystemdUnavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_systemd_error_for_no_such_unit_returns_apply() {
+        let err = SystemdError::NoSuchUnit("ghost.timer".into());
+        let mapped = map_systemd_error(err, "enable_unit");
+        assert!(!mapped.is_deferrable());
+        match mapped {
+            PrimitiveError::Apply { reason } => {
+                assert!(reason.contains("ghost.timer"), "unit: {reason}");
+                assert!(reason.contains("enable_unit"), "op: {reason}");
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_systemd_error_for_authorization_denied_returns_apply_with_polkit_hint() {
+        let err = SystemdError::AuthorizationDenied {
+            action: "enable_unit".into(),
+            unit: "logrotate.timer".into(),
+        };
+        let mapped = map_systemd_error(err, "enable_unit");
+        assert!(!mapped.is_deferrable());
+        match mapped {
+            PrimitiveError::Apply { reason } => {
+                assert!(reason.contains("authorization denied"), "reason: {reason}");
+                assert!(reason.contains("logrotate.timer"), "unit: {reason}");
+                assert!(reason.contains("polkit"), "polkit-hint: {reason}");
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_systemd_error_for_job_failed_returns_apply() {
+        let err = SystemdError::JobFailed {
+            job: "/job/7".into(),
+            result: "failed".into(),
+            active_state: "failed".into(),
+        };
+        let mapped = map_systemd_error(err, "start_unit");
+        assert!(!mapped.is_deferrable());
+        match mapped {
+            PrimitiveError::Apply { reason } => {
+                assert!(reason.contains("job"), "reason: {reason}");
+                assert!(reason.contains("failed"), "result: {reason}");
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_systemd_error_for_restart_not_observed_returns_apply() {
+        let err = SystemdError::RestartNotObserved {
+            unit: "x.timer".into(),
+        };
+        let mapped = map_systemd_error(err, "restart_unit");
+        assert!(!mapped.is_deferrable());
+        match mapped {
+            PrimitiveError::Apply { reason } => {
+                assert!(reason.contains("x.timer"), "unit: {reason}");
+                assert!(reason.contains("not observed"), "reason: {reason}");
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_systemd_error_for_timeout_returns_systemd_unavailable() {
+        let err = SystemdError::Timeout(Duration::from_secs(30));
+        let mapped = map_systemd_error(err, "wait_for_job");
+        assert!(mapped.is_deferrable());
+        match mapped {
+            PrimitiveError::SystemdUnavailable { reason } => {
+                assert!(reason.contains("timeout"), "reason: {reason}");
+                assert!(reason.contains("wait_for_job"), "op: {reason}");
+            }
+            other => panic!("expected SystemdUnavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_systemd_error_for_io_returns_io_primitive_error() {
+        let err = SystemdError::Io(std::io::Error::other("bad fd"));
+        let mapped = map_systemd_error(err, "unit_info");
+        // Io — это не deferrable (deferrable=true только для Runr/Systemd
+        // Unavailable), но и не Apply.
+        assert!(!mapped.is_deferrable());
+        match mapped {
+            PrimitiveError::Io { context, .. } => {
+                assert!(context.contains("systemd"), "context: {context}");
+                assert!(context.contains("unit_info"), "op в context: {context}");
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
 }

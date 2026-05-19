@@ -1088,6 +1088,115 @@ mod tests {
         assert!(!mapped.is_deferrable());
     }
 
+    #[test]
+    fn map_runr_error_api_error_includes_status_and_body_in_reason() {
+        // 5xx от runr — non-deferrable Apply. Оператор должен видеть и status,
+        // и body: типичная причина — internal error внутри runr (например,
+        // bad unit file syntax), который без body не диагностировать.
+        let err = RunrError::ApiError {
+            status: 500,
+            body: "panic: bad unit file".into(),
+        };
+        let mapped = map_runr_error(err, "http://mock", "service_start");
+        assert!(!mapped.is_deferrable());
+        match mapped {
+            PrimitiveError::Apply { reason } => {
+                assert!(reason.contains("status=500"), "status: {reason}");
+                assert!(reason.contains("panic: bad unit file"), "body: {reason}");
+                assert!(reason.contains("service_start"), "op в сообщении: {reason}");
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_runr_error_bad_response_is_apply_not_deferrable() {
+        // BadResponse — runr вернул 2xx, но JSON битый/несоответствует схеме.
+        // Это сигнал расхождения версий, retry не поможет.
+        let err = RunrError::BadResponse("missing field `state`".into());
+        let mapped = map_runr_error(err, "http://mock", "service_statuses");
+        assert!(!mapped.is_deferrable());
+        match mapped {
+            PrimitiveError::Apply { reason } => {
+                assert!(reason.contains("invalid JSON"), "reason: {reason}");
+                assert!(reason.contains("missing field"), "reason: {reason}");
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_runr_error_io_is_runr_unavailable_deferrable() {
+        // Локальная I/O-ошибка при чтении потока ответа — трактуется как
+        // unavailable (transport problem), defer'абельна и попадёт в журнал.
+        let err = RunrError::Io(std::io::Error::other("connection reset by peer"));
+        let mapped = map_runr_error(err, "http://mock", "service_statuses");
+        assert!(mapped.is_deferrable());
+        match mapped {
+            PrimitiveError::RunrUnavailable { base_url, reason } => {
+                assert_eq!(base_url, "http://mock");
+                assert!(reason.contains("i/o error"), "reason: {reason}");
+                assert!(reason.contains("connection reset"), "reason: {reason}");
+            }
+            other => panic!("expected RunrUnavailable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_runr_error_restart_not_observed_is_apply() {
+        // verify_restart истёк без инкремента счётчика — runr принял команду,
+        // но рестарт не наблюдался. Это semantic-fail, не transport, поэтому
+        // Apply (non-deferrable).
+        let err = RunrError::RestartNotObserved {
+            unit: "nginx".into(),
+        };
+        let mapped = map_runr_error(err, "http://mock", "verify_restart");
+        assert!(!mapped.is_deferrable());
+        match mapped {
+            PrimitiveError::Apply { reason } => {
+                assert!(reason.contains("nginx"), "unit: {reason}");
+                assert!(reason.contains("not observed"), "reason: {reason}");
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_runr_error_start_not_observed_with_last_state_in_reason() {
+        // verify_start истёк, сервис не дошёл до Running. last_state помогает
+        // оператору отличить «застрял в Activating» от «упал в Failed».
+        let err = RunrError::StartNotObserved {
+            unit: "myapp".into(),
+            last_state: "Activating".into(),
+        };
+        let mapped = map_runr_error(err, "http://mock", "verify_start");
+        assert!(!mapped.is_deferrable());
+        match mapped {
+            PrimitiveError::Apply { reason } => {
+                assert!(reason.contains("myapp"), "unit: {reason}");
+                assert!(reason.contains("Activating"), "last_state: {reason}");
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_runr_error_service_start_failed_with_unit_in_reason() {
+        // Сервис перешёл в Failed — это явный crash, retry не имеет смысла.
+        let err = RunrError::ServiceStartFailed {
+            unit: "broken.service".into(),
+        };
+        let mapped = map_runr_error(err, "http://mock", "verify_start");
+        assert!(!mapped.is_deferrable());
+        match mapped {
+            PrimitiveError::Apply { reason } => {
+                assert!(reason.contains("broken.service"), "unit: {reason}");
+                assert!(reason.contains("Failed"), "reason: {reason}");
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
     // ===== Phase H: validate_with =====
 
     use bosun_core::{ValidateError, ValidateRunner};

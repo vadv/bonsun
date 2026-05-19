@@ -318,4 +318,30 @@ mod tests {
         let err = run(&r, &force_update_diff(&r), &ctx, &backend).unwrap_err();
         assert!(matches!(err, PrimitiveError::InvalidPayload(_)));
     }
+
+    /// Timeout-ошибка execute → Apply с упоминанием duration в reason.
+    /// Аудит 2026-05-19 отметил, что Timeout ветка map_backend_error покрыта
+    /// только косвенно; добавляем direct-тест.
+    #[test]
+    fn apply_timeout_error_in_execute_returns_apply_with_duration() {
+        let backend_inner = Arc::new(MockBackend::new());
+        *backend_inner.execute_result.lock().unwrap() =
+            Err(PgSqlError::Timeout(Duration::from_secs(45)));
+        let backend: Arc<dyn PgSqlBackend> = backend_inner.clone();
+        let r = make_resource(serde_json::json!({
+            "name": "vacuum",
+            "dsn": "postgres://u@h/d",
+            "sql": "VACUUM",
+        }));
+        let (_tmp, ctx) = make_ctx();
+        let err = run(&r, &force_update_diff(&r), &ctx, &backend).unwrap_err();
+        match err {
+            PrimitiveError::Apply { reason } => {
+                assert!(reason.contains("timed out"), "reason: {reason}");
+                assert!(reason.contains("45s"), "duration в reason: {reason}");
+                assert!(reason.contains("vacuum"), "name: {reason}");
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
 }

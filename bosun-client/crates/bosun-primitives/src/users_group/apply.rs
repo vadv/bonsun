@@ -409,4 +409,78 @@ mod tests {
         let report = run(&r, &Diff::NoChange, &ctx, &backend.clone().as_arc()).unwrap();
         assert!(!report.changed);
     }
+
+    // -- маппинг ошибок ------------------------------------------------------
+    //
+    // users_group::apply переиспользует users_user::apply::users_error_to_primitive.
+    // Проверяем, что ветки Lookup и InvalidName корректно протекают через apply
+    // как PrimitiveError. Backend выбрасывает Lookup/InvalidName — мы их видим
+    // в результате run.
+
+    /// Дополнительный mock-backend: lookup_group возвращает заданную ошибку.
+    /// Используется только в этих двух тестах, чтобы не разносить инфраструктуру.
+    struct ErrLookupBackend {
+        err: Mutex<Option<UsersError>>,
+    }
+
+    impl UsersBackend for ErrLookupBackend {
+        fn lookup_user(&self, _: &str) -> Result<Option<UserInfo>, UsersError> {
+            Ok(None)
+        }
+        fn lookup_group(&self, _: &str) -> Result<Option<GroupInfo>, UsersError> {
+            match self.err.lock().unwrap().take() {
+                Some(e) => Err(e),
+                None => Ok(None),
+            }
+        }
+        fn useradd(&self, _: &UserAddOpts) -> Result<(), UsersError> {
+            unimplemented!()
+        }
+        fn usermod(&self, _: &UserModOpts) -> Result<(), UsersError> {
+            unimplemented!()
+        }
+        fn userdel(&self, _: &str) -> Result<(), UsersError> {
+            unimplemented!()
+        }
+        fn groupadd(&self, _: &GroupAddOpts) -> Result<(), UsersError> {
+            unimplemented!()
+        }
+        fn groupmod(&self, _: &GroupModOpts) -> Result<(), UsersError> {
+            unimplemented!()
+        }
+        fn groupdel(&self, _: &str) -> Result<(), UsersError> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn apply_propagates_lookup_error_as_apply() {
+        // Если NSS-backend упал на lookup_group, apply должен вернуть
+        // PrimitiveError::Apply с target и reason в сообщении.
+        let backend: Arc<dyn UsersBackend> = Arc::new(ErrLookupBackend {
+            err: Mutex::new(Some(UsersError::Lookup {
+                target: "postgres".into(),
+                reason: "getgrnam: EIO".into(),
+            })),
+        });
+        let r = make_resource(serde_json::json!({
+            "name": "postgres",
+            "state": "present",
+        }));
+        let (_tmp, ctx) = make_ctx();
+        let err = run(&r, &force_update_diff(&r), &ctx, &backend).unwrap_err();
+        match err {
+            PrimitiveError::Apply { reason } => {
+                assert!(
+                    reason.contains("postgres"),
+                    "target должен попасть в reason: {reason}"
+                );
+                assert!(
+                    reason.contains("EIO"),
+                    "причина должна попасть в reason: {reason}"
+                );
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
 }

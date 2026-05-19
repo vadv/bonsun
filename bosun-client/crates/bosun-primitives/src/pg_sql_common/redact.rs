@@ -123,4 +123,38 @@ mod tests {
         );
         assert!(red.contains("password=*****"), "маркер должен быть: {red}");
     }
+
+    #[test]
+    fn empty_string_passes_through_without_panic() {
+        // Граничный случай: redact_dsn("") не должен паниковать и должен
+        // вернуть пустую строку. url::Url::parse("") → Err → key=value путь,
+        // split_whitespace → пусто, out — "".
+        let red = redact_dsn("");
+        assert_eq!(red, "", "пустой DSN → пустая строка, got {red:?}");
+    }
+
+    #[test]
+    fn kv_style_password_without_value_masks_to_marker() {
+        // `password=` без значения — corner-case libpq. Замена должна
+        // подменить остаток на маркер, не сохранить пустую строку как пароль.
+        let dsn = "host=h user=u password= dbname=d";
+        let red = redact_dsn(dsn);
+        assert!(red.contains("password=*****"), "маркер должен быть: {red}");
+        assert!(red.contains("dbname=d"));
+    }
+
+    #[test]
+    fn kv_style_multiple_password_tokens_all_masked() {
+        // Если в DSN несколько токенов с префиксом password= (хотя libpq
+        // возьмёт только последний) — мы маскируем каждый.
+        let dsn = "user=u password=first dbname=d password=second";
+        let red = redact_dsn(dsn);
+        assert!(!red.contains("first"), "first password утёк: {red}");
+        assert!(!red.contains("second"), "second password утёк: {red}");
+        assert_eq!(
+            red.matches("password=*****").count(),
+            2,
+            "оба токена должны быть замаскированы, got {red}"
+        );
+    }
 }

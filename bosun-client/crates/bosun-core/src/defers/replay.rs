@@ -709,6 +709,39 @@ mod tests {
     }
 
     #[test]
+    fn replay_with_stale_attempt_count_promotes_after_max_attempts() {
+        // Stale-state edge: запись на диске уже содержит attempt_count ==
+        // max_attempts (например, в прошлом цикле bump прошёл, а
+        // move_to_manual_clear упал из-за сбоя fs). Замысел: следующий
+        // replay-цикл должен заметить превышение и сразу промоутнуть, не
+        // оставляя запись болтаться в .deferred.
+        //
+        // Реализация: bump_attempt всё равно выполняется, и updated.attempt_count
+        // становится max+1, что >= max — триггерит ветку promotion. Эффект:
+        // запись попадает в .manual_clear, оператор увидит её в bosun status.
+        let (tmp, journal) = open();
+        let mut entry = make_entry(
+            "systemd",
+            DeferAction::Restart,
+            "nginx",
+            DeferPriority::Restart,
+            3,
+        );
+        entry.attempt_count = 3; // == max_attempts на старте.
+        journal.enqueue(entry).unwrap();
+
+        let client = FakeClient::new(|_| Err(DispatchError::Action("still failing".into())));
+        let report = replay(&journal, &client).unwrap();
+        assert_eq!(
+            report.promoted_to_manual_clear, 1,
+            "stale max-attempt запись должна промоутнуться"
+        );
+        assert_eq!(report.failed, 0, "promoted not failed: report={report:?}");
+        assert_eq!(count_files_with_extension(tmp.path(), "deferred"), 0);
+        assert_eq!(count_files_with_extension(tmp.path(), "manual_clear"), 1);
+    }
+
+    #[test]
     fn replay_with_hc_progresses_bump_attempt_across_multiple_cycles() {
         // E2E: три прогона replay подряд, каждый раз dispatch=Ok, hc=fail.
         // Первый цикл → attempt_count 0→1 (failed=1).

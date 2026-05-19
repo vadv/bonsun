@@ -226,4 +226,58 @@ mod tests {
             other => panic!("expected Apply, got {other:?}"),
         }
     }
+
+    /// Timeout в check'е → Apply. Аудит 2026-05-19: ветка Timeout
+    /// map_check_error покрывалась только через косвенный путь.
+    #[test]
+    fn plan_check_timeout_returns_apply() {
+        let backend: Arc<dyn PgSqlBackend> = Arc::new(
+            MockBackend::new().with_query_err(PgSqlError::Timeout(Duration::from_secs(10))),
+        );
+        let r = resource(serde_json::json!({
+            "name": "long-check",
+            "dsn": "postgres://u@h/d",
+            "sql": "INSERT INTO t VALUES (1)",
+            "if_not_exists_check": "SELECT 1",
+        }));
+        let err = compute_diff(&r, &EmptyFacts, &plan_ctx(), &backend).unwrap_err();
+        match err {
+            PrimitiveError::Apply { reason } => {
+                assert!(
+                    reason.contains("if_not_exists_check failed"),
+                    "reason: {reason}"
+                );
+                assert!(reason.contains("timed out"), "reason: {reason}");
+                assert!(reason.contains("long-check"), "name: {reason}");
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
+    /// Sql-ошибка в check'е → Apply, sqlstate видим в reason.
+    #[test]
+    fn plan_check_sql_with_sqlstate_in_reason() {
+        let backend: Arc<dyn PgSqlBackend> =
+            Arc::new(MockBackend::new().with_query_err(PgSqlError::Sql {
+                sqlstate: Some("42601".into()),
+                message: "syntax error at or near \"FROM\"".into(),
+            }));
+        let r = resource(serde_json::json!({
+            "name": "bad-check",
+            "dsn": "postgres://u@h/d",
+            "sql": "CREATE ROLE x",
+            "if_not_exists_check": "SELECT 1 FORM pg_roles",
+        }));
+        let err = compute_diff(&r, &EmptyFacts, &plan_ctx(), &backend).unwrap_err();
+        match err {
+            PrimitiveError::Apply { reason } => {
+                assert!(reason.contains("42601"), "sqlstate в reason: {reason}");
+                assert!(
+                    reason.contains("syntax error"),
+                    "message в reason: {reason}"
+                );
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
 }

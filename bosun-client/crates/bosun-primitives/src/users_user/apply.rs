@@ -605,4 +605,51 @@ mod tests {
             other => panic!("expected Exec, got {other:?}"),
         }
     }
+
+    #[test]
+    fn users_error_to_primitive_for_lookup_returns_apply_error() {
+        // Lookup-сбой от NSS-backend'а (битый /etc/passwd, EIO) — это
+        // operational issue, не bundle-баг: оператор должен починить
+        // окружение, а не правит spec. Мапим в Apply.
+        let err = users_error_to_primitive(UsersError::Lookup {
+            target: "postgres".into(),
+            reason: "getpwnam: EIO".into(),
+        });
+        match err {
+            PrimitiveError::Apply { reason } => {
+                assert!(
+                    reason.contains("postgres"),
+                    "target должен попасть в reason: {reason}"
+                );
+                assert!(
+                    reason.contains("EIO"),
+                    "причина должна попасть в reason: {reason}"
+                );
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn users_error_to_primitive_for_invalid_name_returns_invalid_payload() {
+        // InvalidName приходит из backend'а только при попытке записать имя,
+        // которое попало в обход validate_user_name. Это spec-баг.
+        let err = users_error_to_primitive(UsersError::InvalidName {
+            name: "bad name".into(),
+            reason: "contains space".into(),
+        });
+        match err {
+            PrimitiveError::InvalidPayload(msg) => {
+                assert!(
+                    msg.contains("bad name"),
+                    "имя должно попасть в сообщение: {msg}"
+                );
+                assert!(
+                    msg.contains("contains space"),
+                    "причина должна попасть в сообщение: {msg}"
+                );
+            }
+            other => panic!("expected InvalidPayload, got {other:?}"),
+        }
+    }
 }

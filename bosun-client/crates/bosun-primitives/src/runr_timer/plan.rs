@@ -139,4 +139,27 @@ mod tests {
         let a = decide_timer_action(&spec(TimerState::Enabled, false), None);
         assert_eq!(a, TimerAction::Enable { start_now: false });
     }
+
+    #[test]
+    fn disabled_when_unknown_is_no_change() {
+        // Таймер отсутствует в snapshot (или ещё не зарегистрирован) →
+        // enabled_now=false. desired=Disabled → NoChange.
+        let a = decide_timer_action(&spec(TimerState::Disabled, false), None);
+        assert_eq!(a, TimerAction::NoChange);
+    }
+
+    #[test]
+    fn absent_when_unknown_is_no_change() {
+        // Таймер отсутствует → enabled_now=false. desired=Absent → NoChange.
+        // Иначе попытка stop+disable вернула бы NotFound от runr.
+        let a = decide_timer_action(&spec(TimerState::Absent, false), None);
+        assert_eq!(a, TimerAction::NoChange);
+    }
+
+    #[test]
+    fn enabled_when_unknown_with_start_now_propagates_flag() {
+        // Покрывает start_now=true для unknown → enable_now сценария.
+        let a = decide_timer_action(&spec(TimerState::Enabled, true), None);
+        assert_eq!(a, TimerAction::Enable { start_now: true });
+    }
 }

@@ -260,6 +260,28 @@ mod tests {
     }
 
     #[test]
+    fn force_replaces_directory_with_symlink_removing_contents() {
+        // Между plan и apply по пути появилась директория (раса, или bundle
+        // переставили шаги). С force=true apply должен снять директорию
+        // рекурсивно и создать симлинк. Это покрывает ветку replace_symlink,
+        // где meta.file_type().is_dir() == true → remove_dir_all.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("was-dir");
+        std::fs::create_dir_all(path.join("inner")).unwrap();
+        std::fs::write(path.join("inner/leaf"), b"keep until removed").unwrap();
+        let r = make_resource(&path, "/target", "present", true);
+        let ctx = make_ctx();
+        let report = apply(&r, &update_diff(), &ctx).unwrap();
+        assert!(report.changed);
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.file_type().is_symlink(), "path должен стать симлинком");
+        let read = std::fs::read_link(&path).unwrap();
+        assert_eq!(read, PathBuf::from("/target"));
+        // Содержимого директории больше нет.
+        assert!(!path.join("inner").exists());
+    }
+
+    #[test]
     fn no_force_with_regular_file_returns_apply_error() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("was-file");
