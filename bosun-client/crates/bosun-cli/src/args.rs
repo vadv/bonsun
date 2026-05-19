@@ -20,6 +20,35 @@ pub enum Command {
     Version,
     /// Apply a bundle to the local system.
     Apply(ApplyArgs),
+    /// Bundle utilities (validate, ...).
+    Bundle(BundleCli),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct BundleCli {
+    #[command(subcommand)]
+    pub command: BundleSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BundleSubcommand {
+    /// Statically evaluate a bundle without touching the system.
+    Validate(BundleValidateArgs),
+}
+
+#[derive(Debug, clap::Args)]
+pub struct BundleValidateArgs {
+    /// Path to the bundle directory.
+    #[arg(long)]
+    pub bundle: PathBuf,
+
+    /// Comma-separated active tags.
+    #[arg(long, value_delimiter = ',')]
+    pub tags: Vec<String>,
+
+    /// Optional facts fixture (JSON).
+    #[arg(long)]
+    pub facts: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -28,9 +57,10 @@ pub struct ApplyArgs {
     #[arg(long)]
     pub bundle: PathBuf,
 
-    /// Path to a YAML inventory that overrides bundle defaults.
-    #[arg(long)]
-    pub inventory: Option<PathBuf>,
+    /// Comma-separated active tags (e.g. `--tags=production,canary`). CLI
+    /// dedups and sorts before passing to the evaluator.
+    #[arg(long, value_delimiter = ',')]
+    pub tags: Vec<String>,
 
     /// Run plan only, do not modify the system.
     #[arg(long, default_value_t = false)]
@@ -176,8 +206,8 @@ mod tests {
             "apply",
             "--bundle",
             "/b",
-            "--inventory",
-            "/i.yaml",
+            "--tags",
+            "production,canary",
             "--dry-run",
             "--continue-on-error",
             "--log-level",
@@ -211,8 +241,34 @@ mod tests {
         assert!(matches!(args.format, ReportFormat::Json));
         assert!(args.no_color);
         assert_eq!(args.deadline_sec, 30);
-        assert_eq!(args.inventory, Some(PathBuf::from("/i.yaml")));
+        assert_eq!(
+            args.tags,
+            vec!["production".to_string(), "canary".to_string()],
+        );
         assert_eq!(args.metric_file, PathBuf::from("/tmp/m.prom"));
+    }
+
+    #[test]
+    fn bundle_validate_parses_tags_csv() {
+        let cli = Cli::try_parse_from([
+            "bosun",
+            "bundle",
+            "validate",
+            "--bundle",
+            "/b",
+            "--tags",
+            "production,staging",
+        ])
+        .unwrap();
+        let Command::Bundle(bundle_cli) = cli.command else {
+            panic!("expected bundle subcommand")
+        };
+        let BundleSubcommand::Validate(args) = bundle_cli.command;
+        assert_eq!(args.bundle, PathBuf::from("/b"));
+        assert_eq!(
+            args.tags,
+            vec!["production".to_string(), "staging".to_string()]
+        );
     }
 
     #[test]

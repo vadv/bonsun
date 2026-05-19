@@ -18,7 +18,7 @@ fn apply_help_lists_all_documented_flags() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     for flag in [
         "--bundle",
-        "--inventory",
+        "--tags",
         "--dry-run",
         "--continue-on-error",
         "--log-level",

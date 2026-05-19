@@ -1,11 +1,13 @@
-//! Главный flow `bosun apply` per spec, секция «bosun-cli / Flow».
+//! Главный flow `bosun apply` per spec.
 //!
-//! Шаги 1-19 spec'а реализованы в одной функции `run`, потому что границы
-//! между ними — не самостоятельные единицы переиспользования. Каждый шаг
-//! пишет наблюдаемый эффект (директория, lock, файл метрики) и возвращает
-//! exit-код через значение, не через panic.
+//! Шаги повторяют MVP-flow, но:
+//! - `--inventory` убран; inventory полностью внутри bundle и грузится
+//!   через `inventory.load` в Starlark.
+//! - `--tags=production,canary` добавлен; CLI дедуплицирует и сортирует.
+//! - Активные тэги пишутся в Prometheus textfile (отдельный файл
+//!   `bosun_tags.prom`) и логируются на старте через `tracing::info!`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -25,10 +27,8 @@ use crate::bootstrap::{self, LockOutcome};
 use crate::exit_code;
 use crate::logging;
 use crate::metric::{self, FactStateEntry, MetricSnapshot};
+use crate::tags_metric;
 
-/// Список фактов, состояние которых публикуется в метрику. Порядок и
-/// набор зафиксированы для observability: scrape'ы 60k нод должны бить
-/// в одни и те же метрические серии.
 const TRACKED_FACTS: &[&str] = &[
     "hostname",
     "cpu_count",
@@ -38,14 +38,11 @@ const TRACKED_FACTS: &[&str] = &[
     "installed_packages",
 ];
 
-/// Выполнить `bosun apply` per spec. Возвращает exit-код. Никогда не
-/// panic'ует на ожидаемых ошибках — все маппятся в код.
 pub fn run(args: &ApplyArgs) -> i32 {
     let started = Instant::now();
     let started_utc = chrono::Utc::now().timestamp();
     let version = env!("CARGO_PKG_VERSION").to_string();
 
-    // Шаг 2: создание директорий ДО tracing init и flock.
     let lock_parent = args
         .lock_path
         .parent()
@@ -63,10 +60,6 @@ pub fn run(args: &ApplyArgs) -> i32 {
         return exit_code::CLI_ENV_ERROR;
     }
 
-    // Шаг 3: flock. На этом этапе tracing ещё не настроен — пишем в stderr
-    // напрямую. Это согласовано со spec: «WouldBlock → tracing::info» там
-    // приведено как иллюстрация, но без subscriber'а logger всё равно не
-    // вывел бы строку. Используем stderr.
     let _lock_guard = match bootstrap::try_flock(&args.lock_path) {
         Ok(LockOutcome::Acquired(g)) => g,
         Ok(LockOutcome::Held) => {
@@ -74,11 +67,6 @@ pub fn run(args: &ApplyArgs) -> i32 {
                 "bosun: another bosun instance holds {}, skipping",
                 args.lock_path.display(),
             );
-            // Метрика пишется даже при flock=Held: иначе оператор не отличит
-            // «бинарь сейчас стоит и работает» от «бинарь умер давно». Серия
-            // bosun_last_attempt_timestamp_seconds обновляется в любом
-            // запуске, поэтому алерт на её staleness ловит реально завис-
-            // шие cron-таймеры.
             let snapshot = MetricSnapshot {
                 version,
                 exit_code: exit_code::SUCCESS,
@@ -102,21 +90,25 @@ pub fn run(args: &ApplyArgs) -> i32 {
         }
     };
 
-    // Шаг 4: tracing init. После flock — чтобы повторные вызовы под одной
-    // блокировкой не приводили к двойной установке global subscriber'а.
     if let Err(e) = logging::init(args.log_level, args.log_format, args.no_color) {
         eprintln!("bosun: logging init failed: {e}");
         return exit_code::CLI_ENV_ERROR;
     }
 
-    // Шаг 6: cancellation token + signal handlers.
+    // Активные тэги: dedup + sort до передачи в evaluator.
+    let active_tags: BTreeSet<String> = args.tags.iter().cloned().collect();
+    let tags_for_eval: HashSet<String> = active_tags.iter().cloned().collect();
+    let tags_log: Vec<&str> = active_tags.iter().map(|s| s.as_str()).collect();
+    tracing::info!(active_tags = ?tags_log, "bosun: active tags");
+    if let Err(e) = tags_metric::write_atomic(&tags_metric_path(&args.metric_file), &active_tags) {
+        tracing::warn!(error = %e, "failed to write tags metric file");
+    }
+
     let cancel = CancellationToken::new();
     install_signal_handlers(cancel.clone());
 
-    // Шаг 5: deadline.
     let deadline = Instant::now() + Duration::from_secs(args.deadline_sec.into());
 
-    // Шаг 7: загрузка bundle.
     let bundle = match Bundle::load_dir(&args.bundle) {
         Ok(b) => b,
         Err(e) => {
@@ -125,51 +117,56 @@ pub fn run(args: &ApplyArgs) -> i32 {
         }
     };
 
-    // Шаг 8: semver-проверка.
     if let Err(e) = bundle.check_compatibility(&version) {
         tracing::error!(error = %e, "bundle requires different bosun version");
         return exit_code::EVAL_ERROR;
     }
 
-    // Шаг 9: inventory merge.
-    let inventory = match load_inventory_override(args.inventory.as_deref()) {
-        Ok(v) => bundle.merge_inventory(v),
-        Err(code) => return code,
-    };
-
-    // Шаг 10: facts.
     let facts = FactsCollector::with_default_collectors_path();
     facts.collect_at_start();
 
-    // Snapshot до Starlark-eval: эта же копия материализуется в JSON для
-    // template-рендера, чтобы шаблоны видели те же значения, что и
-    // манифест.
     let snapshot = facts.snapshot();
     let facts_json_for_templates = materialize_facts_json(&snapshot);
-    let templates_root = bundle.templates_root.clone();
-    let inventory_for_templates = inventory.clone();
-    let template_fn: TemplateFn = Rc::new(move |path: &str| {
-        render_template(
-            &templates_root,
-            path,
-            &inventory_for_templates,
-            &facts_json_for_templates,
-        )
-        .map_err(|e| anyhow::anyhow!(e))
-    });
+    let bundle_root_for_templates = bundle.root.clone();
+    let template_fn: TemplateFn = Rc::new(
+        move |resolved_path: &Path, _rel: &str, ctx: &serde_json::Value| {
+            // resolved_path — канонический абсолют под bundle root. render_template
+            // ожидает (templates_root, relative). Подкатегория «relative»
+            // считается строго в пределах role/lib templates/-директории.
+            let parent = resolved_path.parent().ok_or_else(|| {
+                anyhow::anyhow!("template: resolved path has no parent: {resolved_path:?}")
+            })?;
+            let file_name = resolved_path
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("template: resolved path has no file name"))?
+                .to_string_lossy()
+                .into_owned();
+            // `inv` для шаблона: берётся из kwargs `template(path, inv = ...)`,
+            // либо целиком ctx (если ctx — объект). Жирная семантика: ctx
+            // целиком кладётся как `inv`, если в нём нет ключа `inv`; иначе
+            // используется ctx.inv. Это даёт совместимость с legacy template'ами
+            // (`{{ inv.foo }}`) и новый стиль (`template(..., inv = ...)`).
+            let inv_value = match ctx {
+                serde_json::Value::Object(m) if m.contains_key("inv") => m["inv"].clone(),
+                other => other.clone(),
+            };
+            let _ = &bundle_root_for_templates;
+            render_template(parent, &file_name, &inv_value, &facts_json_for_templates)
+                .map_err(|e| anyhow::anyhow!(e))
+        },
+    );
 
-    // Шаг 11: primitives для evaluator.
     let evaluator_primitives = build_primitives();
 
-    // Шаг 12-13: evaluator → registry.
     let sensitive = Arc::new(SensitiveStore::new());
     let plan_ctx = PlanCtx::new(deadline, cancel.clone());
-    let evaluator = Evaluator::new(bundle, evaluator_primitives, inventory);
+    let evaluator = Evaluator::new(bundle, evaluator_primitives);
     let registry = match evaluator.evaluate(
         snapshot.clone(),
         sensitive.clone(),
         template_fn,
         plan_ctx.clone(),
+        tags_for_eval,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -178,11 +175,8 @@ pub fn run(args: &ApplyArgs) -> i32 {
         }
     };
 
-    // Шаг 14: orchestrator. Primitives регистрируем повторно — `Box<dyn
-    // Primitive>` не Clone, исходный map уехал в Evaluator.
     let orchestrator = Orchestrator::new(build_primitives());
 
-    // Шаг 15: plan vs apply.
     let apply_ctx = ApplyCtx::new(
         deadline,
         cancel.clone(),
@@ -226,9 +220,6 @@ pub fn run(args: &ApplyArgs) -> i32 {
         match orchestrator.apply(&registry, &view, &mark_dirty, &plan_ctx, &apply_ctx, opts) {
             Ok(report) => {
                 print_apply(&report, args.format);
-                // has_failures смотрит только на failed: Deferred сюда не
-                // попадает, exit-код остаётся SUCCESS при чисто транзиентных
-                // отказах.
                 let code = if report.has_failures() {
                     exit_code::APPLY_PARTIAL_FAILURE
                 } else {
@@ -249,7 +240,6 @@ pub fn run(args: &ApplyArgs) -> i32 {
         }
     };
 
-    // Шаг 16: метрика. Финальные значения после run.
     let duration = started.elapsed().as_secs_f64();
     let fact_states = build_fact_states(&facts);
     let snapshot = MetricSnapshot {
@@ -271,28 +261,15 @@ pub fn run(args: &ApplyArgs) -> i32 {
     exit
 }
 
-/// Прочитать override-inventory с диска. Возвращает Null при отсутствии
-/// флага, валидный JSON при успехе, exit-код при ошибке чтения/парсинга.
-fn load_inventory_override(path: Option<&Path>) -> Result<serde_json::Value, i32> {
-    let Some(path) = path else {
-        return Ok(serde_json::Value::Null);
-    };
-    let text = std::fs::read_to_string(path).map_err(|e| {
-        tracing::error!(error = %e, path = %path.display(), "reading inventory");
-        exit_code::EVAL_ERROR
-    })?;
-    let yaml: serde_norway::Value = serde_norway::from_str(&text).map_err(|e| {
-        tracing::error!(error = %e, path = %path.display(), "parsing inventory yaml");
-        exit_code::EVAL_ERROR
-    })?;
-    serde_json::to_value(yaml).map_err(|e| {
-        tracing::error!(error = %e, "converting inventory yaml to json");
-        exit_code::EVAL_ERROR
-    })
+/// Положить `bosun_tags.prom` в ту же директорию, что и `bosun.prom`.
+fn tags_metric_path(metric_file: &Path) -> PathBuf {
+    let parent = metric_file
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
+    parent.join("bosun_tags.prom")
 }
 
-/// Собрать material'изованную JSON-карту фактов для шаблонов. Snapshot
-/// перебирается через `FactsSource::get` для каждого имени из snapshot.names.
 fn materialize_facts_json(snapshot: &bosun_facts::FactsSnapshot) -> serde_json::Value {
     use bosun_core::FactsSource;
     let mut map = serde_json::Map::new();
@@ -302,9 +279,6 @@ fn materialize_facts_json(snapshot: &bosun_facts::FactsSnapshot) -> serde_json::
             FactValue::Known(v) => v,
             FactValue::Stale { value, .. } => value,
             FactValue::Unknown { .. } => serde_json::Value::Null,
-            // Forward-compat: новые FactValue-варианты в core безопасно
-            // материализуются как Null, пока шаблоны не научатся их
-            // обрабатывать.
             _ => serde_json::Value::Null,
         };
         map.insert(name.to_string(), json_value);
@@ -312,9 +286,6 @@ fn materialize_facts_json(snapshot: &bosun_facts::FactsSnapshot) -> serde_json::
     serde_json::Value::Object(map)
 }
 
-/// Сконструировать набор примитивов. Вынесено в функцию, потому что
-/// Evaluator и Orchestrator владеют ими отдельно — у `Box<dyn Primitive>`
-/// нет Clone, проще собрать два раза.
 fn build_primitives() -> HashMap<ResourceKind, Box<dyn Primitive>> {
     let mut m: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
     m.insert(
@@ -328,8 +299,6 @@ fn build_primitives() -> HashMap<ResourceKind, Box<dyn Primitive>> {
     m
 }
 
-/// Собрать состояние каждого зафиксированного факта для метрики. Snapshot
-/// берётся свежий, после возможного mark_dirty в apply.
 fn build_fact_states(collector: &FactsCollector) -> Vec<FactStateEntry> {
     let snapshot = collector.snapshot();
     use bosun_core::FactsSource;
@@ -340,8 +309,6 @@ fn build_fact_states(collector: &FactsCollector) -> Vec<FactStateEntry> {
                 FactValue::Known(_) => 0,
                 FactValue::Unknown { .. } => 1,
                 FactValue::Stale { .. } => 2,
-                // Forward-compat: новые состояния факта пока трактуем как
-                // Unknown в метрике, пока не появятся отдельные коды.
                 _ => 1,
             };
             FactStateEntry {
@@ -352,10 +319,6 @@ fn build_fact_states(collector: &FactsCollector) -> Vec<FactStateEntry> {
         .collect()
 }
 
-/// Установить обработчик SIGTERM/SIGINT через `signal-hook`. Отдельный поток
-/// дёргает `cancel.cancel()` при первом полученном сигнале и выходит.
-/// Второй сигнал уже не отменит ничего повторно (CancellationToken
-/// идемпотентен), но кооперативное завершение примитивов уже идёт.
 fn install_signal_handlers(cancel: CancellationToken) {
     let signals_result = signal_hook::iterator::Signals::new([
         signal_hook::consts::SIGTERM,
@@ -376,8 +339,6 @@ fn install_signal_handlers(cancel: CancellationToken) {
     });
 }
 
-/// Распечатать plan-отчёт в stdout. Логи остаются в stderr — это разделение
-/// каналов из spec («формат отчёта»).
 fn print_plan(report: &PlanReport, format: ReportFormat) {
     let mut out = std::io::stdout().lock();
     match format {
@@ -426,7 +387,6 @@ fn print_plan(report: &PlanReport, format: ReportFormat) {
     }
 }
 
-/// Распечатать apply-отчёт.
 fn print_apply(report: &ApplyReport, format: ReportFormat) {
     let mut out = std::io::stdout().lock();
     match format {
@@ -473,8 +433,6 @@ fn print_apply(report: &ApplyReport, format: ReportFormat) {
     }
 }
 
-/// Утилита для `with_default_collectors`: ставит root в `/`. Вынесено,
-/// чтобы `run` не тащил PathBuf-боилерплейт.
 trait WithDefaultCollectorsPath {
     fn with_default_collectors_path() -> FactsCollector;
 }
@@ -511,27 +469,9 @@ mod tests {
     }
 
     #[test]
-    fn load_inventory_override_none_returns_null() {
-        let v = load_inventory_override(None).unwrap();
-        assert_eq!(v, serde_json::Value::Null);
-    }
-
-    #[test]
-    fn load_inventory_override_parses_yaml_file() {
-        let tmp = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(tmp.path(), "name: nginx\nversion: 1.18.0\n").unwrap();
-        let v = load_inventory_override(Some(tmp.path())).unwrap();
-        assert_eq!(v["name"], serde_json::json!("nginx"));
-        assert_eq!(v["version"], serde_json::json!("1.18.0"));
-    }
-
-    #[test]
-    fn load_inventory_override_returns_eval_error_on_missing_file() {
-        // Используем гарантированно несуществующий путь.
-        let tmp = tempfile::TempDir::new().unwrap();
-        let path = tmp.path().join("nope.yaml");
-        let code = load_inventory_override(Some(&path)).unwrap_err();
-        assert_eq!(code, exit_code::EVAL_ERROR);
+    fn tags_metric_path_uses_parent_of_metric_file() {
+        let p = tags_metric_path(Path::new("/var/lib/foo/bosun.prom"));
+        assert_eq!(p, PathBuf::from("/var/lib/foo/bosun_tags.prom"));
     }
 
     #[test]
@@ -543,8 +483,6 @@ mod tests {
         let snapshot = collector.snapshot();
         let json = materialize_facts_json(&snapshot);
         let obj = json.as_object().unwrap();
-        // На пустом tempdir-root коллекторы не находят /etc/hostname и т.д.,
-        // поэтому большинство фактов в Unknown — должны материализоваться в Null.
         assert!(!obj.is_empty());
         for (_name, value) in obj {
             assert!(
