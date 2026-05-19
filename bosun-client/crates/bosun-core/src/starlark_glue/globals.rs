@@ -218,6 +218,12 @@ fn service_namespace(builder: &mut GlobalsBuilder) {
 /// `reload_on`/`restart_on`/`depends_on`). Любой ключ за пределами этого
 /// списка — ошибка: автор bundle'а либо обращается к init-специфичной фиче
 /// (тогда вызов должен идти на конкретный примитив), либо опечатался.
+///
+/// Известное ограничение: `health_check_cmd` и `validate_with` пропускаются
+/// сюда как list-of-strings, но конкретные `runr.service`/`systemd.service`
+/// в Phase D/E читают их через `optional_str` и `Array` тихо отбрасывают.
+/// Полноценный парсинг list-параметров подключится в Phase H/I вместе с
+/// реальным запуском validate-cmd и health-check exec.
 const SERVICE_UNIT_ALLOWED_KWARGS: &[&str] = &[
     "name",
     "state",
