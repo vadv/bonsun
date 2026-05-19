@@ -4,6 +4,7 @@
 //! планом/apply'ем через `serde_json::from_value`. Семантика — узкая:
 //! «послать allowlist-сигнал процессу по имени или uid», без shell.
 
+use bosun_core::UnitName;
 use serde::Deserialize;
 
 /// Spec примитива `process.signal`.
@@ -22,7 +23,10 @@ pub struct ProcessSignalSpec {
     /// Уникальное имя ресурса. Используется как часть `defer_id`
     /// (`process.signal:<name>`) и как target в журнале defers, играет ту же
     /// роль, что и `name` у `defers.AddCommand` в chiit.
-    pub name: String,
+    /// Валидация через `UnitName` отвергает path-traversal — defer-файл
+    /// строится из этого имени, и пробитие имени могло бы записать журнал
+    /// в чужую директорию.
+    pub name: UnitName,
     /// Имя сигнала. Допускается префикс `SIG` (например `SIGHUP` ↔ `HUP`).
     /// Валидируется в `build_signal_argv` против allowlist.
     pub signal: String,
@@ -54,11 +58,26 @@ mod tests {
             "process_name": "pg_doorman",
         });
         let spec: ProcessSignalSpec = serde_json::from_value(json).unwrap();
-        assert_eq!(spec.name, "hup-pg-doorman");
+        assert_eq!(spec.name.as_str(), "hup-pg-doorman");
         assert_eq!(spec.signal, "HUP");
         assert_eq!(spec.process_name.as_deref(), Some("pg_doorman"));
         assert!(spec.process_user.is_none());
         assert!(spec.deferred, "deferred должен быть true по умолчанию");
+    }
+
+    #[test]
+    fn deserialize_rejects_invalid_unit_name() {
+        let json = serde_json::json!({
+            "name": "../etc/passwd",
+            "signal": "HUP",
+            "process_name": "x",
+        });
+        let err = serde_json::from_value::<ProcessSignalSpec>(json).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must start with") || msg.contains("invalid character"),
+            "expected UnitName error, got: {msg}"
+        );
     }
 
     #[test]
@@ -90,6 +109,6 @@ mod tests {
         let spec: ProcessSignalSpec = serde_json::from_value(json).unwrap();
         // Поле typo_field тихо игнорируется serde по дефолту; задача spec'а
         // — не падать на нём, а валидация лежит на slой выше.
-        assert_eq!(spec.name, "x");
+        assert_eq!(spec.name.as_str(), "x");
     }
 }

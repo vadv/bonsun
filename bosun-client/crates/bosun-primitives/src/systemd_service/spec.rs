@@ -7,6 +7,7 @@
 //! сохраняет explicit-режим.
 
 use bosun_core::defers::HealthCheck;
+use bosun_core::UnitName;
 use serde::Deserialize;
 
 /// Желаемое состояние systemd unit'а. Совпадает по форме с
@@ -39,7 +40,9 @@ const fn enable_default() -> bool {
 pub struct SystemdServiceSpec {
     /// Имя unit'а (с расширением `.service` либо без — systemd
     /// нормализует сам).
-    pub name: String,
+    /// Валидация имени через `UnitName` отвергает path-traversal, пробелы
+    /// и не-ASCII символы прямо на десериализации payload'а.
+    pub name: UnitName,
     /// Целевое состояние.
     pub state: ServiceState,
     /// Включить unit (`EnableUnitFiles`). По умолчанию `true`.
@@ -65,12 +68,23 @@ mod tests {
     fn deserialize_minimum_defaults_enable_true() {
         let json = serde_json::json!({"name": "nginx.service", "state": "running"});
         let spec: SystemdServiceSpec = serde_json::from_value(json).unwrap();
-        assert_eq!(spec.name, "nginx.service");
+        assert_eq!(spec.name.as_str(), "nginx.service");
         assert_eq!(spec.state, ServiceState::Running);
         // Это отличие от runr.service.
         assert!(spec.enable);
         assert!(spec.health_check.is_none());
         assert!(spec.validate_with.is_none());
+    }
+
+    #[test]
+    fn deserialize_rejects_invalid_unit_name() {
+        let json = serde_json::json!({"name": "/etc/passwd", "state": "running"});
+        let err = serde_json::from_value::<SystemdServiceSpec>(json).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must start with") || msg.contains("invalid character"),
+            "expected UnitName error, got: {msg}"
+        );
     }
 
     #[test]

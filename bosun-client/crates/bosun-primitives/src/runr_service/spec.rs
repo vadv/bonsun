@@ -4,6 +4,7 @@
 //! читают её через `serde_json::from_value`.
 
 use bosun_core::defers::HealthCheck;
+use bosun_core::UnitName;
 use serde::Deserialize;
 
 /// Желаемое состояние сервиса. Соответствует тройке из chiit и design-секции
@@ -31,7 +32,9 @@ pub enum ServiceState {
 #[derive(Clone, Debug, Deserialize)]
 pub struct RunrServiceSpec {
     /// Имя unit'а (без `.service` суффикса — runr принимает голое имя).
-    pub name: String,
+    /// Валидация имени через `UnitName` отвергает path-traversal, пробелы
+    /// и не-ASCII символы прямо на десериализации payload'а.
+    pub name: UnitName,
     /// Целевое состояние.
     pub state: ServiceState,
     /// Включить autostart unit'а. По умолчанию false: runr не требует
@@ -59,11 +62,25 @@ mod tests {
     fn deserialize_minimum_running() {
         let json = serde_json::json!({"name": "postgres", "state": "running"});
         let spec: RunrServiceSpec = serde_json::from_value(json).unwrap();
-        assert_eq!(spec.name, "postgres");
+        assert_eq!(spec.name.as_str(), "postgres");
         assert_eq!(spec.state, ServiceState::Running);
         assert!(!spec.enable);
         assert!(spec.health_check.is_none());
         assert!(spec.validate_with.is_none());
+    }
+
+    #[test]
+    fn deserialize_rejects_invalid_unit_name() {
+        // `/etc/passwd` — попытка path-traversal через runr.service payload.
+        // UnitName::Deserialize должен отвергнуть до того, как имя дойдёт
+        // до defer-журнала или HTTP-пути runr.
+        let json = serde_json::json!({"name": "../etc/passwd", "state": "running"});
+        let err = serde_json::from_value::<RunrServiceSpec>(json).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must start with") || msg.contains("invalid character"),
+            "expected UnitName error message, got: {msg}"
+        );
     }
 
     #[test]

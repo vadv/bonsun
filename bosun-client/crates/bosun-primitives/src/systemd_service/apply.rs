@@ -225,13 +225,13 @@ fn enqueue_defer(
     priority: DeferPriority,
     sources: Vec<String>,
 ) -> Result<ChangeReport, PrimitiveError> {
-    let id = make_id(INIT_SYSTEM_SYSTEMD, &defer_action, &spec.name);
+    let id = make_id(INIT_SYSTEM_SYSTEMD, &defer_action, spec.name.as_str());
     let entry = DeferEntry {
         spec_version: CURRENT_SPEC_VERSION,
         id: id.clone(),
         action: defer_action.clone(),
         init_system: INIT_SYSTEM_SYSTEMD.to_string(),
-        target: spec.name.clone(),
+        target: spec.name.as_str().to_string(),
         validate_cmd: spec.validate_with.clone(),
         health_check: spec.health_check.clone(),
         priority,

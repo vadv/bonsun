@@ -219,7 +219,7 @@ fn enqueue_defer(
         id: id.clone(),
         action,
         init_system: INIT_SYSTEM_NONE.to_string(),
-        target: spec.name.clone(),
+        target: spec.name.as_str().to_string(),
         validate_cmd: None,
         health_check: None,
         priority: DeferPriority::Command,
@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn build_argv_by_name_hup() {
         let spec = ProcessSignalSpec {
-            name: "hup-doorman".into(),
+            name: bosun_core::UnitName::new("hup-doorman").unwrap(),
             signal: "HUP".into(),
             process_name: Some("pg_doorman".into()),
             process_user: None,
@@ -391,7 +391,7 @@ mod tests {
     #[test]
     fn build_argv_by_user_with_sig_prefix_normalized() {
         let spec = ProcessSignalSpec {
-            name: "reload-pg".into(),
+            name: bosun_core::UnitName::new("reload-pg").unwrap(),
             signal: "SIGHUP".into(),
             process_name: None,
             process_user: Some("postgres".into()),
@@ -405,7 +405,7 @@ mod tests {
     #[test]
     fn build_argv_signal_kill_is_invalid_payload() {
         let spec = ProcessSignalSpec {
-            name: "x".into(),
+            name: bosun_core::UnitName::new("x").unwrap(),
             signal: "KILL".into(),
             process_name: Some("evil".into()),
             process_user: None,
@@ -424,7 +424,7 @@ mod tests {
     #[test]
     fn build_argv_signal_stop_is_invalid_payload() {
         let spec = ProcessSignalSpec {
-            name: "x".into(),
+            name: bosun_core::UnitName::new("x").unwrap(),
             signal: "STOP".into(),
             process_name: Some("p".into()),
             process_user: None,
@@ -439,7 +439,7 @@ mod tests {
     #[test]
     fn build_argv_signal_cont_is_invalid_payload() {
         let spec = ProcessSignalSpec {
-            name: "x".into(),
+            name: bosun_core::UnitName::new("x").unwrap(),
             signal: "CONT".into(),
             process_name: Some("p".into()),
             process_user: None,
@@ -454,7 +454,7 @@ mod tests {
     #[test]
     fn build_argv_signal_garbage_is_invalid_payload() {
         let spec = ProcessSignalSpec {
-            name: "x".into(),
+            name: bosun_core::UnitName::new("x").unwrap(),
             signal: "MEOW".into(),
             process_name: Some("p".into()),
             process_user: None,
@@ -469,7 +469,7 @@ mod tests {
     #[test]
     fn build_argv_both_selectors_is_invalid_payload() {
         let spec = ProcessSignalSpec {
-            name: "x".into(),
+            name: bosun_core::UnitName::new("x").unwrap(),
             signal: "HUP".into(),
             process_name: Some("a".into()),
             process_user: Some("b".into()),
@@ -490,7 +490,7 @@ mod tests {
     #[test]
     fn build_argv_no_selector_is_invalid_payload() {
         let spec = ProcessSignalSpec {
-            name: "x".into(),
+            name: bosun_core::UnitName::new("x").unwrap(),
             signal: "HUP".into(),
             process_name: None,
             process_user: None,
@@ -512,7 +512,7 @@ mod tests {
     fn build_argv_supports_all_allowlist_signals() {
         for sig in ["HUP", "TERM", "INT", "USR1", "USR2", "WINCH", "PIPE"] {
             let spec = ProcessSignalSpec {
-                name: format!("test-{sig}"),
+                name: bosun_core::UnitName::new(format!("test-{sig}")).unwrap(),
                 signal: sig.to_string(),
                 process_name: Some("p".into()),
                 process_user: None,

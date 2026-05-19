@@ -115,7 +115,7 @@ mod tests {
 
     fn spec(state: ServiceState) -> SystemdServiceSpec {
         SystemdServiceSpec {
-            name: "nginx.service".into(),
+            name: bosun_core::UnitName::new("nginx.service").unwrap(),
             state,
             enable: true,
             health_check: None,

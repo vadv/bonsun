@@ -86,7 +86,7 @@ pub fn run(
 
     // 2. Snapshot service statuses (один HTTP-call на весь apply).
     let statuses = get_or_fetch_statuses(runr.as_ref(), &ctx.runr_service_statuses)?;
-    let current = statuses.iter().find(|s| s.name == spec.name);
+    let current = statuses.iter().find(|s| s.name == spec.name.as_str());
 
     // 3. Тригеры notify из `restart_on` / `reload_on`.
     let restart_triggered = resource.restart_on.iter().any(|id| ctx.is_changed(id));
@@ -193,13 +193,13 @@ fn enqueue_defer(
     priority: DeferPriority,
     sources: Vec<String>,
 ) -> Result<ChangeReport, PrimitiveError> {
-    let id = make_id(INIT_SYSTEM_RUNR, &defer_action, &spec.name);
+    let id = make_id(INIT_SYSTEM_RUNR, &defer_action, spec.name.as_str());
     let entry = DeferEntry {
         spec_version: CURRENT_SPEC_VERSION,
         id: id.clone(),
         action: defer_action.clone(),
         init_system: INIT_SYSTEM_RUNR.to_string(),
-        target: spec.name.clone(),
+        target: spec.name.as_str().to_string(),
         validate_cmd: spec.validate_with.clone(),
         health_check: spec.health_check.clone(),
         priority,

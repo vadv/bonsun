@@ -123,7 +123,7 @@ mod tests {
 
     fn spec(state: ServiceState) -> RunrServiceSpec {
         RunrServiceSpec {
-            name: "pg".into(),
+            name: bosun_core::UnitName::new("pg").unwrap(),
             state,
             enable: false,
             health_check: None,

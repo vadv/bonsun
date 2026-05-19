@@ -1,5 +1,6 @@
 //! Десериализуемая часть payload'а `systemd.timer`.
 
+use bosun_core::UnitName;
 use serde::Deserialize;
 
 /// Целевое состояние systemd timer'а.
@@ -29,7 +30,8 @@ const fn enable_default() -> bool {
 pub struct SystemdTimerSpec {
     /// Имя timer'а (с расширением `.timer` либо без — systemd
     /// нормализует сам).
-    pub name: String,
+    /// Валидация через `UnitName` отвергает path-traversal и не-ASCII.
+    pub name: UnitName,
     /// Целевое состояние.
     pub state: TimerState,
     /// `EnableUnitFiles` на стороне systemd. По умолчанию true.
@@ -46,9 +48,16 @@ mod tests {
     fn deserialize_min_enabled_default_enable_true() {
         let json = serde_json::json!({"name": "logrotate.timer", "state": "enabled"});
         let spec: SystemdTimerSpec = serde_json::from_value(json).unwrap();
-        assert_eq!(spec.name, "logrotate.timer");
+        assert_eq!(spec.name.as_str(), "logrotate.timer");
         assert_eq!(spec.state, TimerState::Enabled);
         assert!(spec.enable);
+    }
+
+    #[test]
+    fn deserialize_rejects_invalid_unit_name() {
+        let json = serde_json::json!({"name": "foo bar", "state": "enabled"});
+        let err = serde_json::from_value::<SystemdTimerSpec>(json).unwrap_err();
+        assert!(err.to_string().contains("invalid character"));
     }
 
     #[test]

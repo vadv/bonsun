@@ -88,7 +88,7 @@ mod tests {
 
     fn spec(state: TimerState) -> SystemdTimerSpec {
         SystemdTimerSpec {
-            name: "logrotate.timer".into(),
+            name: bosun_core::UnitName::new("logrotate.timer").unwrap(),
             state,
             enable: true,
         }

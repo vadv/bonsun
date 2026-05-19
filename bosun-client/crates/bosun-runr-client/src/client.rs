@@ -1,4 +1,12 @@
 //! Sync HTTP-клиент над `ureq::Agent`.
+//!
+//! Имена unit'ов попадают в URL path после `/api/v1/services/` или
+//! `/api/v1/timers/`. На уровне primitive'а они уже валидированы как
+//! `UnitName` (`bosun-core::unit_name`) и состоят только из URL-safe
+//! символов. Тем не менее в самом клиенте мы делаем дополнительный
+//! percent-encoding: если в будущем кто-то вызовет API минуя primitive
+//! (например, тесты или скрипт), невалидный байт не должен превратить
+//! HTTP-запрос к runr в инъекцию в путь.
 
 use std::time::Duration;
 
@@ -9,6 +17,27 @@ use crate::types::{
     ActionAck, DaemonInfo, RestartOptions, ServiceStatus, StartOptions, StopOptions, TimerStatus,
     TimerToggleNow, UnitListItem,
 };
+
+/// Минимальное percent-encoding для path segment'а runr API. Сохраняем
+/// «unreserved» по RFC 3986 (`A-Z a-z 0-9 - . _ ~`) и плюс типичные для
+/// systemd имена символы `@`, которые runr понимает буквально. Всё
+/// остальное (включая `/`, `?`, `#`, пробел, control chars, UTF-8 bytes)
+/// идёт в `%HH` форме. На входе мы ожидаем уже валидную `UnitName`,
+/// но этот хелпер служит safety net и не зависит от `bosun-core`.
+fn percent_encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'@' => {
+                out.push(byte as char);
+            }
+            _ => {
+                out.push_str(&format!("%{byte:02X}"));
+            }
+        }
+    }
+    out
+}
 
 /// Sync-клиент runr API.
 ///
@@ -55,7 +84,8 @@ impl Client {
 
     /// `POST /api/v1/services/<name>/start`.
     pub fn service_start(&self, name: &str, idempotent: bool) -> Result<ActionAck, RunrError> {
-        let path = format!("/api/v1/services/{name}/start");
+        let encoded = percent_encode_path_segment(name);
+        let path = format!("/api/v1/services/{encoded}/start");
         self.post_json(&path, &StartOptions { idempotent }, Some(("service", name)))
     }
 
@@ -68,7 +98,8 @@ impl Client {
         force: bool,
         timeout_humantime: Option<&str>,
     ) -> Result<ActionAck, RunrError> {
-        let path = format!("/api/v1/services/{name}/stop");
+        let encoded = percent_encode_path_segment(name);
+        let path = format!("/api/v1/services/{encoded}/stop");
         let body = StopOptions {
             timeout: timeout_humantime.map(str::to_string),
             force,
@@ -80,7 +111,8 @@ impl Client {
     /// `RestartOptions { stop: { force: false }, start: { idempotent: true } }`
     /// — те же дефолты, что использует chiit-клиент.
     pub fn service_restart(&self, name: &str) -> Result<ActionAck, RunrError> {
-        let path = format!("/api/v1/services/{name}/restart");
+        let encoded = percent_encode_path_segment(name);
+        let path = format!("/api/v1/services/{encoded}/restart");
         let body = RestartOptions {
             stop: StopOptions {
                 timeout: None,
@@ -93,32 +125,37 @@ impl Client {
 
     /// `POST /api/v1/services/<name>/reload`.
     pub fn service_reload(&self, name: &str) -> Result<ActionAck, RunrError> {
-        let path = format!("/api/v1/services/{name}/reload");
+        let encoded = percent_encode_path_segment(name);
+        let path = format!("/api/v1/services/{encoded}/reload");
         self.post_json(&path, &EmptyBody {}, Some(("service", name)))
     }
 
     /// `POST /api/v1/timers/<name>/start`.
     pub fn timer_start(&self, name: &str) -> Result<ActionAck, RunrError> {
-        let path = format!("/api/v1/timers/{name}/start");
+        let encoded = percent_encode_path_segment(name);
+        let path = format!("/api/v1/timers/{encoded}/start");
         self.post_json(&path, &EmptyBody {}, Some(("timer", name)))
     }
 
     /// `POST /api/v1/timers/<name>/stop`.
     pub fn timer_stop(&self, name: &str) -> Result<ActionAck, RunrError> {
-        let path = format!("/api/v1/timers/{name}/stop");
+        let encoded = percent_encode_path_segment(name);
+        let path = format!("/api/v1/timers/{encoded}/stop");
         self.post_json(&path, &EmptyBody {}, Some(("timer", name)))
     }
 
     /// `POST /api/v1/timers/<name>/enable`. Флаг `now` соответствует
     /// `EnableTimerOptions.now` — запустить таймер сразу после enable.
     pub fn timer_enable(&self, name: &str, now: bool) -> Result<ActionAck, RunrError> {
-        let path = format!("/api/v1/timers/{name}/enable");
+        let encoded = percent_encode_path_segment(name);
+        let path = format!("/api/v1/timers/{encoded}/enable");
         self.post_json(&path, &TimerToggleNow { now }, Some(("timer", name)))
     }
 
     /// `POST /api/v1/timers/<name>/disable`.
     pub fn timer_disable(&self, name: &str, now: bool) -> Result<ActionAck, RunrError> {
-        let path = format!("/api/v1/timers/{name}/disable");
+        let encoded = percent_encode_path_segment(name);
+        let path = format!("/api/v1/timers/{encoded}/disable");
         self.post_json(&path, &TimerToggleNow { now }, Some(("timer", name)))
     }
 
@@ -201,3 +238,44 @@ impl Client {
 /// (`{}`), а не пустую строку.
 #[derive(serde::Serialize)]
 struct EmptyBody {}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_encode_keeps_safe_chars() {
+        // Все символы из UnitName regex'а должны проходить без изменения.
+        let safe = "abcXYZ123-._@";
+        assert_eq!(percent_encode_path_segment(safe), safe);
+    }
+
+    #[test]
+    fn percent_encode_escapes_slash() {
+        // Защита от path-injection: `/` нельзя пропускать прозрачно,
+        // иначе name="foo/bar/etc" пробьёт уровень URL.
+        let out = percent_encode_path_segment("foo/bar");
+        assert_eq!(out, "foo%2Fbar");
+    }
+
+    #[test]
+    fn percent_encode_escapes_space() {
+        let out = percent_encode_path_segment("foo bar");
+        assert_eq!(out, "foo%20bar");
+    }
+
+    #[test]
+    fn percent_encode_escapes_question_and_hash() {
+        // ? и # ломают URL-парсинг (query/fragment); должны быть escaped.
+        assert_eq!(percent_encode_path_segment("a?b"), "a%3Fb");
+        assert_eq!(percent_encode_path_segment("a#b"), "a%23b");
+    }
+
+    #[test]
+    fn percent_encode_escapes_high_bytes() {
+        // Не-ASCII должно идти через %HH. Cyrillic "а" → UTF-8 0xD0 0xB0.
+        let out = percent_encode_path_segment("а");
+        assert_eq!(out, "%D0%B0");
+    }
+}
