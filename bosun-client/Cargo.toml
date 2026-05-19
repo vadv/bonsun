@@ -55,7 +55,10 @@ chrono = { version = "0.4", features = ["clock"] }
 signal-hook = "0.3"
 cucumber = "0.21"
 rand = "0.8"
-ureq = { version = "2", default-features = false, features = ["json"] }
+# tls — rustls + webpki-roots, pure Rust. native-tls сознательно не
+# используется, чтобы не тянуть libssl/libcrypto в зависимости musl-сборки.
+# Без этой фичи apt.key и любые HTTPS-вызовы падают на TLS-handshake.
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
 wiremock = "0.6"
 nix = { version = "0.31", default-features = false, features = ["user"] }
 # Phase O: cert.tls — генерация self-signed x509 без openssl-binary.
