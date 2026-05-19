@@ -250,6 +250,11 @@ mod tests {
         store: Arc<SensitiveStore>,
         backup_root: std::path::PathBuf,
     ) -> ApplyCtx {
+        // Журнал defers — фиксированная директория на tmpfs; file.content
+        // не enqueue'ит defers напрямую, поле нужно только для удовлетворения
+        // сигнатуры конструктора.
+        let defers_root = std::env::temp_dir().join("bosun-file-test-defers");
+        let defers = Arc::new(bosun_core::defers::Journal::open(&defers_root).unwrap());
         ApplyCtx::new(
             Instant::now() + Duration::from_secs(60),
             CancellationToken::new(),
@@ -257,6 +262,9 @@ mod tests {
             store,
             backup_root,
             std::path::PathBuf::from("/tmp"),
+            defers,
+            None,
+            None,
         )
     }
 
@@ -277,6 +285,7 @@ mod tests {
                 spec_version: 1,
                 payload,
                 reload_on: Vec::new(),
+                restart_on: Vec::new(),
                 depends_on: Vec::new(),
             },
             sha,
@@ -449,6 +458,7 @@ mod tests {
             spec_version: 1,
             payload,
             reload_on: Vec::new(),
+            restart_on: Vec::new(),
             depends_on: Vec::new(),
         };
         let store = Arc::new(SensitiveStore::new());
@@ -587,6 +597,7 @@ mod tests {
             spec_version: 1,
             payload,
             reload_on: Vec::new(),
+            restart_on: Vec::new(),
             depends_on: Vec::new(),
         };
         let store = Arc::new(SensitiveStore::new());

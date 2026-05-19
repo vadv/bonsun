@@ -96,6 +96,15 @@ pub struct Handle(pub ResourceId);
 
 /// Зарегистрированный ресурс в Registry. Payload type-erased через JSON,
 /// каждый примитив десериализует payload в собственный Spec через serde.
+///
+/// `reload_on` и `restart_on` — это notify-связи. Если хоть один из перечисленных
+/// ресурсов в текущем apply изменился (`ctx.is_changed`), примитив инициирует
+/// reload (мягко) или restart (жёстко, субсумирует reload). Семантика выровнена
+/// с design-секцией «Notify-связи»: restart_on имеет приоритет над reload_on
+/// для одного и того же target, дедуп идёт через `defers`.
+///
+/// `depends_on` — порядковая связь. Топологический сорт гарантирует, что зависимости
+/// успевают примениться раньше зависимых.
 #[derive(Clone, Debug)]
 pub struct Resource {
     pub id: ResourceId,
@@ -103,6 +112,10 @@ pub struct Resource {
     pub spec_version: u16,
     pub payload: serde_json::Value,
     pub reload_on: Vec<ResourceId>,
+    /// Notify-связь, означающая «если любой из перечисленных ресурсов изменился —
+    /// рестартуй меня». Сильнее, чем `reload_on`: для одного target restart
+    /// субсумирует reload (см. `defers::priority`).
+    pub restart_on: Vec<ResourceId>,
     pub depends_on: Vec<ResourceId>,
 }
 
@@ -173,5 +186,25 @@ mod tests {
         let id = ResourceId::new(&kind, "nginx");
         let h = Handle(id.clone());
         assert_eq!(h.0, id);
+    }
+
+    #[test]
+    fn resource_keeps_separate_restart_and_reload_vecs() {
+        // Регрессия: restart_on и reload_on — независимые поля. Один и тот же
+        // источник может фигурировать в обоих списках без коллапса.
+        let kind = ResourceKind::from_static("apt.package");
+        let id = ResourceId::new(&kind, "svc");
+        let cfg = ResourceId::new(&kind, "config");
+        let r = Resource {
+            id,
+            kind,
+            spec_version: 1,
+            payload: serde_json::json!({}),
+            reload_on: vec![cfg.clone()],
+            restart_on: vec![cfg.clone()],
+            depends_on: vec![],
+        };
+        assert_eq!(r.reload_on, vec![cfg.clone()]);
+        assert_eq!(r.restart_on, vec![cfg]);
     }
 }

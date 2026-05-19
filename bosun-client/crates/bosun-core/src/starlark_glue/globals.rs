@@ -521,7 +521,7 @@ fn register_primitive_call<'v>(
         None
     };
 
-    let (identity, payload, reload_on, depends_on) =
+    let (identity, payload, reload_on, restart_on, depends_on) =
         with_state(|state| -> Result<_, starlark::Error> {
             let primitive = state.primitives.get(&kind).ok_or_else(|| {
                 let err = StarlarkGlueError::UnknownPrimitive(kind_str.to_string());
@@ -542,11 +542,14 @@ fn register_primitive_call<'v>(
             let reload_on = call_args
                 .optional_handle_list("reload_on")
                 .map_err(|e| record_invalid_call_in(state, kind_str, &format!("{e}")))?;
+            let restart_on = call_args
+                .optional_handle_list("restart_on")
+                .map_err(|e| record_invalid_call_in(state, kind_str, &format!("{e}")))?;
             let depends_on = call_args
                 .optional_handle_list("depends_on")
                 .map_err(|e| record_invalid_call_in(state, kind_str, &format!("{e}")))?;
 
-            Ok((identity, payload, reload_on, depends_on))
+            Ok((identity, payload, reload_on, restart_on, depends_on))
         })
         .ok_or_else(|| {
             starlark::Error::new_other(anyhow::anyhow!("internal: no eval state in thread-local"))
@@ -573,6 +576,7 @@ fn register_primitive_call<'v>(
         spec_version: 1,
         payload,
         reload_on,
+        restart_on,
         depends_on,
     };
 

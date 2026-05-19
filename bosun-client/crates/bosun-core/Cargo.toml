@@ -25,6 +25,10 @@ sha2 = { workspace = true }
 allocative = "0.3"
 dupe = "0.9"
 starlark_derive = "~0.13"
+# Traits-only прослойка: ApplyCtx ссылается на dyn RunrHandle/SystemdHandle
+# из bosun-handles. Сам bosun-core не зависит от client-крейтов напрямую —
+# граф зависимостей остаётся ациклическим: core → handles → clients.
+bosun-handles = { path = "../bosun-handles" }
 
 [dev-dependencies]
 tempfile = { workspace = true }

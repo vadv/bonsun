@@ -25,10 +25,20 @@ impl Diff {
 
 /// Результат apply-фазы примитива (только успех).
 /// Ошибка возвращается через Err(PrimitiveError) — двойного канала нет.
+///
+/// `deferred=true` маркирует случай, когда apply положил действие в журнал
+/// defers и вернулся, не дожидаясь выполнения. Оркестратор трактует это
+/// как `Outcome::Deferred` (см. `Orchestrator::apply`), summary
+/// инкрементируется в `deferred`, а не `changed`. Использование: примитив
+/// поставил `ctx.defers.enqueue(...)` и сразу же возвращает
+/// `ChangeReport::deferred(reason)`.
 #[derive(Clone, Debug, Serialize)]
 pub struct ChangeReport {
     pub changed: bool,
     pub message: String,
+    /// Действие отложено в журнал defers. `changed=false`, `deferred=true`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deferred: bool,
 }
 
 impl ChangeReport {
@@ -36,6 +46,7 @@ impl ChangeReport {
         Self {
             changed: false,
             message: String::new(),
+            deferred: false,
         }
     }
 
@@ -43,6 +54,17 @@ impl ChangeReport {
         Self {
             changed: true,
             message: message.into(),
+            deferred: false,
+        }
+    }
+
+    /// Marker «действие положено в defer-журнал и будет выполнено в
+    /// replay». Оркестратор инкрементирует `summary.deferred`, не `changed`.
+    pub fn deferred(message: impl Into<String>) -> Self {
+        Self {
+            changed: false,
+            message: message.into(),
+            deferred: true,
         }
     }
 }
@@ -66,11 +88,36 @@ mod tests {
     fn change_report_factories() {
         let nc = ChangeReport::no_change();
         assert!(!nc.changed);
+        assert!(!nc.deferred);
         assert!(nc.message.is_empty());
 
         let ch = ChangeReport::changed("installed");
         assert!(ch.changed);
+        assert!(!ch.deferred);
         assert_eq!(ch.message, "installed");
+
+        let def = ChangeReport::deferred("enqueued restart");
+        assert!(!def.changed);
+        assert!(def.deferred);
+        assert_eq!(def.message, "enqueued restart");
+    }
+
+    #[test]
+    fn change_report_deferred_omits_field_in_default_json() {
+        // skip_serializing_if гарантирует, что обратно-совместимые потребители
+        // (читалки старого формата) не споткнутся об лишнее поле для
+        // changed/no_change-отчётов.
+        let ch = ChangeReport::changed("ok");
+        let json = serde_json::to_value(&ch).unwrap();
+        assert_eq!(
+            json.get("deferred"),
+            None,
+            "default false должен быть пропущен"
+        );
+
+        let def = ChangeReport::deferred("ok");
+        let json = serde_json::to_value(&def).unwrap();
+        assert_eq!(json["deferred"], serde_json::json!(true));
     }
 
     #[test]

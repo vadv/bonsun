@@ -378,7 +378,28 @@ impl Orchestrator {
             });
             match apply_result {
                 Ok(report) => {
-                    if report.changed {
+                    if report.deferred {
+                        // Действие положено в defer-журнал. Это не failure
+                        // и не change в текущем apply: оркестратор посчитает
+                        // его как Outcome::Deferred. Логически совпадает с
+                        // is_deferrable-error путем, но без ошибки — это
+                        // штатный happy path для notify-restart.
+                        tracing::info!(reason = %report.message, "apply deferred (enqueued)");
+                        resources.push(ResourceApplyOutcome {
+                            id,
+                            kind,
+                            outcome: Outcome::Deferred {
+                                reason: report.message.clone(),
+                            },
+                            message: report.message,
+                        });
+                        summary.deferred += 1;
+                    } else if report.changed {
+                        // Помечаем ресурс изменённым в ctx, чтобы
+                        // notify-подписчики могли увидеть это через
+                        // ctx.is_changed. Идёт ДО push'а в resources,
+                        // чтобы поле id ещё было доступно.
+                        apply_ctx.record_changed(&id);
                         // `summary` поле, а не `message`: вместе с format-msg
                         // "applied with change" даёт явное сообщение события.
                         tracing::info!(summary = %report.message, "applied with change");
@@ -637,6 +658,7 @@ mod tests {
             spec_version: 1,
             payload: serde_json::json!({}),
             reload_on: Vec::new(),
+            restart_on: Vec::new(),
             depends_on: deps,
         }
     }
@@ -649,14 +671,23 @@ mod tests {
     }
 
     fn apply_ctx() -> ApplyCtx {
-        ApplyCtx {
-            deadline: Instant::now() + Duration::from_secs(60),
-            cancel: CancellationToken::new(),
-            log_span: tracing::Span::none(),
-            sensitive: Arc::new(SensitiveStore::new()),
-            backup_root: PathBuf::from("/tmp/test-backups"),
-            log_dir: PathBuf::from("/tmp/test-logs"),
-        }
+        // ApplyCtx требует валидный журнал. В тестах оркестратора defers
+        // не используется, поэтому используем фиксированный путь — он
+        // достаточно стабилен для unit-тестов и не создаёт временных
+        // зависимостей между жизнями TempDir и Arc<ApplyCtx>.
+        let defers_root = std::env::temp_dir().join("bosun-test-orchestrator-defers");
+        let defers = std::sync::Arc::new(crate::defers::Journal::open(&defers_root).unwrap());
+        ApplyCtx::new(
+            Instant::now() + Duration::from_secs(60),
+            CancellationToken::new(),
+            tracing::Span::none(),
+            Arc::new(SensitiveStore::new()),
+            PathBuf::from("/tmp/test-backups"),
+            PathBuf::from("/tmp/test-logs"),
+            defers,
+            None,
+            None,
+        )
     }
 
     #[test]
@@ -1498,6 +1529,7 @@ mod tests {
             spec_version: 1,
             payload: serde_json::json!({}),
             reload_on: Vec::new(),
+            restart_on: Vec::new(),
             depends_on: vec![id_b.clone()],
         })
         .unwrap();
@@ -1507,6 +1539,7 @@ mod tests {
             spec_version: 1,
             payload: serde_json::json!({}),
             reload_on: Vec::new(),
+            restart_on: Vec::new(),
             depends_on: vec![id_a],
         })
         .unwrap();

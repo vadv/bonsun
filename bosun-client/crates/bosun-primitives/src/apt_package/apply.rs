@@ -314,6 +314,7 @@ mod tests {
                 "allow_change_held": false,
             }),
             reload_on: Vec::new(),
+            restart_on: Vec::new(),
             depends_on: Vec::new(),
         }
     }
@@ -339,11 +340,17 @@ mod tests {
                 "allow_change_held": allow_change_held,
             }),
             reload_on: Vec::new(),
+            restart_on: Vec::new(),
             depends_on: Vec::new(),
         }
     }
 
     fn make_ctx(log_dir: std::path::PathBuf) -> ApplyCtx {
+        // Журнал defers — фиксированная директория на tmpfs. apt.package
+        // не enqueue'ит defers, журнал нужен только для удовлетворения
+        // сигнатуры конструктора.
+        let defers_root = std::env::temp_dir().join("bosun-apt-test-defers");
+        let defers = Arc::new(bosun_core::defers::Journal::open(&defers_root).unwrap());
         ApplyCtx::new(
             Instant::now() + Duration::from_secs(600),
             CancellationToken::new(),
@@ -351,6 +358,9 @@ mod tests {
             Arc::new(SensitiveStore::new()),
             std::path::PathBuf::from("/tmp"),
             log_dir,
+            defers,
+            None,
+            None,
         )
     }
 
@@ -664,6 +674,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let cancel = CancellationToken::new();
         cancel.cancel();
+        let defers_root = std::env::temp_dir().join("bosun-apt-test-defers-cancel");
+        let defers = Arc::new(bosun_core::defers::Journal::open(&defers_root).unwrap());
         let ctx = ApplyCtx::new(
             Instant::now() + Duration::from_secs(600),
             cancel,
@@ -671,6 +683,9 @@ mod tests {
             Arc::new(SensitiveStore::new()),
             std::path::PathBuf::from("/tmp"),
             tmp.path().to_path_buf(),
+            defers,
+            None,
+            None,
         );
         let (_d, lock_path) = free_lock_path();
         let diff = Diff::Add {
@@ -693,6 +708,7 @@ mod tests {
             spec_version: 1,
             payload: serde_json::json!({ "no_name": true }),
             reload_on: Vec::new(),
+            restart_on: Vec::new(),
             depends_on: Vec::new(),
         };
         let tmp = tempfile::tempdir().unwrap();

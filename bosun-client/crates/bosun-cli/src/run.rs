@@ -15,8 +15,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bosun_core::{
-    ApplyCtx, ApplyOpts, ApplyReport, Bundle, Evaluator, FactValue, Orchestrator, Outcome, PlanCtx,
-    PlanReport, Primitive, ResourceKind, SensitiveStore, TemplateFn,
+    defers::Journal, ApplyCtx, ApplyOpts, ApplyReport, Bundle, Evaluator, FactValue, Orchestrator,
+    Outcome, PlanCtx, PlanReport, Primitive, ResourceKind, SensitiveStore, TemplateFn,
 };
 use bosun_facts::FactsCollector;
 use bosun_primitives::{template::render_template, AptPrimitive, FilePrimitive};
@@ -177,6 +177,16 @@ pub fn run(args: &ApplyArgs) -> i32 {
 
     let orchestrator = Orchestrator::new(build_primitives());
 
+    // Phase D: defers журнал на tmpfs. CLI-флаги для пути и handle'ов
+    // runr/systemd подключаются в Phase J; пока используем стандартный
+    // путь `/tmp/bosun-defers/` и None-handle'ы.
+    let defers = match Journal::open("/tmp/bosun-defers") {
+        Ok(j) => Arc::new(j),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to open defer journal");
+            return exit_code::CLI_ENV_ERROR;
+        }
+    };
     let apply_ctx = ApplyCtx::new(
         deadline,
         cancel.clone(),
@@ -184,6 +194,9 @@ pub fn run(args: &ApplyArgs) -> i32 {
         sensitive.clone(),
         args.backup_dir.clone(),
         args.log_dir.clone(),
+        defers,
+        None,
+        None,
     );
 
     let view = facts.view();

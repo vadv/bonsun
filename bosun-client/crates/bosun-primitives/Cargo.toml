@@ -11,16 +11,22 @@ workspace = true
 
 [dependencies]
 bosun-core = { path = "../bosun-core" }
+# Traits для общения с runr/systemd. Phase D-примитивы получают handle
+# через ctx.runr (Option<Arc<dyn RunrHandle>>).
+bosun-handles = { path = "../bosun-handles" }
+# Нужен для типов ServiceStatus/TimerStatus/RunrError, которые
+# фигурируют в plan/apply и в маппинге ошибок.
+bosun-runr-client = { path = "../bosun-runr-client" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+chrono = { workspace = true }
 # tempfile нужен в Phase 6.1 для atomic-write (NamedTempFile + persist) в file.content::apply.
 # Tests внутри крейта получают его транзитивно через [dependencies], дубль в [dev-dependencies] не нужен.
 tempfile = { workspace = true }
 minijinja = { workspace = true }
 libc = { workspace = true }
-chrono = { workspace = true }
 # fs4 — advisory file-lock через flock(2). Раньше использовался для apt.package
 # dpkg-lock probe; после F03-фикса там fcntl, fs4 нужен только в защитном
 # тесте `probe_does_not_detect_flock_locks`, чтобы зафиксировать различие

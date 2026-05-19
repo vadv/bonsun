@@ -48,16 +48,29 @@ impl Registry {
     /// застрявших вершин, а не конкретный path по циклу: восстановить путь
     /// требует back-edge DFS, который для MVP избыточен. Если нужен exact
     /// cycle, выводить его придётся в Phase 5+ при отладке сложных манифестов.
+    ///
+    /// В качестве рёбер используются `depends_on`, `reload_on` и `restart_on`:
+    /// первое выражает «применяй меня после X», два других — notify-семантику.
+    /// Для порядка применения они эквивалентны: notify-источник должен быть
+    /// планирован до подписчика, чтобы подписчик мог узнать о его изменении.
     pub fn topological_order(&self) -> Result<Vec<ResourceId>, RegistryError> {
         // Kahn algorithm: рёбра — от dependency к dependent.
-        // reload_on и depends_on в MVP трактуются одинаково.
         let n = self.resources.len();
         let mut in_degree: HashMap<&ResourceId, usize> =
             self.resources.iter().map(|r| (&r.id, 0)).collect();
         let mut adj: HashMap<&ResourceId, Vec<&ResourceId>> = HashMap::new();
 
         for r in &self.resources {
-            for dep in r.depends_on.iter().chain(r.reload_on.iter()) {
+            // Все три источника связей формируют идентичные рёбра в графе
+            // порядка применения. Дубль одного и того же id внутри одного
+            // ресурса трактуется как несколько рёбер — Kahn это переносит:
+            // in_degree корректно убывает на каждое pop'нутое sucessor-звено.
+            for dep in r
+                .depends_on
+                .iter()
+                .chain(r.reload_on.iter())
+                .chain(r.restart_on.iter())
+            {
                 if !self.by_id.contains_key(dep) {
                     return Err(RegistryError::UnknownHandle(dep.clone()));
                 }
@@ -124,6 +137,7 @@ mod tests {
             spec_version: 1,
             payload: serde_json::json!({}),
             reload_on: Vec::new(),
+            restart_on: Vec::new(),
             depends_on: deps,
         }
     }
@@ -176,6 +190,7 @@ mod tests {
             spec_version: 1,
             payload: serde_json::json!({}),
             reload_on: vec![],
+            restart_on: vec![],
             depends_on: vec![id_b.clone()],
         })
         .unwrap();
@@ -185,6 +200,7 @@ mod tests {
             spec_version: 1,
             payload: serde_json::json!({}),
             reload_on: vec![],
+            restart_on: vec![],
             depends_on: vec![id_a.clone()],
         })
         .unwrap();
@@ -205,6 +221,54 @@ mod tests {
         let mut reg = Registry::new();
         let ghost = ResourceId::new(&kind("apt.package"), "ghost");
         reg.add(res("file.content", "/a", vec![ghost])).unwrap();
+        let err = reg.topological_order().unwrap_err();
+        assert!(matches!(err, RegistryError::UnknownHandle(_)));
+    }
+
+    #[test]
+    fn topo_order_respects_restart_on() {
+        // restart_on создаёт такое же отношение «применить раньше», как
+        // depends_on/reload_on: notify-источник должен быть впереди
+        // notify-подписчика в порядке apply.
+        let mut reg = Registry::new();
+        let cfg = reg.add(res("file.content", "/etc/cfg", vec![])).unwrap();
+        let kind_svc = kind("runr.service");
+        let id_svc = ResourceId::new(&kind_svc, "svc");
+        reg.add(Resource {
+            id: id_svc.clone(),
+            kind: kind_svc,
+            spec_version: 1,
+            payload: serde_json::json!({}),
+            reload_on: vec![],
+            restart_on: vec![cfg.clone()],
+            depends_on: vec![],
+        })
+        .unwrap();
+        let order = reg.topological_order().unwrap();
+        // cfg должен идти раньше svc.
+        let pos = |id: &ResourceId| order.iter().position(|x| x == id).unwrap();
+        assert!(
+            pos(&cfg) < pos(&id_svc),
+            "cfg should precede svc in topo order, got {order:?}"
+        );
+    }
+
+    #[test]
+    fn restart_on_unknown_handle_rejected() {
+        let mut reg = Registry::new();
+        let ghost = ResourceId::new(&kind("file.content"), "/ghost");
+        let kind_svc = kind("runr.service");
+        let id_svc = ResourceId::new(&kind_svc, "svc");
+        reg.add(Resource {
+            id: id_svc,
+            kind: kind_svc,
+            spec_version: 1,
+            payload: serde_json::json!({}),
+            reload_on: vec![],
+            restart_on: vec![ghost],
+            depends_on: vec![],
+        })
+        .unwrap();
         let err = reg.topological_order().unwrap_err();
         assert!(matches!(err, RegistryError::UnknownHandle(_)));
     }

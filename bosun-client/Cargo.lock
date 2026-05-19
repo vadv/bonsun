@@ -286,6 +286,7 @@ version = "0.1.0"
 dependencies = [
  "allocative",
  "anyhow",
+ "bosun-handles",
  "chrono",
  "dupe",
  "semver",
@@ -318,10 +319,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "bosun-handles"
+version = "0.1.0"
+dependencies = [
+ "bosun-runr-client",
+ "bosun-systemd-client",
+]
+
+[[package]]
 name = "bosun-primitives"
 version = "0.1.0"
 dependencies = [
  "bosun-core",
+ "bosun-handles",
+ "bosun-runr-client",
  "chrono",
  "fs4",
  "libc",

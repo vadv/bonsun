@@ -1,0 +1,22 @@
+[package]
+name = "bosun-handles"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Тонкая прослойка traits поверх клиентов: владеет публичными trait'ами,
+# через которые ApplyCtx и примитивы общаются с runr/systemd. Зависит от
+# обоих клиентских крейтов и предоставляет blanket impl'ы — это разрывает
+# цикл `bosun-core ↔ bosun-runr-client`, который бы возник при попытке
+# объявить trait в bosun-core.
+bosun-runr-client = { path = "../bosun-runr-client" }
+bosun-systemd-client = { path = "../bosun-systemd-client" }
+
+[dev-dependencies]
+# Для round-trip-ассертов на trait-object'ах в тестах.

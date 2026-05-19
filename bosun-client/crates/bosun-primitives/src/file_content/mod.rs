@@ -186,6 +186,7 @@ mod tests {
                 "content_size": contents.len() as u64,
             }),
             reload_on: Vec::new(),
+            restart_on: Vec::new(),
             depends_on: Vec::new(),
         }
     }

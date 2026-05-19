@@ -130,6 +130,7 @@ mod tests {
                 "timeout_sec": 600_u32,
             }),
             reload_on: Vec::new(),
+            restart_on: Vec::new(),
             depends_on: Vec::new(),
         }
     }
@@ -267,6 +268,7 @@ mod tests {
             spec_version: 1,
             payload: serde_json::json!({ "no_name_here": true }),
             reload_on: Vec::new(),
+            restart_on: Vec::new(),
             depends_on: Vec::new(),
         };
         let facts = StubFacts {
