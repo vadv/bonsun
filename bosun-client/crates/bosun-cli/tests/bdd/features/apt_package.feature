@@ -44,8 +44,14 @@ Feature: apt.package primitive
     # dpkg-lock — транзиентное состояние (unattended-upgrades, ручной apt и
     # т.п.). bosun не должен валить exit-код и флапать метрику failed —
     # ресурс уходит в Deferred, следующий цикл попробует снова.
+    #
+    # apt/dpkg/unattended-upgrades берут lock через fcntl(F_SETLK, F_WRLCK).
+    # BSD-flock(2) и POSIX-fcntl — независимые механизмы, поэтому раньше
+    # тест эмулировал blocker через `flock -x`, но bosun-фикс F03 перешёл
+    # на fcntl(F_GETLK) probe. Сейчас держатель тоже должен быть fcntl —
+    # используем python3, который есть в test-base образе.
     Given a fresh container
-    When I run "( flock -x 9 ; sleep 60 ) 9>/var/lib/dpkg/lock-frontend & sleep 1" inside the container
+    When I run "python3 -u -c 'import fcntl, sys, time; f=open(\"/var/lib/dpkg/lock-frontend\",\"r+\"); fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB); sys.stdout.write(\"locked\\n\"); sys.stdout.flush(); time.sleep(60)' & sleep 1" inside the container
     Then exit code is 0
     Given a bundle with manifest:
       """

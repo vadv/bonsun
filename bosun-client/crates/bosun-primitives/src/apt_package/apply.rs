@@ -509,6 +509,12 @@ mod tests {
 
     #[test]
     fn apply_dpkg_locked_returns_dpkg_locked_with_no_runner_calls() {
+        // F03-фикс: probe использует fcntl(F_GETLK), который видит только
+        // fcntl-локи. Захватываем lock через python3 (как делает apt/dpkg).
+        // Если python3 нет — тест пропускается, потому что без него
+        // невозможно эмулировать fcntl-lock из другого процесса.
+        use std::io::Read;
+        use std::process::Stdio;
         use std::sync::mpsc;
         use std::thread;
 
@@ -521,25 +527,45 @@ mod tests {
         let lock_path = lock_dir.path().join("dpkg-lock-frontend");
         std::fs::write(&lock_path, "").unwrap();
 
-        let (started_tx, started_rx) = mpsc::channel::<()>();
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-        let lock_path_clone = lock_path.clone();
-        let holder = thread::spawn(move || {
-            use fs4::fs_std::FileExt;
-            let f = std::fs::File::options()
-                .read(true)
-                .write(true)
-                .open(&lock_path_clone)
-                .unwrap();
-            // UFCS: см. lock_probe.rs — std::fs::File с 1.89 даёт
-            // inherent lock_exclusive/unlock, что бы конфликтовало по
-            // MSRV-clippy с trait'ом fs4.
-            FileExt::lock_exclusive(&f).unwrap();
-            started_tx.send(()).unwrap();
-            let _ = release_rx.recv();
-            FileExt::unlock(&f).unwrap();
+        let path_str = lock_path.to_str().unwrap().to_string();
+        let script = format!(
+            "import fcntl, sys, time\n\
+             f = open(r'{path_str}', 'r+')\n\
+             fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)\n\
+             sys.stdout.write('locked\\n'); sys.stdout.flush()\n\
+             sys.stdin.read()\n"
+        );
+        let mut child = match std::process::Command::new("python3")
+            .args(["-u", "-c", &script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => {
+                eprintln!("skipping: python3 not available for fcntl-lock holder");
+                return;
+            }
+        };
+
+        let mut stdout = child.stdout.take().unwrap();
+        let (tx, rx) = mpsc::channel::<()>();
+        let reader = thread::spawn(move || {
+            let mut buf = [0_u8; 32];
+            let mut acc = String::new();
+            while let Ok(n) = stdout.read(&mut buf) {
+                if n == 0 {
+                    return;
+                }
+                acc.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if acc.contains("locked") {
+                    let _ = tx.send(());
+                    return;
+                }
+            }
         });
-        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
         let diff = Diff::Add {
             description: "install".into(),
@@ -552,8 +578,9 @@ mod tests {
         }
         assert!(runner.calls().is_empty());
 
-        release_tx.send(()).unwrap();
-        holder.join().unwrap();
+        drop(child.stdin.take());
+        let _ = child.wait();
+        let _ = reader.join();
     }
 
     #[test]
