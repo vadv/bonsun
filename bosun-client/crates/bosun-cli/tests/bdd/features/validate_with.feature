@@ -1,15 +1,9 @@
-@docker @validate-with @todo-skip
+@docker @validate-with
 Feature: validate_with — атомарная замена с предварительной валидацией
   file.content c validate_with рендерит `<path>.new`, запускает validator
   на этом файле и только при exit=0 swap'ает в `<path>`. На failure
   `<path>.new` остаётся для forensics, target не трогается. Это chiit-
   паттерн «nginx -t / pgbouncer -t перед applyem конфигурации».
-  Сценарии помечены @todo-skip: file_content::build_payload в Phase H
-  не читает validate_with из Starlark CallArgs (см. apply.rs строки
-  123-162 знают про spec.validate_with, но в mod.rs::build_payload
-  поле не попадает в payload). Это production-gap, который ловится
-  именно этим BDD-набором — нужен фикс в primitives до того, как
-  сценарии пройдут зелёным.
 
   Scenario: Validator exit 0 — swap происходит
     Given a fresh container

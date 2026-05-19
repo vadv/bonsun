@@ -39,7 +39,8 @@ impl Primitive for FilePrimitive {
 
     /// Args, дошедшие сюда из Starlark-glue, уже без `contents` — оно
     /// перехвачено glue'ем и положено в SensitiveStore. Здесь ожидаются
-    /// `path`, `content_sha256`, `content_size`, опционально `mode/owner/group`.
+    /// `path`, `content_sha256`, `content_size`, опционально
+    /// `mode/owner/group/validate_with`.
     fn build_payload(
         &self,
         args: &CallArgs,
@@ -67,6 +68,17 @@ impl Primitive for FilePrimitive {
         let group = args
             .optional_str("group")
             .map_err(|e| PrimitiveError::InvalidPayload(format!("file.content: {e}")))?;
+        // validate_with — pre-swap валидатор (`nginx -t`, `pg_doorman -t`,
+        // etc.), list[str] из Starlark. Glue упаковывает список в
+        // `ArgValue::Other(Array)`, `optional_str_list` распаковывает обратно.
+        // Пустой массив намеренно НЕ фильтруем здесь: apply рассматривает
+        // `validate_with=[]` как bundle-bug (см. apply.rs::apply ветка
+        // `Some([])`) — «оператор явно вписал поле, тихий пропуск был бы
+        // сюрпризом». В отличие от runr.service/systemd.service, у которых
+        // пустой массив = None.
+        let validate_with = args
+            .optional_str_list("validate_with")
+            .map_err(|e| PrimitiveError::InvalidPayload(format!("file.content: {e}")))?;
 
         Ok(serde_json::json!({
             "path": path,
@@ -75,6 +87,7 @@ impl Primitive for FilePrimitive {
             "group": group,
             "content_sha256": content_sha256,
             "content_size": content_size,
+            "validate_with": validate_with,
         }))
     }
 
@@ -285,6 +298,90 @@ mod tests {
         assert_eq!(payload["mode"], serde_json::json!(0o600));
         assert_eq!(payload["owner"], serde_json::json!("root"));
         assert_eq!(payload["group"], serde_json::json!(null));
+        // validate_with не указан в kwargs — поле остаётся null, apply
+        // уходит по MVP-пути без render-to-.new.
+        assert!(payload["validate_with"].is_null());
+    }
+
+    /// Phase K regression: bundle с file.content(validate_with=[...])
+    /// должен пробрасывать массив в payload. До этого фикса
+    /// `build_payload` игнорировал поле, и Phase H render-to-.new путь
+    /// никогда не активировался — bundle выглядел валидно, а validator
+    /// тихо не запускался.
+    #[test]
+    fn build_payload_parses_validate_with_list() {
+        use std::collections::HashMap;
+
+        use bosun_core::ArgValue;
+
+        let mut args: HashMap<String, ArgValue> = HashMap::new();
+        args.insert("path".into(), ArgValue::Str("/etc/nginx.conf".into()));
+        args.insert("content_sha256".into(), ArgValue::Str("abc".into()));
+        args.insert("content_size".into(), ArgValue::Int(3));
+        args.insert(
+            "validate_with".into(),
+            ArgValue::Other(serde_json::json!(["nginx", "-t", "-c", "{new_path}"])),
+        );
+        let call_args = CallArgs::new(args);
+        let payload = FilePrimitive
+            .build_payload(&call_args, &plan_ctx())
+            .unwrap();
+        assert_eq!(
+            payload["validate_with"],
+            serde_json::json!(["nginx", "-t", "-c", "{new_path}"]),
+        );
+    }
+
+    /// validate_with=[] докатывается до payload как пустой массив —
+    /// apply отвергнет его как bundle-bug (см. apply.rs::apply ветка
+    /// `Some([])`). Регрессия: build_payload не должен молча трактовать
+    /// пустой как «не задано», иначе оператор не заметит ошибку.
+    #[test]
+    fn build_payload_keeps_empty_validate_with_array() {
+        use std::collections::HashMap;
+
+        use bosun_core::ArgValue;
+
+        let mut args: HashMap<String, ArgValue> = HashMap::new();
+        args.insert("path".into(), ArgValue::Str("/etc/x".into()));
+        args.insert("content_sha256".into(), ArgValue::Str("abc".into()));
+        args.insert("content_size".into(), ArgValue::Int(3));
+        args.insert(
+            "validate_with".into(),
+            ArgValue::Other(serde_json::json!([])),
+        );
+        let call_args = CallArgs::new(args);
+        let payload = FilePrimitive
+            .build_payload(&call_args, &plan_ctx())
+            .unwrap();
+        assert_eq!(payload["validate_with"], serde_json::json!([]));
+    }
+
+    /// Spec десериализуется из payload, который build_payload собрал.
+    /// Roundtrip JSON → FileContentSpec → validate_with как list.
+    #[test]
+    fn build_payload_validate_with_roundtrips_to_spec() {
+        use std::collections::HashMap;
+
+        use bosun_core::ArgValue;
+
+        let mut args: HashMap<String, ArgValue> = HashMap::new();
+        args.insert("path".into(), ArgValue::Str("/etc/pgbouncer.ini".into()));
+        args.insert("content_sha256".into(), ArgValue::Str("d4d4".into()));
+        args.insert("content_size".into(), ArgValue::Int(42));
+        args.insert(
+            "validate_with".into(),
+            ArgValue::Other(serde_json::json!(["pgbouncer", "-V", "{new_path}"])),
+        );
+        let call_args = CallArgs::new(args);
+        let payload = FilePrimitive
+            .build_payload(&call_args, &plan_ctx())
+            .unwrap();
+        let spec: super::spec::FileContentSpec = serde_json::from_value(payload).unwrap();
+        assert_eq!(
+            spec.validate_with.as_deref(),
+            Some(["pgbouncer".to_string(), "-V".into(), "{new_path}".into(),].as_slice(),),
+        );
     }
 
     #[test]
