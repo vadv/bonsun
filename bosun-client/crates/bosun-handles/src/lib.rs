@@ -25,9 +25,11 @@ pub use bosun_systemd_client::{SystemdError, UnitInfo};
 /// чтобы в production обходиться `impl RunrHandle for Client`, а в тестах
 /// подставить mock без переоформления возвращаемых типов.
 ///
-/// `Send + Sync` обязательны: ApplyCtx клонируется по `Arc`, оркестратор
-/// держит handle сквозь весь apply и может вызывать его из произвольного
-/// worker'а (даже если сейчас всё последовательно).
+/// `Send + Sync` — необходимая часть контракта: ApplyCtx делит handle
+/// через `Arc<dyn RunrHandle>`, а `Arc<dyn T>: Send` требует `T: Send +
+/// Sync`. Production-имплементация `bosun_runr_client::Client` поверх
+/// ureq удовлетворяет это естественно. См. compile-time assertions в
+/// `tests::thread_safety_contract`.
 pub trait RunrHandle: Send + Sync {
     fn base_url(&self) -> &str;
     fn daemon_info(&self) -> Result<DaemonInfo, RunrError>;
@@ -147,6 +149,14 @@ impl RunrHandle for bosun_runr_client::Client {
 /// systemd-job через `wait_for_job` с лимитом, чтобы примитив получал
 /// готовый результат и проверял `InvocationID` без дополнительной возни с
 /// `JobHandle`.
+///
+/// `Send + Sync` — необходимая часть контракта: ApplyCtx делит handle
+/// через `Arc<dyn SystemdHandle>`, а `Arc<dyn T>: Send` требует `T: Send
+/// + Sync`. `BlockingSystemdManager` поверх current-thread tokio runtime
+/// удовлетворяет это: `Runtime::block_on` сериализует исполнение на
+/// единственном worker'е, поэтому одновременные вызовы из нескольких
+/// нитей безопасны. См. compile-time assertions в
+/// `tests::thread_safety_contract`.
 pub trait SystemdHandle: Send + Sync {
     fn daemon_reload(&self) -> Result<(), SystemdError>;
     fn needs_daemon_reload(&self, unit_name: &str) -> Result<bool, SystemdError>;
@@ -228,5 +238,30 @@ impl SystemdHandle for bosun_systemd_client::BlockingSystemdManager {
     }
     fn unit_info(&self, name: &str) -> Result<UnitInfo, SystemdError> {
         bosun_systemd_client::BlockingSystemdManager::unit_info(self, name)
+    }
+}
+
+#[cfg(test)]
+mod thread_safety_contract {
+    //! Lock-in trait contracts. Если в будущем `BlockingSystemdManager`
+    //! или `bosun_runr_client::Client` перестанет быть `Send + Sync` —
+    //! компиляция этих assertions упадёт, и кто-то заметит расхождение
+    //! ДО того, как ApplyCtx::runr/systemd сломается на типовом уровне.
+    use super::*;
+
+    fn assert_send_sync<T: Send + Sync>() {}
+
+    #[test]
+    fn runr_handle_is_send_sync() {
+        assert_send_sync::<bosun_runr_client::Client>();
+        // Заодно проверяем, что dyn-объект через Arc остаётся
+        // Send + Sync: это ровно та форма, которой пользуется ApplyCtx.
+        assert_send_sync::<std::sync::Arc<dyn RunrHandle>>();
+    }
+
+    #[test]
+    fn systemd_handle_is_send_sync() {
+        assert_send_sync::<bosun_systemd_client::BlockingSystemdManager>();
+        assert_send_sync::<std::sync::Arc<dyn SystemdHandle>>();
     }
 }

@@ -18,9 +18,12 @@ use crate::types::{JobHandle, JobResult, UnitInfo};
 /// private `current_thread` tokio runtime; every public method calls
 /// `Runtime::block_on` to drive the async client to completion.
 ///
-/// Not `Sync`. Not `Send` across threads in any meaningful way (the
-/// connection is bound to the runtime worker). Wrap in `Rc` in
-/// orchestrator code and pass by reference.
+/// Thread-safety: this type is `Send + Sync` at the type level — both
+/// `tokio::runtime::Runtime` and `zbus::Connection` are `Send + Sync`,
+/// and `Runtime::block_on` takes `&self`. Multiple threads MAY call
+/// `block_on` concurrently; tokio guarantees only one task runs at a
+/// time on the single worker, so dbus calls are serialized internally.
+/// `Arc<BlockingSystemdManager>` is the supported shared-ownership form.
 pub struct BlockingSystemdManager {
     rt: Runtime,
     inner: SystemdManager,
