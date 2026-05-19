@@ -21,18 +21,17 @@ tempfile = { workspace = true }
 minijinja = { workspace = true }
 libc = { workspace = true }
 chrono = { workspace = true }
-# fs4 — advisory file-lock через flock(2) для apt.package dpkg-lock probe
-# (`/var/lib/dpkg/lock-frontend`). Тот же crate уже использован в bosun-cli
-# для per-host bosun-lock; кросс-platform не нужно, но дублирование с std
-# было бы дороже сопровождать.
+# fs4 — advisory file-lock через flock(2). Раньше использовался для apt.package
+# dpkg-lock probe; после F03-фикса там fcntl, fs4 нужен только в защитном
+# тесте `probe_does_not_detect_flock_locks`, чтобы зафиксировать различие
+# между BSD flock и POSIX fcntl. Оставлен в [dependencies], т.к. может ещё
+# понадобиться (per-host bosun-lock в bosun-cli использует тот же crate).
 fs4 = { workspace = true }
 # rand — джиттер backoff'ов в apt-get update retry-loop'е. На 60k нодах
 # фиксированный backoff пробивает mirror одинаковым залпом; ±25% jitter
 # размазывает retry'и по времени.
 rand = { workspace = true }
-
-[dev-dependencies]
-# CancellationToken нужен для конструирования PlanCtx/ApplyCtx в unit-тестах
-# file.content::apply. В production-коде это поле приходит из CLI через
-# `tokio::signal`, не из bosun-primitives.
+# tokio-util — CancellationToken пробрасывается из ApplyCtx через CommandRunner
+# в external-command runner (F05-фикс). Это часть public API trait'а
+# CommandRunner, поэтому в [dependencies], не [dev-dependencies].
 tokio-util = { workspace = true }

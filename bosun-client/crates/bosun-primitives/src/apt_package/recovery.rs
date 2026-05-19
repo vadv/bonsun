@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use bosun_core::PrimitiveError;
 use rand::Rng;
+use tokio_util::sync::CancellationToken;
 
 use super::exec::CommandRunner;
 
@@ -78,9 +79,10 @@ fn jittered_backoff(base: Duration, jitter_pct: u32) -> Duration {
 pub fn run_dpkg_configure_a(
     runner: &dyn CommandRunner,
     global_deadline: Instant,
+    cancel: &CancellationToken,
 ) -> Result<(), PrimitiveError> {
     let attempt_deadline = min_deadline(global_deadline, Instant::now() + DPKG_CONFIGURE_TIMEOUT);
-    let result = runner.run("dpkg", &["--configure", "-a"], attempt_deadline)?;
+    let result = runner.run("dpkg", &["--configure", "-a"], attempt_deadline, cancel)?;
     if result.exit_code == Some(0) {
         return Ok(());
     }
@@ -99,8 +101,9 @@ pub fn run_dpkg_configure_a(
 pub fn run_apt_update_with_retries(
     runner: &dyn CommandRunner,
     global_deadline: Instant,
+    cancel: &CancellationToken,
 ) -> Result<(), PrimitiveError> {
-    run_apt_update_with_policy(runner, global_deadline, &AptUpdatePolicy::default())
+    run_apt_update_with_policy(runner, global_deadline, &AptUpdatePolicy::default(), cancel)
 }
 
 /// Тот же `apt-get update`, но с явным `AptUpdatePolicy`. Нужен для тестов:
@@ -110,6 +113,7 @@ pub fn run_apt_update_with_policy(
     runner: &dyn CommandRunner,
     global_deadline: Instant,
     policy: &AptUpdatePolicy,
+    cancel: &CancellationToken,
 ) -> Result<(), PrimitiveError> {
     let args = &[
         "update",
@@ -124,7 +128,7 @@ pub fn run_apt_update_with_policy(
         // глобального deadline'а.
         let attempt_deadline =
             min_deadline(global_deadline, Instant::now() + policy.per_attempt_timeout);
-        let result = runner.run("apt-get", args, attempt_deadline)?;
+        let result = runner.run("apt-get", args, attempt_deadline, cancel)?;
 
         if result.exit_code == Some(0) {
             return Ok(());
@@ -278,6 +282,7 @@ mod tests {
             cmd: &str,
             args: &[&str],
             _deadline: Instant,
+            _cancel: &CancellationToken,
         ) -> Result<CommandResult, PrimitiveError> {
             self.calls.lock().unwrap().push((
                 cmd.to_string(),
@@ -319,7 +324,7 @@ mod tests {
     #[test]
     fn dpkg_configure_a_success() {
         let runner = MockRunner::new(vec![cmdres(Some(0), "")]);
-        run_dpkg_configure_a(&runner, deadline()).unwrap();
+        run_dpkg_configure_a(&runner, deadline(), &CancellationToken::new()).unwrap();
         let calls = runner.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "dpkg");
@@ -329,7 +334,7 @@ mod tests {
     #[test]
     fn dpkg_configure_a_failure_returns_exec() {
         let runner = MockRunner::new(vec![cmdres(Some(1), "dpkg: error processing")]);
-        let err = run_dpkg_configure_a(&runner, deadline()).unwrap_err();
+        let err = run_dpkg_configure_a(&runner, deadline(), &CancellationToken::new()).unwrap_err();
         match err {
             PrimitiveError::Exec {
                 reason,
@@ -347,7 +352,13 @@ mod tests {
     #[test]
     fn update_first_attempt_success_makes_one_call() {
         let runner = MockRunner::new(vec![cmdres(Some(0), "")]);
-        run_apt_update_with_policy(&runner, deadline(), &zero_backoff_policy(3)).unwrap();
+        run_apt_update_with_policy(
+            &runner,
+            deadline(),
+            &zero_backoff_policy(3),
+            &CancellationToken::new(),
+        )
+        .unwrap();
         let calls = runner.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, "apt-get");
@@ -366,15 +377,26 @@ mod tests {
             cmdres(Some(1), "503"),
             cmdres(Some(0), ""),
         ]);
-        run_apt_update_with_policy(&runner, deadline(), &zero_backoff_policy(3)).unwrap();
+        run_apt_update_with_policy(
+            &runner,
+            deadline(),
+            &zero_backoff_policy(3),
+            &CancellationToken::new(),
+        )
+        .unwrap();
         assert_eq!(runner.calls().len(), 3);
     }
 
     #[test]
     fn update_non_retriable_gpg_aborts_immediately() {
         let runner = MockRunner::new(vec![cmdres(Some(1), "W: GPG error: http://repo unsigned")]);
-        let err =
-            run_apt_update_with_policy(&runner, deadline(), &zero_backoff_policy(3)).unwrap_err();
+        let err = run_apt_update_with_policy(
+            &runner,
+            deadline(),
+            &zero_backoff_policy(3),
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
         match err {
             PrimitiveError::Exec {
                 reason,
@@ -393,8 +415,13 @@ mod tests {
     #[test]
     fn update_non_retriable_permission_denied_aborts_immediately() {
         let runner = MockRunner::new(vec![cmdres(Some(1), "E: permission denied on /var/lib")]);
-        let err =
-            run_apt_update_with_policy(&runner, deadline(), &zero_backoff_policy(3)).unwrap_err();
+        let err = run_apt_update_with_policy(
+            &runner,
+            deadline(),
+            &zero_backoff_policy(3),
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
         assert!(matches!(err, PrimitiveError::Exec { .. }));
         assert_eq!(runner.calls().len(), 1);
     }
@@ -406,8 +433,13 @@ mod tests {
             cmdres(Some(1), ""),
             cmdres(Some(1), ""),
         ]);
-        let err =
-            run_apt_update_with_policy(&runner, deadline(), &zero_backoff_policy(3)).unwrap_err();
+        let err = run_apt_update_with_policy(
+            &runner,
+            deadline(),
+            &zero_backoff_policy(3),
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
         match err {
             PrimitiveError::Exec { reason, .. } => assert!(reason.contains("after retries")),
             other => panic!("unexpected: {other:?}"),
@@ -535,7 +567,13 @@ mod tests {
         let runner = MockRunner::new(vec![cmdres(Some(1), "timed out"), cmdres(Some(0), "")]);
 
         let events = record_events(|| {
-            run_apt_update_with_policy(&runner, deadline(), &zero_backoff_policy(3)).unwrap();
+            run_apt_update_with_policy(
+                &runner,
+                deadline(),
+                &zero_backoff_policy(3),
+                &CancellationToken::new(),
+            )
+            .unwrap();
         });
 
         assert!(

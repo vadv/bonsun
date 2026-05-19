@@ -50,7 +50,7 @@ pub fn run(
         version = ?spec.version,
         "starting install",
     );
-    let install_result = install_attempt(runner, &spec, resource_deadline)?;
+    let install_result = install_attempt(runner, &spec, resource_deadline, &ctx.cancel)?;
     let outcome = analyze_install_result(&install_result);
     tracing::debug!(outcome = ?outcome, exit = ?install_result.exit_code, "install attempt result");
 
@@ -117,6 +117,7 @@ fn install_attempt(
     runner: &dyn CommandRunner,
     spec: &AptPackageSpec,
     deadline: Instant,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<CommandResult, PrimitiveError> {
     let pkg_spec = match &spec.version {
         Some(v) => format!("{}={}", spec.name, v),
@@ -136,6 +137,7 @@ fn install_attempt(
             &pkg_spec,
         ],
         deadline,
+        cancel,
     )
 }
 
@@ -157,7 +159,7 @@ fn recover_dpkg_then_retry(
     let _ = write_log(&ctx.log_dir, "install", &first_result.stderr);
     check_cancel_or_deadline(ctx)?;
 
-    if let Err(e) = run_dpkg_configure_a(runner, deadline) {
+    if let Err(e) = run_dpkg_configure_a(runner, deadline, &ctx.cancel) {
         // Сохраняем stderr `dpkg --configure -a` — даже если это `Exec`,
         // у нас уже есть excerpt в самой ошибке, но полный лог поможет
         // post-mortem'у.
@@ -168,7 +170,7 @@ fn recover_dpkg_then_retry(
     }
 
     check_cancel_or_deadline(ctx)?;
-    let retry = install_attempt(runner, spec, deadline)?;
+    let retry = install_attempt(runner, spec, deadline, &ctx.cancel)?;
     if retry.exit_code == Some(0) {
         if !retry.stderr.is_empty() {
             let _ = write_log(&ctx.log_dir, "install-retry", &retry.stderr);
@@ -197,7 +199,7 @@ fn recover_apt_update_then_retry(
     let _ = write_log(&ctx.log_dir, "install", &first_result.stderr);
     check_cancel_or_deadline(ctx)?;
 
-    if let Err(e) = run_apt_update_with_retries(runner, deadline) {
+    if let Err(e) = run_apt_update_with_retries(runner, deadline, &ctx.cancel) {
         if let PrimitiveError::Exec { stderr_excerpt, .. } = &e {
             let _ = write_log(&ctx.log_dir, "update", stderr_excerpt);
         }
@@ -205,7 +207,7 @@ fn recover_apt_update_then_retry(
     }
 
     check_cancel_or_deadline(ctx)?;
-    let retry = install_attempt(runner, spec, deadline)?;
+    let retry = install_attempt(runner, spec, deadline, &ctx.cancel)?;
     if retry.exit_code == Some(0) {
         if !retry.stderr.is_empty() {
             let _ = write_log(&ctx.log_dir, "install-retry", &retry.stderr);
@@ -272,6 +274,7 @@ mod tests {
             cmd: &str,
             args: &[&str],
             _deadline: Instant,
+            _cancel: &CancellationToken,
         ) -> Result<CommandResult, PrimitiveError> {
             self.calls
                 .lock()
