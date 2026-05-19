@@ -1036,6 +1036,8 @@ apt.package(name = "nginx")
     }
 
     /// Stub-примитив для `systemd.service`: симметричен `MockRunrService`.
+    /// Дополнительно достаёт list[str]-параметры через optional_str_list, чтобы
+    /// тесты могли проверять, что glue правильно пробрасывает массивы в payload.
     struct MockSystemdService;
 
     impl Primitive for MockSystemdService {
@@ -1056,7 +1058,18 @@ apt.package(name = "nginx")
             let state = args
                 .required_str("state")
                 .map_err(|e| PrimitiveError::InvalidPayload(format!("systemd.service: {e}")))?;
-            Ok(serde_json::json!({"name": name, "state": state}))
+            let validate_with = args
+                .optional_str_list("validate_with")
+                .map_err(|e| PrimitiveError::InvalidPayload(format!("systemd.service: {e}")))?;
+            let health_check_cmd = args
+                .optional_str_list("health_check_cmd")
+                .map_err(|e| PrimitiveError::InvalidPayload(format!("systemd.service: {e}")))?;
+            Ok(serde_json::json!({
+                "name": name,
+                "state": state,
+                "validate_with": validate_with,
+                "health_check_cmd": health_check_cmd,
+            }))
         }
         fn plan(
             &self,
@@ -1272,6 +1285,44 @@ service.unit(name = "nginx", state = "running", restart_on = [trigger])
         assert_eq!(
             svc.restart_on[0],
             ResourceId::new(&ResourceKind::from_static("apt.package"), "nginx"),
+        );
+    }
+
+    /// service.unit(validate_with=[...]) на init=systemd должен дойти до
+    /// systemd.service::build_payload с заполненным list[str]. Раньше glue
+    /// упаковывал список в Other(Array), а build_payload использовал
+    /// optional_str → молча терял массив. Это был блокер H1 ревью.
+    #[test]
+    fn service_unit_propagates_validate_with_to_systemd_payload() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "service")
+service.unit(
+    name = "nginx",
+    state = "running",
+    validate_with = ["nginx", "-t", "-c", "{new_path}"],
+    health_check_cmd = ["curl", "-fsS", "http://127.0.0.1/healthz"],
+)
+"#,
+        );
+        let facts: Rc<dyn FactsSource> = Rc::new(FixedInitSystem(Some("systemd")));
+        let run = run_with_facts(bundle, primitives_with_mock_services(), facts);
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        let svc = reg
+            .get(&ResourceId::new(
+                &ResourceKind::from_static("systemd.service"),
+                "nginx",
+            ))
+            .unwrap();
+        // Главное: payload реально содержит обе list-of-strings.
+        assert_eq!(
+            svc.payload["validate_with"],
+            serde_json::json!(["nginx", "-t", "-c", "{new_path}"]),
+        );
+        assert_eq!(
+            svc.payload["health_check_cmd"],
+            serde_json::json!(["curl", "-fsS", "http://127.0.0.1/healthz"]),
         );
     }
 

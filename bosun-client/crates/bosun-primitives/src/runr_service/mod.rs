@@ -66,18 +66,15 @@ impl Primitive for RunrServicePrimitive {
 
         // health_check: либо cmd-вариант (`health_check_cmd: Vec<String>`),
         // либо url-вариант (`health_check_url: String`). Оба сразу — ошибка.
-        let hc_cmd = args
-            .optional_handle_list("health_check_cmd")
-            .ok()
-            .filter(|v| !v.is_empty());
-        let _ = hc_cmd; // используем версию ниже через take_raw
         let health_check = build_health_check(args)?;
 
-        // validate_with: список аргументов validate-команды.
-        // CallArgs не имеет тип List<String>, поэтому берём raw через
-        // `take_raw` ниже не вариант (CallArgs &). Пока поддерживаем
-        // только через `Other(serde_json::Value)`.
-        let validate_with = extract_validate_with(args)?;
+        // validate_with — список аргументов pre-swap validate команды.
+        // Пустой массив трактуем как «не задан» (None), чтобы apply-фаза
+        // не запускала валидатор без аргументов.
+        let validate_with = args
+            .optional_str_list("validate_with")
+            .map_err(|e| PrimitiveError::InvalidPayload(format!("runr.service: {e}")))?
+            .filter(|v| !v.is_empty());
 
         Ok(serde_json::json!({
             "name": name,
@@ -111,10 +108,13 @@ impl Primitive for RunrServicePrimitive {
 /// `health_check_cmd` (List[str] из Starlark) → `HealthCheck::Cmd`.
 /// `health_check_url: str` → `HealthCheck::Url`. Оба одновременно — ошибка.
 fn build_health_check(args: &CallArgs) -> Result<Option<serde_json::Value>, PrimitiveError> {
-    // CallArgs не выдаёт `List[str]` напрямую — используем `Other` JSON-форму.
-    // Это согласовано с design: для Phase D Starlark-glue ещё не сериализует
-    // эти поля; реальное использование появится в `service.unit` Phase F.
-    let cmd = serialize_str_list_from_other(args, "health_check_cmd")?;
+    // `health_check_cmd` приходит из Starlark как list[str]. Glue упаковывает
+    // его в `ArgValue::Other(Array)`, `optional_str_list` распаковывает обратно.
+    // Пустой массив игнорируем — он эквивалентен «не задан».
+    let cmd = args
+        .optional_str_list("health_check_cmd")
+        .map_err(|e| PrimitiveError::InvalidPayload(format!("runr.service: {e}")))?
+        .filter(|v| !v.is_empty());
     let url = args
         .optional_str("health_check_url")
         .map_err(|e| PrimitiveError::InvalidPayload(format!("runr.service: {e}")))?;
@@ -167,41 +167,6 @@ fn build_health_check(args: &CallArgs) -> Result<Option<serde_json::Value>, Prim
         }
         (None, None) => Ok(None),
     }
-}
-
-/// Прочитать `List[str]`-параметр из CallArgs через `Other`. Если значение —
-/// JSON-array строк, возвращает `Vec<String>`. Иначе ошибка.
-fn serialize_str_list_from_other(
-    args: &CallArgs,
-    name: &str,
-) -> Result<Option<Vec<String>>, PrimitiveError> {
-    // CallArgs не предоставляет публичный геттер для Other-варианта без
-    // mutating-доступа. Здесь мы сознательно пробуем через optional_str
-    // как fallback на случай, когда Starlark пробросил список как
-    // JSON-string. Реальная обработка списка в build_payload подключится
-    // через `take_raw` на mutable CallArgs (см. Phase F refactor).
-    // Сейчас возвращаем None, если параметр отсутствует или не строка.
-    match args.optional_str(name) {
-        Ok(Some(joined)) => {
-            // Допустим, что Starlark кладёт пустой список как "" или
-            // не передаёт параметр. Тестам это не нужно — функциональность
-            // подключится в Phase F.
-            if joined.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(joined.split('\x1f').map(str::to_string).collect()))
-            }
-        }
-        Ok(None) => Ok(None),
-        Err(_) => Ok(None),
-    }
-}
-
-/// Аналог для `validate_with`. Сейчас возвращает None, реальный список
-/// подключится через Starlark glue в Phase H, когда `validate_with` появится
-/// в `service.unit` builder'е.
-fn extract_validate_with(_args: &CallArgs) -> Result<Option<Vec<String>>, PrimitiveError> {
-    Ok(None)
 }
 
 #[cfg(test)]
@@ -308,6 +273,104 @@ mod tests {
             .unwrap_err();
         match err {
             PrimitiveError::InvalidPayload(msg) => assert!(msg.contains("state")),
+            other => panic!("expected InvalidPayload, got {other:?}"),
+        }
+    }
+
+    /// Раньше health_check_cmd как list[str] тихо игнорировался — payload
+    /// получал `health_check: null`, replay никогда не запускал probe.
+    /// Теперь parser должен распаковать массив строк в `HealthCheck::Cmd`.
+    #[test]
+    fn build_payload_parses_health_check_cmd_list() {
+        let mut args: HashMap<String, ArgValue> = HashMap::new();
+        args.insert("name".into(), ArgValue::Str("api".into()));
+        args.insert("state".into(), ArgValue::Str("running".into()));
+        args.insert(
+            "health_check_cmd".into(),
+            ArgValue::Other(serde_json::json!([
+                "curl",
+                "-fsS",
+                "http://localhost/healthz"
+            ])),
+        );
+        args.insert("health_check_retry".into(), ArgValue::Int(3));
+        args.insert("health_check_timeout_sec".into(), ArgValue::Int(2));
+        let call_args = CallArgs::new(args);
+        let payload = RunrServicePrimitive::new()
+            .build_payload(&call_args, &plan_ctx())
+            .unwrap();
+        assert_eq!(payload["health_check"]["kind"], "cmd");
+        assert_eq!(
+            payload["health_check"]["cmd"],
+            serde_json::json!(["curl", "-fsS", "http://localhost/healthz"]),
+        );
+        assert_eq!(payload["health_check"]["retry_count"], 3);
+        assert_eq!(payload["health_check"]["timeout_sec"], 2);
+    }
+
+    /// `validate_with` тоже list[str]; раньше extract_validate_with всегда
+    /// возвращал None. Регрессия для service.unit(validate_with=...).
+    #[test]
+    fn build_payload_parses_validate_with_list() {
+        let mut args: HashMap<String, ArgValue> = HashMap::new();
+        args.insert("name".into(), ArgValue::Str("pgbouncer".into()));
+        args.insert("state".into(), ArgValue::Str("running".into()));
+        args.insert(
+            "validate_with".into(),
+            ArgValue::Other(serde_json::json!(["pgbouncer", "-V", "{new_path}"])),
+        );
+        let call_args = CallArgs::new(args);
+        let payload = RunrServicePrimitive::new()
+            .build_payload(&call_args, &plan_ctx())
+            .unwrap();
+        assert_eq!(
+            payload["validate_with"],
+            serde_json::json!(["pgbouncer", "-V", "{new_path}"]),
+        );
+    }
+
+    /// Пустой list[str] для health_check_cmd и validate_with трактуем как
+    /// «параметр не задан» — иначе apply попытался бы запустить пустой argv.
+    #[test]
+    fn build_payload_empty_list_treats_as_absent() {
+        let mut args: HashMap<String, ArgValue> = HashMap::new();
+        args.insert("name".into(), ArgValue::Str("svc".into()));
+        args.insert("state".into(), ArgValue::Str("running".into()));
+        args.insert(
+            "health_check_cmd".into(),
+            ArgValue::Other(serde_json::json!([])),
+        );
+        args.insert(
+            "validate_with".into(),
+            ArgValue::Other(serde_json::json!([])),
+        );
+        let call_args = CallArgs::new(args);
+        let payload = RunrServicePrimitive::new()
+            .build_payload(&call_args, &plan_ctx())
+            .unwrap();
+        assert!(payload["health_check"].is_null());
+        assert!(payload["validate_with"].is_null());
+    }
+
+    /// health_check_cmd с нестроковым элементом — структурная ошибка
+    /// от call_args::optional_str_list, должна добраться до InvalidPayload.
+    #[test]
+    fn build_payload_health_check_cmd_with_int_is_error() {
+        let mut args: HashMap<String, ArgValue> = HashMap::new();
+        args.insert("name".into(), ArgValue::Str("svc".into()));
+        args.insert("state".into(), ArgValue::Str("running".into()));
+        args.insert(
+            "health_check_cmd".into(),
+            ArgValue::Other(serde_json::json!(["ok", 42])),
+        );
+        let call_args = CallArgs::new(args);
+        let err = RunrServicePrimitive::new()
+            .build_payload(&call_args, &plan_ctx())
+            .unwrap_err();
+        match err {
+            PrimitiveError::InvalidPayload(msg) => {
+                assert!(msg.contains("health_check_cmd"), "got: {msg}");
+            }
             other => panic!("expected InvalidPayload, got {other:?}"),
         }
     }

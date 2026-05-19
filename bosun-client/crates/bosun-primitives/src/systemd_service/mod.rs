@@ -68,7 +68,13 @@ impl Primitive for SystemdServicePrimitive {
             .unwrap_or(true);
 
         let health_check = build_health_check(args)?;
-        let validate_with = extract_validate_with(args)?;
+        // validate_with — pre-swap валидатор, list[str] из Starlark. Glue
+        // упаковывает список в `ArgValue::Other(Array)`. Пустой массив
+        // равноценен «не задан».
+        let validate_with = args
+            .optional_str_list("validate_with")
+            .map_err(|e| PrimitiveError::InvalidPayload(format!("systemd.service: {e}")))?
+            .filter(|v| !v.is_empty());
 
         Ok(serde_json::json!({
             "name": name,
@@ -99,10 +105,13 @@ impl Primitive for SystemdServicePrimitive {
 }
 
 /// HealthCheck builder. Симметричен runr_service::build_health_check.
-/// Phase F (`service.unit`) будет регистрировать общий glue, который
-/// проставит эти аргументы — пока поведение тождественно runr-варианту.
+/// `health_check_cmd` — list[str], glue упаковывает в `ArgValue::Other(Array)`,
+/// `optional_str_list` распаковывает обратно. Пустой массив игнорируем.
 fn build_health_check(args: &CallArgs) -> Result<Option<serde_json::Value>, PrimitiveError> {
-    let cmd = serialize_str_list_from_other(args, "health_check_cmd")?;
+    let cmd = args
+        .optional_str_list("health_check_cmd")
+        .map_err(|e| PrimitiveError::InvalidPayload(format!("systemd.service: {e}")))?
+        .filter(|v| !v.is_empty());
     let url = args
         .optional_str("health_check_url")
         .map_err(|e| PrimitiveError::InvalidPayload(format!("systemd.service: {e}")))?;
@@ -152,29 +161,6 @@ fn build_health_check(args: &CallArgs) -> Result<Option<serde_json::Value>, Prim
         }
         (None, None) => Ok(None),
     }
-}
-
-/// Симметрично runr_service. Возвращает None пока Starlark glue для
-/// списка строк не подключился — см. Phase F refactor.
-fn serialize_str_list_from_other(
-    args: &CallArgs,
-    name: &str,
-) -> Result<Option<Vec<String>>, PrimitiveError> {
-    match args.optional_str(name) {
-        Ok(Some(joined)) => {
-            if joined.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(joined.split('\x1f').map(str::to_string).collect()))
-            }
-        }
-        Ok(None) => Ok(None),
-        Err(_) => Ok(None),
-    }
-}
-
-fn extract_validate_with(_args: &CallArgs) -> Result<Option<Vec<String>>, PrimitiveError> {
-    Ok(None)
 }
 
 #[cfg(test)]
@@ -282,5 +268,93 @@ mod tests {
         assert_eq!(payload["health_check"]["kind"], "url");
         assert_eq!(payload["health_check"]["url"], "http://127.0.0.1/healthz");
         assert_eq!(payload["health_check"]["expected_status"], 204);
+    }
+
+    /// Раньше health_check_cmd как list[str] тихо игнорировался — теперь
+    /// должен распаковываться в `HealthCheck::Cmd { cmd: [..] }`.
+    #[test]
+    fn build_payload_parses_health_check_cmd_list() {
+        let mut args: HashMap<String, ArgValue> = HashMap::new();
+        args.insert("name".into(), ArgValue::Str("nginx.service".into()));
+        args.insert("state".into(), ArgValue::Str("running".into()));
+        args.insert(
+            "health_check_cmd".into(),
+            ArgValue::Other(serde_json::json!(["curl", "-fsS", "http://127.0.0.1/"])),
+        );
+        let call_args = CallArgs::new(args);
+        let payload = SystemdServicePrimitive::new()
+            .build_payload(&call_args, &plan_ctx())
+            .unwrap();
+        assert_eq!(payload["health_check"]["kind"], "cmd");
+        assert_eq!(
+            payload["health_check"]["cmd"],
+            serde_json::json!(["curl", "-fsS", "http://127.0.0.1/"]),
+        );
+    }
+
+    /// validate_with — pre-swap валидатор для restart/reload defer.
+    /// Регрессия: service.unit(validate_with=["nginx","-t"]).
+    #[test]
+    fn build_payload_parses_validate_with_list() {
+        let mut args: HashMap<String, ArgValue> = HashMap::new();
+        args.insert("name".into(), ArgValue::Str("nginx.service".into()));
+        args.insert("state".into(), ArgValue::Str("running".into()));
+        args.insert(
+            "validate_with".into(),
+            ArgValue::Other(serde_json::json!(["nginx", "-t", "-c", "{new_path}"])),
+        );
+        let call_args = CallArgs::new(args);
+        let payload = SystemdServicePrimitive::new()
+            .build_payload(&call_args, &plan_ctx())
+            .unwrap();
+        assert_eq!(
+            payload["validate_with"],
+            serde_json::json!(["nginx", "-t", "-c", "{new_path}"]),
+        );
+    }
+
+    #[test]
+    fn build_payload_empty_health_check_cmd_is_absent() {
+        let mut args: HashMap<String, ArgValue> = HashMap::new();
+        args.insert("name".into(), ArgValue::Str("nginx.service".into()));
+        args.insert("state".into(), ArgValue::Str("running".into()));
+        args.insert(
+            "health_check_cmd".into(),
+            ArgValue::Other(serde_json::json!([])),
+        );
+        args.insert(
+            "validate_with".into(),
+            ArgValue::Other(serde_json::json!([])),
+        );
+        let call_args = CallArgs::new(args);
+        let payload = SystemdServicePrimitive::new()
+            .build_payload(&call_args, &plan_ctx())
+            .unwrap();
+        assert!(payload["health_check"].is_null());
+        assert!(payload["validate_with"].is_null());
+    }
+
+    /// health_check_cmd и health_check_url вместе — InvalidPayload, ловим,
+    /// что новая реализация cmd-парсера не сломала эту проверку.
+    #[test]
+    fn build_payload_both_cmd_and_url_is_error() {
+        let mut args: HashMap<String, ArgValue> = HashMap::new();
+        args.insert("name".into(), ArgValue::Str("nginx.service".into()));
+        args.insert("state".into(), ArgValue::Str("running".into()));
+        args.insert(
+            "health_check_cmd".into(),
+            ArgValue::Other(serde_json::json!(["curl"])),
+        );
+        args.insert("health_check_url".into(), ArgValue::Str("http://x/".into()));
+        let call_args = CallArgs::new(args);
+        let err = SystemdServicePrimitive::new()
+            .build_payload(&call_args, &plan_ctx())
+            .unwrap_err();
+        match err {
+            PrimitiveError::InvalidPayload(msg) => {
+                assert!(msg.contains("одновременно не допускаются"), "got: {msg}");
+            }
+            other => panic!("expected InvalidPayload, got {other:?}"),
+        }
     }
 }
