@@ -289,6 +289,7 @@ dependencies = [
  "bosun-handles",
  "chrono",
  "dupe",
+ "libc",
  "semver",
  "serde",
  "serde_json",

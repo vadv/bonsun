@@ -9,11 +9,29 @@
 //! Dedup правила реализуют chiit-семантику: restart субсумирует reload,
 //! идемпотентная повторная вставка возвращает `AlreadyExists` без
 //! перезаписи (content stable, проверено в `defers_test.go:36`).
+//!
+//! Журнал по умолчанию лежит в `/tmp/bosun-defers` (сознательное решение,
+//! tmpfs выдерживает агрессивные fsync'и). Под root путь под `/tmp`
+//! даёт local user возможность pre-create symlink и заставить chmod
+//! на чужой файл. Поэтому `Journal::open` валидирует root через
+//! `symlink_metadata` + `O_NOFOLLOW|O_DIRECTORY` и работает с правами
+//! через `fchmod` на открытый fd, а не через `set_permissions` по пути.
+
+// SAFETY-обоснование на уровне модуля: unsafe-блок в `harden_root`
+// вызывает `libc::fstat` и `libc::fchmod` на raw fd. Указатели валидны
+// (fd принадлежит живому `File`, &mut stat — стэковая структура).
+// Return code проверяется явно, errno читается через
+// `io::Error::last_os_error`.
+#![allow(unsafe_code)]
 
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::mem::MaybeUninit;
+use std::os::fd::AsRawFd;
+#[cfg(test)]
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -44,6 +62,11 @@ pub enum DeferError {
     /// часов, или баг конструирования `tmp.<nanos>` имени).
     #[error("system clock is before unix epoch")]
     Clock,
+    /// Корень журнала не прошёл проверку безопасности: это symlink,
+    /// или не директория, или принадлежит чужому uid. Под root local user
+    /// мог pre-create путь, поэтому отказываем громко.
+    #[error("defer journal root {path} is unsafe: {reason}")]
+    UnsafeRoot { path: PathBuf, reason: String },
 }
 
 impl DeferError {
@@ -92,30 +115,23 @@ impl Journal {
         &self.root
     }
 
-    /// Открывает (или создаёт) журнал. На создании ставится `0o700`;
-    /// если запуск под root, ядро автоматически проставит owner=root.
-    /// Мы не делаем `chown` — он требует CAP_CHOWN и не нужен в неpriv
-    /// тестах.
+    /// Открывает (или создаёт) журнал.
+    ///
+    /// Контракт безопасности (важен под root, журнал лежит в `/tmp`):
+    /// - root не может быть symlink — `symlink_metadata` отвергает такие
+    ///   пути до любых модификаций.
+    /// - root открывается с `O_NOFOLLOW | O_DIRECTORY`: если между
+    ///   проверкой и открытием путь подменили — open провалится.
+    /// - права (`fchmod`) ставятся через открытый fd, не через
+    ///   `set_permissions` по пути, который следует за symlink.
+    /// - owner проверяется через `fstat` на тот же fd: должен совпадать
+    ///   с euid процесса (или быть root, если процесс root). Чужой uid
+    ///   = local user предзагрязнил путь, отказ.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, DeferError> {
         let root = path.as_ref().to_path_buf();
-        if !root.exists() {
-            fs::create_dir_all(&root).map_err(|e| DeferError::io(&root, e))?;
-        }
-        let metadata = fs::metadata(&root).map_err(|e| DeferError::io(&root, e))?;
-        if !metadata.is_dir() {
-            return Err(DeferError::io(
-                &root,
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "journal root is not a directory",
-                ),
-            ));
-        }
-        let mut perms = metadata.permissions();
-        if perms.mode() & 0o777 != 0o700 {
-            perms.set_mode(0o700);
-            fs::set_permissions(&root, perms).map_err(|e| DeferError::io(&root, e))?;
-        }
+        ensure_root_directory(&root)?;
+        let dir = open_root_nofollow(&root)?;
+        harden_root(&root, &dir)?;
         Ok(Journal { root })
     }
 
@@ -323,6 +339,114 @@ fn read_entry(path: &Path) -> Result<DeferEntry, DeferError> {
     serde_json::from_slice(&bytes).map_err(|e| DeferError::serde(path, e))
 }
 
+/// Создаёт `root` если его нет, отвергает symlink и не-директории.
+///
+/// Если путь отсутствует — `mkdir` сам с mode `0o700` (mkdir не следует
+/// за symlink в финальном компоненте: если местo символическая ссылка,
+/// ядро вернёт EEXIST, а не молча создаст её цель). После создания мы
+/// всё равно перепроверим через `symlink_metadata` — на случай TOCTOU.
+fn ensure_root_directory(root: &Path) -> Result<(), DeferError> {
+    match fs::symlink_metadata(root) {
+        Ok(meta) => {
+            let file_type = meta.file_type();
+            if file_type.is_symlink() {
+                return Err(DeferError::UnsafeRoot {
+                    path: root.to_path_buf(),
+                    reason: "path is a symlink".into(),
+                });
+            }
+            if !file_type.is_dir() {
+                return Err(DeferError::UnsafeRoot {
+                    path: root.to_path_buf(),
+                    reason: "path exists but is not a directory".into(),
+                });
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // Создаём только финальный компонент: родитель должен уже
+            // существовать (`/tmp`, `/var/lib/bosun` и т.п.). Это
+            // даёт детерминированный обзор того, что именно журнал
+            // создаёт. Сам `mkdir` атомарен по отношению к symlink:
+            // если кто-то параллельно создал symlink на этом пути,
+            // mkdir вернёт EEXIST.
+            let mut builder = fs::DirBuilder::new();
+            builder.recursive(false).mode(0o700);
+            builder.create(root).map_err(|e| DeferError::io(root, e))?;
+            // Перепроверяем: после mkdir путь должен быть директорией,
+            // не symlink'ом. Если кто-то успел rmdir + symlink в
+            // микросекундном окне, мы это увидим.
+            let meta = fs::symlink_metadata(root).map_err(|e| DeferError::io(root, e))?;
+            if meta.file_type().is_symlink() {
+                return Err(DeferError::UnsafeRoot {
+                    path: root.to_path_buf(),
+                    reason: "path became a symlink after mkdir".into(),
+                });
+            }
+        }
+        Err(e) => return Err(DeferError::io(root, e)),
+    }
+    Ok(())
+}
+
+/// Открывает root через `O_NOFOLLOW | O_DIRECTORY`. Если кто-то между
+/// `ensure_root_directory` и open подменил путь на symlink — open
+/// упадёт с `ELOOP` (ОС-зависимо EINVAL/ENOTDIR), и мы возвращаем ошибку
+/// до любого `fchmod`.
+fn open_root_nofollow(root: &Path) -> Result<File, DeferError> {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(root)
+        .map_err(|e| DeferError::io(root, e))
+}
+
+/// Через открытый fd: проверяет owner (`fstat`) и нормализует mode
+/// (`fchmod`). Оба сисколла работают по fd, поэтому подмена пути на
+/// symlink после open уже бесполезна — fd ссылается на конкретный inode.
+fn harden_root(root: &Path, dir: &File) -> Result<(), DeferError> {
+    // SAFETY: `libc::fstat` принимает fd и `*mut stat`. fd валиден
+    // (живой `File`). Указатель на `MaybeUninit<stat>` — выровненный,
+    // ненулевой; ядро либо заполнит структуру, либо вернёт -1.
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    let rc = unsafe { libc::fstat(dir.as_raw_fd(), stat.as_mut_ptr()) };
+    if rc == -1 {
+        return Err(DeferError::io(root, io::Error::last_os_error()));
+    }
+    // SAFETY: `fstat` вернул 0 → `stat` инициализирована ядром.
+    let stat = unsafe { stat.assume_init() };
+
+    // owner = euid процесса. Под root euid=0, root владеет /tmp/bosun-defers
+    // и проверка тривиальна. Под non-root (тесты) euid≠0, путь создан
+    // самим процессом, ulid совпадает. Если совпадает с root — тоже
+    // принимаем: процесс мог перейти из root в обычного user'а с правом
+    // оставить файл за собой.
+    // SAFETY: `libc::geteuid()` — getter без побочных эффектов.
+    let euid = unsafe { libc::geteuid() };
+    if stat.st_uid != euid && stat.st_uid != 0 {
+        return Err(DeferError::UnsafeRoot {
+            path: root.to_path_buf(),
+            reason: format!(
+                "owner uid={} differs from euid={} (and is not root)",
+                stat.st_uid, euid
+            ),
+        });
+    }
+
+    // Нормализуем mode: 0o700 и ничего больше. Делаем fchmod даже если
+    // уже выставлено — это дешевле проверки и закрывает race с
+    // chmod-ом от стороннего процесса между ensure и open.
+    let current_mode = (stat.st_mode & 0o777) as libc::mode_t;
+    if current_mode != 0o700 {
+        // SAFETY: `libc::fchmod(fd, mode)` — POSIX API. fd валиден,
+        // mode 0o700 — допустимое значение. Возврат -1 при ошибке.
+        let rc = unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) };
+        if rc == -1 {
+            return Err(DeferError::io(root, io::Error::last_os_error()));
+        }
+    }
+    Ok(())
+}
+
 /// Утилита для тестов: проверка, что в журнале нет залежавшихся `.tmp.*` файлов.
 #[cfg(test)]
 pub(crate) fn has_tmp_leftovers(root: &Path) -> bool {
@@ -405,6 +529,78 @@ mod tests {
         let mut perms = fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
         fs::set_permissions(&path, perms).unwrap();
+        let _journal = Journal::open(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn open_rejects_symlink_at_root() {
+        let tmp = TempDir::new().unwrap();
+        let real_target = tmp.path().join("real");
+        fs::create_dir_all(&real_target).unwrap();
+        let symlink_root = tmp.path().join("journal");
+        std::os::unix::fs::symlink(&real_target, &symlink_root).unwrap();
+        // Имитируем атаку: оператор просит открыть `journal`, а это
+        // symlink на чужое место. Open должен отвергнуть до любого
+        // chmod на цель.
+        let err = Journal::open(&symlink_root).unwrap_err();
+        match err {
+            DeferError::UnsafeRoot { reason, .. } => {
+                assert!(reason.contains("symlink"), "reason: {reason}");
+            }
+            other => panic!("expected UnsafeRoot, got {other:?}"),
+        }
+        // Права на real_target должны остаться нетронутыми (не 0700).
+        // Проверяем что мы не сделали chmod на цель symlink'а.
+        let mode = fs::metadata(&real_target).unwrap().permissions().mode();
+        // Дефолтная директория обычно 0o755, точно не 0o700.
+        assert_ne!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn open_rejects_symlink_to_sensitive_file_does_not_chmod_target() {
+        // Точное воспроизведение угрозы из ревью: local user подкладывает
+        // symlink на чужой файл. Старый код делал бы set_permissions по
+        // пути и хитро менял права на чужую цель.
+        let tmp = TempDir::new().unwrap();
+        let victim = tmp.path().join("victim");
+        // Создаём «жертву» — обычный файл с разрешающими правами.
+        fs::write(&victim, b"sensitive").unwrap();
+        let mut perms = fs::metadata(&victim).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&victim, perms).unwrap();
+
+        let attack = tmp.path().join("bosun-defers");
+        std::os::unix::fs::symlink(&victim, &attack).unwrap();
+
+        let _ = Journal::open(&attack).unwrap_err();
+        // Жертва осталась 0o644.
+        let mode = fs::metadata(&victim).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644);
+    }
+
+    #[test]
+    fn open_rejects_non_directory_path() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("file");
+        fs::write(&path, b"hi").unwrap();
+        let err = Journal::open(&path).unwrap_err();
+        match err {
+            DeferError::UnsafeRoot { reason, .. } => {
+                assert!(reason.contains("not a directory"));
+            }
+            other => panic!("expected UnsafeRoot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_existing_directory_with_correct_mode_is_accepted() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("journal");
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder.create(&path).unwrap();
         let _journal = Journal::open(&path).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
