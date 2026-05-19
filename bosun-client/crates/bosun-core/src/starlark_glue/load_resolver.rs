@@ -176,12 +176,12 @@ mod tests {
                 version: "0.1.0".into(),
                 description: None,
                 requires_bosun: "^0.1".into(),
-                entry: "manifests/main.star".into(),
+                entry: "main.star".into(),
                 inventory: Default::default(),
                 tags: Default::default(),
             },
             root: PathBuf::from("/tmp/nonexistent"),
-            entry: PathBuf::from("/tmp/nonexistent/manifests/main.star"),
+            entry: PathBuf::from("/tmp/nonexistent/main.star"),
         };
         Rc::new(EvalState {
             bundle: Rc::new(bundle),

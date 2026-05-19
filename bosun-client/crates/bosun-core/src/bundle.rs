@@ -1,9 +1,9 @@
-//! Загрузчик bundle: layout `bundle.toml + manifests/ + inventory/ + roles/ + _lib/`.
+//! Загрузчик bundle: layout `bundle.toml + main.star + inventory/ + roles/ + _lib/`.
 //!
 //! Bundle — самодостаточная директория. `Bundle::load_dir` валидирует
 //! `bundle.toml`, проверяет `entry` через path-safety helper и сохраняет
-//! канонические пути. Manifests/roles/lib/inventory грузятся on-demand
-//! Starlark-loader'ом, не предзагружаются.
+//! канонические пути. Entry-манифест (`main.star`) лежит в корне bundle;
+//! roles/lib/inventory грузятся on-demand Starlark-loader'ом.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -40,8 +40,8 @@ pub enum BundleError {
     UnsupportedLoadPath { load_path: String },
     #[error("template() called from unsupported module: {module:?} (only roles/<name>/main.star or _lib/<name>/main.star)")]
     UnsupportedModuleForTemplate { module: PathBuf },
-    #[error("template() cannot be called from manifests/main.star: {hint}")]
-    TemplateFromManifests { hint: String },
+    #[error("template() cannot be called from bundle entry (main.star): {hint}")]
+    TemplateFromEntry { hint: String },
     #[error("private symbol '{symbol}' cannot be imported from {module:?}")]
     PrivateSymbol { symbol: String, module: PathBuf },
     #[error("path-safety violation: {0}")]
@@ -58,7 +58,9 @@ pub struct BundleMetadata {
     #[serde(default)]
     pub description: Option<String>,
     pub requires_bosun: String,
-    /// Относительный путь под bundle/ к entry-манифесту.
+    /// Относительный путь под bundle/ к entry-манифесту. По соглашению —
+    /// `main.star` в корне; поле опционально в `bundle.toml`.
+    #[serde(default = "default_entry")]
     pub entry: String,
     /// Опциональная конфигурация inventory (default_merge_strategy).
     #[serde(default)]
@@ -75,6 +77,10 @@ pub struct BundleMetadata {
 pub struct BundleInventoryConfig {
     #[serde(default)]
     pub default_merge_strategy: Option<String>,
+}
+
+fn default_entry() -> String {
+    "main.star".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -181,10 +187,9 @@ impl Bundle {
         module: &Path,
         template_rel: &str,
     ) -> Result<PathBuf, BundleError> {
-        // template() из manifests/main.star — запрещён по spec.
-        let manifests_main = self.root.join("manifests").join("main.star");
-        if module == manifests_main {
-            return Err(BundleError::TemplateFromManifests {
+        // template() из entry-манифеста в корне bundle — запрещён по spec.
+        if module == self.entry {
+            return Err(BundleError::TemplateFromEntry {
                 hint: "move rendering into a role or @lib module".to_string(),
             });
         }
@@ -272,7 +277,7 @@ name           = "demo"
 version        = "0.1.0"
 description    = "demo bundle"
 requires_bosun = "^0.1"
-entry          = "manifests/main.star"
+entry          = "main.star"
 
 [bundle.inventory]
 default_merge_strategy = "deep_map_replace_list"
@@ -283,20 +288,38 @@ staging    = "Staging"
 "#,
         );
         write(
-            &root.join("manifests/main.star"),
+            &root.join("main.star"),
             "load(\"@bosun/builtins\", \"apt\")\n",
         );
 
         let bundle = Bundle::load_dir(&root).unwrap();
         assert_eq!(bundle.metadata.name, "demo");
-        assert_eq!(bundle.metadata.entry, "manifests/main.star");
+        assert_eq!(bundle.metadata.entry, "main.star");
         assert_eq!(bundle.metadata.description.as_deref(), Some("demo bundle"));
         assert_eq!(
             bundle.metadata.inventory.default_merge_strategy.as_deref(),
             Some("deep_map_replace_list")
         );
         assert_eq!(bundle.metadata.tags.len(), 2);
-        assert!(bundle.entry.ends_with("manifests/main.star"));
+        assert!(bundle.entry.ends_with("main.star"));
+    }
+
+    #[test]
+    fn load_dir_defaults_entry_when_omitted() {
+        let (_keep, root) = make_bundle_dir();
+        write(
+            &root.join("bundle.toml"),
+            r#"
+[bundle]
+name           = "demo"
+version        = "0.1.0"
+requires_bosun = "^0.1"
+"#,
+        );
+        write(&root.join("main.star"), "");
+        let bundle = Bundle::load_dir(&root).unwrap();
+        assert_eq!(bundle.metadata.entry, "main.star");
+        assert!(bundle.entry.ends_with("main.star"));
     }
 
     #[test]
@@ -309,10 +332,10 @@ staging    = "Staging"
 name = "demo"
 version = "0.1.0"
 requires_bosun = "^0.1"
-entry = "manifests/main.star"
+entry = "main.star"
 "#,
         );
-        write(&root.join("manifests/main.star"), "");
+        write(&root.join("main.star"), "");
         let bundle = Bundle::load_dir(&root).unwrap();
         bundle.check_compatibility("0.1.0").unwrap();
         bundle.check_compatibility("0.1.5").unwrap();
@@ -328,10 +351,10 @@ entry = "manifests/main.star"
 name = "demo"
 version = "0.1.0"
 requires_bosun = "^0.1"
-entry = "manifests/main.star"
+entry = "main.star"
 "#,
         );
-        write(&root.join("manifests/main.star"), "");
+        write(&root.join("main.star"), "");
         let bundle = Bundle::load_dir(&root).unwrap();
         let err = bundle.check_compatibility("0.2.0").unwrap_err();
         assert!(matches!(err, BundleError::VersionIncompatible { .. }));
@@ -347,10 +370,10 @@ entry = "manifests/main.star"
 name = "demo"
 version = "0.1.0"
 requires_bosun = "^0.1"
-entry = "manifests/missing.star"
+entry = "missing.star"
 "#,
         );
-        write(&root.join("manifests/other.star"), "");
+        write(&root.join("other.star"), "");
         let err = Bundle::load_dir(&root).unwrap_err();
         assert!(matches!(err, BundleError::EntryNotFound(_)));
     }
@@ -408,7 +431,7 @@ entry = "../etc/passwd"
     fn resolve_module_for_roles_returns_canonical_path() {
         let (_keep, root) = make_bundle_dir();
         write(&root.join("bundle.toml"), default_bundle_toml());
-        write(&root.join("manifests/main.star"), "");
+        write(&root.join("main.star"), "");
         write(&root.join("roles/nginx/main.star"), "");
         let bundle = Bundle::load_dir(&root).unwrap();
         let p = bundle.resolve_module("@roles/nginx").unwrap();
@@ -419,7 +442,7 @@ entry = "../etc/passwd"
     fn resolve_module_for_lib_returns_canonical_path() {
         let (_keep, root) = make_bundle_dir();
         write(&root.join("bundle.toml"), default_bundle_toml());
-        write(&root.join("manifests/main.star"), "");
+        write(&root.join("main.star"), "");
         write(&root.join("_lib/runr/main.star"), "");
         let bundle = Bundle::load_dir(&root).unwrap();
         let p = bundle.resolve_module("@lib/runr").unwrap();
@@ -430,7 +453,7 @@ entry = "../etc/passwd"
     fn resolve_module_unsupported_prefix_is_error() {
         let (_keep, root) = make_bundle_dir();
         write(&root.join("bundle.toml"), default_bundle_toml());
-        write(&root.join("manifests/main.star"), "");
+        write(&root.join("main.star"), "");
         let bundle = Bundle::load_dir(&root).unwrap();
         let err = bundle.resolve_module("//foo/bar").unwrap_err();
         assert!(matches!(err, BundleError::UnsupportedLoadPath { .. }));
@@ -440,7 +463,7 @@ entry = "../etc/passwd"
     fn resolve_module_missing_role_is_module_not_found() {
         let (_keep, root) = make_bundle_dir();
         write(&root.join("bundle.toml"), default_bundle_toml());
-        write(&root.join("manifests/main.star"), "");
+        write(&root.join("main.star"), "");
         let bundle = Bundle::load_dir(&root).unwrap();
         let err = bundle.resolve_module("@roles/missing").unwrap_err();
         assert!(matches!(err, BundleError::ModuleNotFound { .. }));
@@ -450,7 +473,7 @@ entry = "../etc/passwd"
     fn resolve_template_from_role_module_resolves_to_role_templates() {
         let (_keep, root) = make_bundle_dir();
         write(&root.join("bundle.toml"), default_bundle_toml());
-        write(&root.join("manifests/main.star"), "");
+        write(&root.join("main.star"), "");
         write(&root.join("roles/nginx/main.star"), "");
         write(&root.join("roles/nginx/templates/nginx.conf.j2"), "ok");
         let bundle = Bundle::load_dir(&root).unwrap();
@@ -465,7 +488,7 @@ entry = "../etc/passwd"
     fn resolve_template_from_lib_module_resolves_to_lib_templates() {
         let (_keep, root) = make_bundle_dir();
         write(&root.join("bundle.toml"), default_bundle_toml());
-        write(&root.join("manifests/main.star"), "");
+        write(&root.join("main.star"), "");
         write(&root.join("_lib/runr/main.star"), "");
         write(&root.join("_lib/runr/templates/service.j2"), "ok");
         let bundle = Bundle::load_dir(&root).unwrap();
@@ -475,22 +498,22 @@ entry = "../etc/passwd"
     }
 
     #[test]
-    fn resolve_template_from_manifests_main_is_rejected() {
+    fn resolve_template_from_root_entry_is_rejected() {
         let (_keep, root) = make_bundle_dir();
         write(&root.join("bundle.toml"), default_bundle_toml());
-        write(&root.join("manifests/main.star"), "");
+        write(&root.join("main.star"), "");
         let bundle = Bundle::load_dir(&root).unwrap();
         let err = bundle
             .resolve_template(&bundle.entry, "anything.j2")
             .unwrap_err();
-        assert!(matches!(err, BundleError::TemplateFromManifests { .. }));
+        assert!(matches!(err, BundleError::TemplateFromEntry { .. }));
     }
 
     #[test]
     fn resolve_template_cross_module_path_is_rejected() {
         let (_keep, root) = make_bundle_dir();
         write(&root.join("bundle.toml"), default_bundle_toml());
-        write(&root.join("manifests/main.star"), "");
+        write(&root.join("main.star"), "");
         write(&root.join("roles/nginx/main.star"), "");
         let bundle = Bundle::load_dir(&root).unwrap();
         let role_module = bundle.resolve_module("@roles/nginx").unwrap();
@@ -505,7 +528,7 @@ entry = "../etc/passwd"
     fn resolve_template_unsupported_module_is_error() {
         let (_keep, root) = make_bundle_dir();
         write(&root.join("bundle.toml"), default_bundle_toml());
-        write(&root.join("manifests/main.star"), "");
+        write(&root.join("main.star"), "");
         write(&root.join("scratch/foo.star"), "");
         let bundle = Bundle::load_dir(&root).unwrap();
         let weird = root.join("scratch/foo.star").canonicalize().unwrap();
@@ -522,7 +545,7 @@ entry = "../etc/passwd"
 name = "demo"
 version = "0.1.0"
 requires_bosun = "^0.1"
-entry = "manifests/main.star"
+entry = "main.star"
 "#
     }
 }

@@ -34,7 +34,7 @@ inventory.read + inventory.merge и module-relative template().
 ```
 bundle/
 ├── bundle.toml                       # метаданные + bundle.tags + bundle.inventory
-├── manifests/main.star               # entry: загружает inventory + роль nginx
+├── main.star                         # entry: загружает inventory + роль nginx
 ├── inventory/
 │   ├── base.yaml                     # дефолты
 │   ├── production.yaml               # overrides для tags=production

@@ -41,7 +41,7 @@ pub struct BosunWorld {
     pub container_workdir: String,
     /// Tempdir на хосте, куда складываются файлы bundle до `docker cp`.
     pub bundle_tmp: Option<TempDir>,
-    /// Тело manifest'а (manifests/main.star).
+    /// Тело manifest'а (main.star в корне).
     pub manifest_body: Option<String>,
     /// Тело inventory (yaml).
     pub inventory_yaml: Option<String>,

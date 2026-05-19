@@ -2,7 +2,6 @@
 name = "merge-default-strategy"
 version = "0.1.0"
 requires_bosun = "^0.1"
-entry = "manifests/main.star"
 
 [bundle.inventory]
 default_merge_strategy = "deep_map_append_list"

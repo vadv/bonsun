@@ -268,8 +268,8 @@ pub fn evaluate_manifest(config: EvaluatorConfig) -> Result<(), StarlarkGlueErro
     let _guard = StateGuard::install(Rc::clone(&state))?;
 
     // Стек current_module начинаем с entry — это нужно, если template()
-    // вызывается из top-level кода manifests/main.star (он попадёт в reject
-    // через TemplateFromManifests). Иначе fallback на codemap пойдёт мимо.
+    // вызывается из top-level кода main.star (он попадёт в reject через
+    // TemplateFromEntry). Иначе fallback на codemap пойдёт мимо.
     let _entry_guard = ModuleStackGuard::push(Rc::clone(&state), entry_path.clone());
 
     let module = Module::new();
@@ -484,7 +484,7 @@ mod tests {
 name = "test"
 version = "0.1.0"
 requires_bosun = "^0.1"
-entry = "manifests/main.star"
+entry = "main.star"
 
 [bundle.inventory]
 default_merge_strategy = "deep_map_replace_list"
@@ -503,7 +503,7 @@ default_merge_strategy = "deep_map_replace_list"
     }
 
     fn bundle_with_manifest(manifest_source: &str) -> Bundle {
-        make_bundle_with_files(&[("manifests/main.star", manifest_source)])
+        make_bundle_with_files(&[("main.star", manifest_source)])
     }
 
     fn primitives_with_mock_apt() -> Rc<HashMap<ResourceKind, Box<dyn Primitive>>> {
@@ -652,7 +652,7 @@ apt.package(name = active[0])
     fn inventory_load_reads_yaml() {
         let bundle = make_bundle_with_files(&[
             (
-                "manifests/main.star",
+                "main.star",
                 r#"
 load("@bosun/builtins", "apt", "inventory")
 inv_data = inventory.read("inventory/base.yaml")
@@ -676,7 +676,7 @@ apt.package(name = inv_data["pkg"])
     fn inventory_merge_default_strategy_from_bundle_toml() {
         let bundle = make_bundle_with_files(&[
             (
-                "manifests/main.star",
+                "main.star",
                 r#"
 load("@bosun/builtins", "apt", "inventory")
 a = inventory.read("inventory/a.yaml")
@@ -703,7 +703,7 @@ apt.package(name = m["pkg"])
     fn inventory_merge_explicit_strategy_replace() {
         let bundle = make_bundle_with_files(&[
             (
-                "manifests/main.star",
+                "main.star",
                 r#"
 load("@bosun/builtins", "apt", "inventory")
 a = inventory.read("inventory/a.yaml")
@@ -736,11 +736,11 @@ apt.package(name = m["pkg"])
 name = "test"
 version = "0.1.0"
 requires_bosun = "^0.1"
-entry = "manifests/main.star"
+entry = "main.star"
 "#,
             ),
             (
-                "manifests/main.star",
+                "main.star",
                 r#"
 load("@bosun/builtins", "inventory")
 a = inventory.read("inventory/a.yaml")
@@ -761,7 +761,7 @@ m = inventory.merge(a, b)
     fn role_load_evaluates_role_module() {
         let bundle = make_bundle_with_files(&[
             (
-                "manifests/main.star",
+                "main.star",
                 r#"
 load("@bosun/builtins", "apt")
 load("@roles/myrole", "configure")
@@ -793,7 +793,7 @@ def configure():
     fn lib_load_evaluates_lib_module() {
         let bundle = make_bundle_with_files(&[
             (
-                "manifests/main.star",
+                "main.star",
                 r#"
 load("@bosun/builtins", "apt")
 load("@lib/helpers", "do_something")
@@ -825,7 +825,7 @@ def do_something():
     fn private_symbol_in_role_cannot_be_imported() {
         let bundle = make_bundle_with_files(&[
             (
-                "manifests/main.star",
+                "main.star",
                 r#"
 load("@roles/myrole", "_private")
 "#,
@@ -848,9 +848,9 @@ def _private():
     }
 
     #[test]
-    fn template_called_from_manifests_is_rejected() {
+    fn template_called_from_root_entry_is_rejected() {
         let bundle = make_bundle_with_files(&[(
-            "manifests/main.star",
+            "main.star",
             r#"
 load("@bosun/builtins", "template")
 template("anything.j2")
@@ -865,14 +865,17 @@ template("anything.j2")
         );
         let err = run.result.unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("manifests/main.star") || msg.contains("manifests"));
+        assert!(
+            msg.contains("main.star") || msg.contains("bundle entry"),
+            "expected entry-template rejection, got: {msg}"
+        );
     }
 
     #[test]
     fn template_inside_role_resolves_to_role_templates() {
         let bundle = make_bundle_with_files(&[
             (
-                "manifests/main.star",
+                "main.star",
                 r#"
 load("@roles/myrole", "configure")
 configure()

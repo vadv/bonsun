@@ -23,7 +23,6 @@ const DEFAULT_BUNDLE_TOML: &str = r#"[bundle]
 name = "bdd-bundle"
 version = "0.1.0"
 requires_bosun = ">=0.1, <1.0"
-entry = "manifests/main.star"
 
 [bundle.inventory]
 default_merge_strategy = "deep_map_replace_list"
@@ -122,7 +121,7 @@ pub fn materialize_and_upload_bundle(world: &mut BosunWorld) -> anyhow::Result<S
     let user_body = world.manifest_body.clone().unwrap_or_default();
     let has_inventory = world.inventory_yaml.is_some();
     let manifest = assemble_manifest(&user_body, has_inventory);
-    write_file(&root.join("manifests/main.star"), &manifest)?;
+    write_file(&root.join("main.star"), &manifest)?;
 
     if let Some(inv_body) = &world.inventory_yaml {
         write_file(&root.join("inventory/legacy.yaml"), inv_body)?;
@@ -142,7 +141,7 @@ pub fn materialize_and_upload_bundle(world: &mut BosunWorld) -> anyhow::Result<S
         } else {
             "load(\"@roles/legacy\", \"main\")\nmain()\n"
         };
-        write_file(&root.join("manifests/main.star"), main)?;
+        write_file(&root.join("main.star"), main)?;
     }
 
     let res = docker_exec_shell(&id, "rm -rf /work/bundle && mkdir -p /work")?;

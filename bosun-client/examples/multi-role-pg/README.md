@@ -48,7 +48,7 @@ exit 3. Применимо для CI bundle-репозитория и pre-commit
 
     bundle/
     ├── bundle.toml                              # name, version, requires_bosun, tags, inventory.default_merge_strategy
-    ├── manifests/main.star                      # entry: загружает inventory + три роли
+    ├── main.star                                # entry: загружает inventory + три роли
     ├── inventory/
     │   ├── base.yaml                            # timezone, locale, cluster-wide settings
     │   ├── production.yaml                      # overrides для tags=production
@@ -76,7 +76,7 @@ exit 3. Применимо для CI bundle-репозитория и pre-commit
 
 ## Inventory chaining
 
-`manifests/main.star` сливает inventory в таком порядке:
+`main.star` сливает inventory в таком порядке:
 
     base.yaml
       → postgresql/01_packages.yaml

@@ -2,4 +2,3 @@
 name = "tags-require"
 version = "0.1.0"
 requires_bosun = "^0.1"
-entry = "manifests/main.star"

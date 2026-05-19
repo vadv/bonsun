@@ -37,12 +37,12 @@ Feature: Bundle directory structure
     Then exit code is 3
 
   @bundle-templates
-  Scenario: template() from manifests/main.star is rejected
+  Scenario: template() from root main.star is rejected
     Given a fresh container
     And the bundle "template-from-manifests"
     When I apply the bundle with tags "bdd"
     Then exit code is 3
-    And output contains "manifests"
+    And output contains "bundle entry"
 
   @bundle-privacy
   Scenario: Private symbol import is rejected

@@ -155,7 +155,6 @@ mod tests {
     fn make_bundle(manifest_source: &str) -> Bundle {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.keep();
-        std::fs::create_dir_all(root.join("manifests")).unwrap();
         std::fs::write(
             root.join("bundle.toml"),
             r#"
@@ -163,11 +162,11 @@ mod tests {
 name = "test"
 version = "0.1.0"
 requires_bosun = "^0.1"
-entry = "manifests/main.star"
+entry = "main.star"
 "#,
         )
         .unwrap();
-        std::fs::write(root.join("manifests/main.star"), manifest_source).unwrap();
+        std::fs::write(root.join("main.star"), manifest_source).unwrap();
         Bundle::load_dir(&root).unwrap()
     }
 
