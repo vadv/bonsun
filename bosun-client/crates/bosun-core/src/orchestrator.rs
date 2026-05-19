@@ -1040,6 +1040,7 @@ mod tests {
                 &apply_ctx(),
                 ApplyOpts {
                     continue_on_error: false,
+                    pacer: PacerConfig::disabled(),
                 },
             )
             .unwrap();
@@ -1106,6 +1107,7 @@ mod tests {
                 &apply_ctx(),
                 ApplyOpts {
                     continue_on_error: true,
+                    pacer: PacerConfig::disabled(),
                 },
             )
             .unwrap();
@@ -1184,6 +1186,7 @@ mod tests {
                 &apply_ctx(),
                 ApplyOpts {
                     continue_on_error: true,
+                    pacer: PacerConfig::disabled(),
                 },
             )
             .unwrap();
@@ -1238,6 +1241,7 @@ mod tests {
                 &apply_ctx(),
                 ApplyOpts {
                     continue_on_error: true,
+                    pacer: PacerConfig::disabled(),
                 },
             )
             .unwrap();
@@ -1287,6 +1291,7 @@ mod tests {
                 &apply_ctx(),
                 ApplyOpts {
                     continue_on_error: true,
+                    pacer: PacerConfig::disabled(),
                 },
             )
             .unwrap();
@@ -1524,6 +1529,7 @@ mod tests {
                 &apply_ctx(),
                 ApplyOpts {
                     continue_on_error: false,
+                    pacer: PacerConfig::disabled(),
                 },
             )
             .unwrap();
@@ -1698,6 +1704,7 @@ mod tests {
                 &apply_ctx(),
                 ApplyOpts {
                     continue_on_error: true,
+                    pacer: PacerConfig::disabled(),
                 },
             )
             .unwrap();
@@ -2089,5 +2096,215 @@ mod tests {
         };
         let msg = panic_message(payload.as_ref());
         assert_eq!(msg, "<non-string panic payload>");
+    }
+
+    /// Phase S: фабрика трёх ресурсов в цепочке, чтобы они применялись
+    /// в детерминированном порядке (через `topological_order`) и
+    /// поведение pacer'а было предсказуемым.
+    fn three_resources_registry() -> Registry {
+        let mut reg = Registry::new();
+        let a = reg.add(resource("apt.package", "a", vec![])).unwrap();
+        let b = reg.add(resource("apt.package", "b", vec![a])).unwrap();
+        reg.add(resource("apt.package", "c", vec![b])).unwrap();
+        reg
+    }
+
+    fn three_nochange_primitive(
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> HashMap<ResourceKind, Box<dyn Primitive>> {
+        let mut primitives: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
+        primitives.insert(
+            kind("apt.package"),
+            Box::new(RecordingPrimitive::new(
+                kind("apt.package"),
+                log,
+                vec![
+                    PlanResult::NoChange,
+                    PlanResult::NoChange,
+                    PlanResult::NoChange,
+                ],
+                vec![],
+            )),
+        );
+        primitives
+    }
+
+    #[test]
+    fn apply_with_pacer_sleeps_between_resources() {
+        // Phase S: pacer включён, target=300ms, N=3 → interval = 100ms
+        // (clamp к [10ms, 200ms]). Между ресурсами две паузы,
+        // суммарное время apply ≥ 180ms (с jitter-запасом на POLL=50ms).
+        let reg = three_resources_registry();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let orchestrator = Orchestrator::new(three_nochange_primitive(Arc::clone(&log)));
+        let mark_dirty = |_: &ResourceKind| {};
+
+        let pacer = PacerConfig {
+            target: Duration::from_millis(300),
+            min_interval: Duration::from_millis(10),
+            max_interval: Duration::from_millis(200),
+        };
+        let started = Instant::now();
+        let report = orchestrator
+            .apply(
+                &reg,
+                &NoFacts,
+                &mark_dirty,
+                &plan_ctx(),
+                &apply_ctx(),
+                ApplyOpts {
+                    continue_on_error: false,
+                    pacer,
+                },
+            )
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(180),
+            "expected ≥180ms apply with 2 sleeps, got {elapsed:?}",
+        );
+        assert_eq!(report.summary.no_change, 3);
+    }
+
+    #[test]
+    fn apply_without_pacer_skips_sleep() {
+        // Phase S: pacer выключен (default) → apply почти мгновенный.
+        let reg = three_resources_registry();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let orchestrator = Orchestrator::new(three_nochange_primitive(Arc::clone(&log)));
+        let mark_dirty = |_: &ResourceKind| {};
+
+        let started = Instant::now();
+        let report = orchestrator
+            .apply(
+                &reg,
+                &NoFacts,
+                &mark_dirty,
+                &plan_ctx(),
+                &apply_ctx(),
+                ApplyOpts::default(),
+            )
+            .unwrap();
+        let elapsed = started.elapsed();
+        // Без pacer'а NoChange-only прогон должен быть быстрым. Верхняя
+        // граница щедрая, чтобы CI-load не давал ложных срабатываний.
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "expected fast apply without pacer, got {elapsed:?}",
+        );
+        assert_eq!(report.summary.no_change, 3);
+    }
+
+    #[test]
+    fn apply_pacer_respects_cancel_during_sleep() {
+        // Phase S: pacer включён, target=10s → interval clamp к max=200ms.
+        // Cancel'им токен из другого потока через 100ms после начала apply'я.
+        // Ожидаем: первый ресурс apply'нут, второй упирается в pacer-sleep,
+        // во время которого cancel срабатывает; orchestrator отдаёт
+        // Interrupted вместо ожидания.
+        let reg = three_resources_registry();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let orchestrator = Orchestrator::new(three_nochange_primitive(Arc::clone(&log)));
+        let mark_dirty = |_: &ResourceKind| {};
+
+        // ApplyCtx с собственным cancel-токеном (вместо нового на каждый
+        // тест внутри `apply_ctx()`). Иначе нет способа дёрнуть cancel
+        // снаружи во время apply.
+        let cancel = CancellationToken::new();
+        let defers_root = std::env::temp_dir().join("bosun-test-pacer-cancel-defers");
+        let defers = Arc::new(crate::defers::Journal::open(&defers_root).unwrap());
+        let ctx = ApplyCtx::new(
+            Instant::now() + Duration::from_secs(60),
+            cancel.clone(),
+            tracing::Span::none(),
+            Arc::new(SensitiveStore::new()),
+            PathBuf::from("/tmp/test-backups"),
+            PathBuf::from("/tmp/test-logs"),
+            defers,
+            None,
+            None,
+        );
+
+        // Cancel'им через 100ms — должен попасть в первый pacer-sleep
+        // (interval=200ms по clamp). JoinHandle отбрасываем — поток
+        // самозавершится.
+        let cancel_for_thread = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            cancel_for_thread.cancel();
+        });
+
+        let pacer = PacerConfig {
+            target: Duration::from_secs(10),
+            min_interval: Duration::from_millis(60),
+            max_interval: Duration::from_millis(200),
+        };
+        let started = Instant::now();
+        let report = orchestrator
+            .apply(
+                &reg,
+                &NoFacts,
+                &mark_dirty,
+                &plan_ctx(),
+                &ctx,
+                ApplyOpts {
+                    continue_on_error: false,
+                    pacer,
+                },
+            )
+            .unwrap();
+        let elapsed = started.elapsed();
+        // Cancel-aware sleep шагает по 50ms; cancel в 100ms → exit в ≤400ms.
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "expected fast exit after cancel, got {elapsed:?}",
+        );
+        // Один ресурс apply'нут (NoChange), второй прерван в pacer-sleep
+        // → Interrupted, третий Skipped (aborted).
+        assert_eq!(report.summary.no_change, 1);
+        assert_eq!(report.summary.interrupted, 1);
+        assert_eq!(report.summary.skipped, 1);
+        assert!(report.has_interruptions());
+        // Reason должен указывать, что cancel случился в pacer-sleep.
+        match &report.resources[1].outcome {
+            Outcome::Interrupted { reason } => {
+                assert!(
+                    reason.contains("pacer"),
+                    "expected pacer reason, got: {reason}",
+                );
+            }
+            other => panic!("expected Interrupted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn apply_with_disabled_pacer_explicit_runs_full_set() {
+        // Negative: явно выключенный pacer (target=0) ведёт себя так же,
+        // как default. Apply делает все 3 ресурса, без sleep'ов.
+        let reg = three_resources_registry();
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let orchestrator = Orchestrator::new(three_nochange_primitive(Arc::clone(&log)));
+        let mark_dirty = |_: &ResourceKind| {};
+
+        let started = Instant::now();
+        let report = orchestrator
+            .apply(
+                &reg,
+                &NoFacts,
+                &mark_dirty,
+                &plan_ctx(),
+                &apply_ctx(),
+                ApplyOpts {
+                    continue_on_error: false,
+                    pacer: PacerConfig::disabled(),
+                },
+            )
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "expected fast apply with disabled pacer, got {elapsed:?}",
+        );
+        assert_eq!(report.summary.no_change, 3);
     }
 }
