@@ -42,18 +42,24 @@ pub struct UnitListItem {
     pub metrics: Option<CgroupMetrics>,
 }
 
-/// Снимок состояния сервиса из `GET /api/v1/services/statuses`. Поля строго
-/// соответствуют `ServiceStatus` из Go-клиента; `started_at` хранится как
-/// raw-строка RFC3339, поскольку runr-клиент не имеет своей привязки к
-/// chrono-типам (это решает каждый потребитель отдельно).
+/// Снимок состояния сервиса из `GET /api/v1/services/statuses`.
+///
+/// Совместимость со схемой runr: исходные имена скопированы с Go-клиента
+/// `postgres-chiit/lib/runr/client.go`, но реальный rust-runr расширил
+/// набор метрик (`memory_vm_rss_bytes`, `pgid`, `service_type` и т.п.).
+/// Поэтому `deny_unknown_fields` намеренно НЕ выставлен — bosun
+/// использует только `name`, `state`, `restarts`; остальные поля
+/// прокидываются для информации и могут отсутствовать на старых
+/// клиентах. Все поля кроме базовых — `#[serde(default)]`, так что
+/// runr с минимальным ответом тоже парсится.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ServiceStatus {
     pub name: String,
     pub state: String,
+    pub restarts: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
-    pub restarts: u64,
+    #[serde(default)]
     pub in_state_for_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uptime_ms: Option<u64>,
@@ -63,9 +69,16 @@ pub struct ServiceStatus {
     pub next_restart_in_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<String>,
+    #[serde(default)]
     pub autostart: bool,
+    /// Legacy-поле из Go-клиента: rust-runr этих чисел больше не отдаёт,
+    /// но bosun может работать против узлов под Go-клиентом или mock'ом,
+    /// которые их сохраняют. `default = 0` нужен на новой схеме.
+    #[serde(default)]
     pub memory_rss_anon_bytes: u64,
+    #[serde(default)]
     pub memory_rss_file_bytes: u64,
+    #[serde(default)]
     pub cpu_usage_percent: f64,
 }
 
@@ -145,7 +158,7 @@ pub(crate) struct TimerToggleNow {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::panic)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
 
@@ -198,22 +211,58 @@ mod tests {
     }
 
     #[test]
-    fn service_status_deny_unknown_fields() {
-        // Регрессия схемы должна детектиться: добавление произвольного поля
-        // обязано ломать парсинг, а не молча игнорироваться.
+    fn service_status_accepts_extra_fields() {
+        // rust-runr расширил схему (`pgid`, `service_type`,
+        // `memory_vm_rss_bytes`...). bosun должен корректно парсить такой
+        // ответ — мы используем только `name`, `state`, `restarts`,
+        // остальное информативно. Поэтому `deny_unknown_fields` снят;
+        // парсинг с extras не должен падать.
         let json = r#"{
-            "name": "x",
+            "name": "echo",
             "state": "Running",
-            "restarts": 0,
-            "in_state_for_ms": 0,
-            "autostart": false,
-            "memory_rss_anon_bytes": 0,
-            "memory_rss_file_bytes": 0,
+            "pid": 45,
+            "pgid": 45,
+            "restarts": 3,
+            "in_state_for_ms": 1000,
+            "uptime_ms": 1000,
+            "autostart": true,
+            "service_type": "simple",
+            "memory_vm_rss_bytes": 3264512,
+            "memory_vm_hwm_bytes": 3264512,
+            "cpu_ticks": 0,
             "cpu_usage_percent": 0.0,
-            "unexpected_field": "boom"
+            "exec_start": "/bin/sleep 30",
+            "restart_policy": "always",
+            "restart_sec": 2.0,
+            "kill_mode": "control-group",
+            "timeout_stop_sec": 90.0,
+            "timeout_start_sec": 90.0
         }"#;
-        let result: Result<ServiceStatus, _> = serde_json::from_str(json);
-        assert!(result.is_err(), "deny_unknown_fields must reject extras");
+        let parsed: ServiceStatus =
+            serde_json::from_str(json).expect("extras must not break parsing");
+        assert_eq!(parsed.name, "echo");
+        assert_eq!(parsed.state, "Running");
+        assert_eq!(parsed.restarts, 3);
+        // Legacy-поля при отсутствии в ответе должны получить дефолт.
+        assert_eq!(parsed.memory_rss_anon_bytes, 0);
+        assert_eq!(parsed.memory_rss_file_bytes, 0);
+    }
+
+    #[test]
+    fn service_status_accepts_minimal_response() {
+        // Минимальный набор полей: bosun плану нужно только знать `state` и
+        // `restarts`. Остальные `#[serde(default)]` должны заполнить дефолтами.
+        let json = r#"{
+            "name": "echo",
+            "state": "Stopped",
+            "restarts": 0
+        }"#;
+        let parsed: ServiceStatus = serde_json::from_str(json).expect("minimal must parse");
+        assert_eq!(parsed.name, "echo");
+        assert_eq!(parsed.state, "Stopped");
+        assert_eq!(parsed.restarts, 0);
+        assert!(parsed.pid.is_none());
+        assert!(!parsed.autostart);
     }
 
     #[test]

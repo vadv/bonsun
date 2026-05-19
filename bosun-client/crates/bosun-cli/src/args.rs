@@ -148,6 +148,16 @@ pub struct ApplyArgs {
     /// Защищает от вырожденного случая «target большой, ресурсов мало».
     #[arg(long, default_value_t = 100)]
     pub pacer_max_interval_ms: u32,
+
+    /// Override факта `init_system`. Принимает те же значения, что коллектор
+    /// `InitSystemFact` (`systemd` / `runit` / `init` / `runr` /
+    /// `mixed-systemd-runr` / `unknown`). Используется тестовой
+    /// инфраструктурой, где `/proc/1/comm` контейнера не соответствует
+    /// реальному набору демонов: BDD-сценарии под `runr` поднимают
+    /// supervisor сами и не могут менять PID 1, поэтому фact приходится
+    /// форсировать снаружи. На production-ноде флаг не нужен.
+    #[arg(long = "init-system", value_name = "INIT_SYSTEM")]
+    pub init_system_override: Option<String>,
 }
 
 /// Аргументы `bosun status` (Phase J). Команда без апплая показывает, что
@@ -435,6 +445,27 @@ mod tests {
         assert_eq!(args.pacer_target_sec, 30);
         assert_eq!(args.pacer_min_interval_ms, 50);
         assert_eq!(args.pacer_max_interval_ms, 120);
+    }
+
+    #[test]
+    fn apply_init_system_override_defaults_to_none() {
+        // По умолчанию флаг не задан — bosun читает factual snapshot.
+        let cli = Cli::try_parse_from(["bosun", "apply", "--bundle", "/b"]).unwrap();
+        let Command::Apply(args) = cli.command else {
+            panic!("expected apply")
+        };
+        assert!(args.init_system_override.is_none());
+    }
+
+    #[test]
+    fn apply_init_system_override_accepts_runr() {
+        let cli =
+            Cli::try_parse_from(["bosun", "apply", "--bundle", "/b", "--init-system", "runr"])
+                .unwrap();
+        let Command::Apply(args) = cli.command else {
+            panic!("expected apply")
+        };
+        assert_eq!(args.init_system_override.as_deref(), Some("runr"));
     }
 
     #[test]

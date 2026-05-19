@@ -215,7 +215,15 @@ pub fn run(args: &ApplyArgs) -> i32 {
     // `systemd` → systemd dbus client; `runr` / `mixed-*` → runr HTTP client;
     // `unknown` или другие — оба None, replay будет пропускать соответствующие
     // entries как `client_unavailable`.
-    let init_system = init_system_value(&snapshot);
+    //
+    // CLI-override `--init-system` берёт верх над snapshot'ом. Используется
+    // BDD-тестами: контейнер с PID 1 = `tail -f /dev/null` собирает факт
+    // `unknown`, но сценарий поднимает реальный runr-supervisor и хочет
+    // принудить ветку `needs_runr`.
+    let init_system = args
+        .init_system_override
+        .clone()
+        .or_else(|| init_system_value(&snapshot));
     let needs_systemd = init_system_requires_systemd(init_system.as_deref());
     let needs_runr = init_system_requires_runr(init_system.as_deref());
 

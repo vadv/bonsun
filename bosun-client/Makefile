@@ -1,9 +1,18 @@
-.PHONY: build test test-unit test-bdd docker-base bosun-bookworm fmt clippy \
+.PHONY: build test test-unit test-bdd docker-base bosun-bookworm runr-bookworm fmt clippy \
         musl-x86_64 musl-aarch64 musl-docker musl-verify
 
 BUILD_PROFILE ?= release
 BOSUN_TEST_IMAGE ?= bosun-test-base:latest
 BOOKWORM_RUST_IMAGE ?= rust:1-bookworm
+# Источник runr: исходники локального проекта. Для BDD сценариев `@runr-service`
+# собираем настоящий runr-бинарь поверх той же bookworm-glibc, что и bosun
+# (см. цель runr-bookworm). По умолчанию ищется в `../runr` (sibling), затем
+# в `../../runr` (родительская группа проектов вида `~/Projects/<group>/{bosun-client,runr}`).
+# CI и нестандартные layout'ы переопределяют переменную явно.
+RUNR_SOURCE_DIR ?= $(shell \
+    if [ -f $(CURDIR)/../runr/Cargo.toml ]; then echo $(CURDIR)/../runr; \
+    elif [ -f $(CURDIR)/../../runr/Cargo.toml ]; then echo $(CURDIR)/../../runr; \
+    fi)
 # Образ для воспроизводимой musl-сборки: rust:alpine содержит musl-toolchain
 # из коробки, дополнительные пакеты ставит сам Dockerfile.
 MUSL_BUILD_IMAGE ?= bosun-musl-build:latest
@@ -22,7 +31,7 @@ fmt:
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
 
-docker-base:
+docker-base: runr-bookworm
 	docker build -t $(BOSUN_TEST_IMAGE) -f docker/test-base.Dockerfile .
 
 # Сборка bosun в bookworm-контейнере: получаем бинарь, совместимый по glibc
@@ -38,10 +47,27 @@ bosun-bookworm:
 	  $(BOOKWORM_RUST_IMAGE) \
 	  sh -c "cargo build --release -p bosun-cli && cp /tmp/cargo-target/release/bosun /out/bosun"
 
+# Сборка runr-binary в том же bookworm-контейнере, что и bosun: bdd-образ
+# `bosun-test-base` строится поверх `debian:bookworm-slim`, а runr с GLIBC_2.34+
+# из host-fedora не загрузится. Артефакт кладётся в target/runr-bookworm/runr
+# и копируется в test-base.Dockerfile через `COPY`. Источник — локальный
+# проект runr (RUNR_SOURCE_DIR), не upstream; ENV переменная даёт точку
+# подмены для CI с другим расположением.
+runr-bookworm:
+	@test -d "$(RUNR_SOURCE_DIR)" || { echo "RUNR_SOURCE_DIR=$(RUNR_SOURCE_DIR) does not exist; set it to a checkout of the runr repo"; exit 1; }
+	mkdir -p target/runr-bookworm
+	docker run --rm \
+	  -v $(RUNR_SOURCE_DIR):/work \
+	  -v $(CURDIR)/target/runr-bookworm:/out \
+	  -w /work \
+	  -e CARGO_TARGET_DIR=/tmp/cargo-target \
+	  $(BOOKWORM_RUST_IMAGE) \
+	  sh -c "cargo build --release && cp /tmp/cargo-target/release/runr /out/runr"
+
 # Run BDD: make test-bdd
 # Filter by tag: make test-bdd TAGS=@apt-package
 # Combine tags: make test-bdd TAGS='@apt-package and not @slow'
-test-bdd: docker-base bosun-bookworm
+test-bdd: runr-bookworm docker-base bosun-bookworm
 	BOSUN_TEST_IMAGE=$(BOSUN_TEST_IMAGE) \
 	BOSUN_BINARY=$(CURDIR)/target/bookworm-release/bosun \
 	cargo test -p bosun-cli --features bdd --test bdd --release -- $(if $(TAGS),--tags '$(TAGS)',)

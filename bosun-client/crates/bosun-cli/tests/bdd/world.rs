@@ -56,6 +56,18 @@ pub struct BosunWorld {
     pub slow_warning_abort: Option<tokio::task::AbortHandle>,
     /// Путь к bosun-бинарю на хосте, который копируется в контейнер.
     pub bosun_binary_path: PathBuf,
+    /// Override для факта `init_system`. Если задан — попадает в
+    /// `bosun apply --init-system <value>`. Используется сценариями под
+    /// runr/systemd, у которых PID 1 контейнера не совпадает с реальным
+    /// init-системой (`tail -f /dev/null` классифицируется как `unknown`,
+    /// но сценарий поднимает supervisor поверх и хочет ветку runr/systemd).
+    pub init_system_override: Option<String>,
+    /// Снимки PID'ов runr-сервисов, сохранённые шагом
+    /// `Given I remember pid of runr service "<name>" as "<label>"`.
+    /// Используется в assertion'ах вида «PID после restart отличается от
+    /// PID до restart», поскольку реальный runr не инкрементит счётчик
+    /// `restarts` на манульные API-вызовы (см. runr_helper).
+    pub runr_pid_snapshots: std::collections::HashMap<String, u32>,
 }
 
 impl std::fmt::Debug for BosunWorld {

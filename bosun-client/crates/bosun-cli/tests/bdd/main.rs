@@ -20,6 +20,7 @@ mod bundle_helper;
 mod cert_helper;
 mod defers_helper;
 mod docker_helper;
+mod runr_helper;
 mod users_helper;
 mod validate_helper;
 mod world;

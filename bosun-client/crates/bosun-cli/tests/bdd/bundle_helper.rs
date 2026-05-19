@@ -181,11 +181,17 @@ fn build_legacy_role_module(user_body: &str, has_inventory: bool) -> String {
     out
 }
 
-/// Команда `bosun apply` для сценария.
-fn apply_cmd(bundle_path: &str, dry_run: bool) -> String {
+/// Команда `bosun apply` для сценария. `init_system_override` приходит из
+/// `BosunWorld` — non-None означает, что сценарий подменил факт через шаг
+/// `Given init_system override "<value>"` (например, под runr-сценарии).
+fn apply_cmd(bundle_path: &str, dry_run: bool, init_system_override: Option<&str>) -> String {
     let dry = if dry_run { " --dry-run" } else { "" };
+    let init_override = match init_system_override {
+        Some(v) => format!(" --init-system {v}"),
+        None => String::new(),
+    };
     format!(
-        "bosun apply --bundle {bundle_path} --tags=bdd{dry} \
+        "bosun apply --bundle {bundle_path} --tags=bdd{dry}{init_override} \
          --lock-path /tmp/bosun.lock \
          --state-dir /tmp/bosun-state \
          --log-dir /tmp/bosun-log \
@@ -235,7 +241,7 @@ pub async fn when_apply_bundle(world: &mut BosunWorld) {
         .container_id
         .clone()
         .unwrap_or_else(|| panic!("no container is running"));
-    let cmd = apply_cmd(&bundle_path, false);
+    let cmd = apply_cmd(&bundle_path, false, world.init_system_override.as_deref());
     let res = crate::docker_helper::docker_exec_shell(&id, &cmd)
         .unwrap_or_else(|e| panic!("docker exec apply: {e}"));
     world.last_exec = Some(res);
@@ -249,7 +255,7 @@ pub async fn when_apply_bundle_dry_run(world: &mut BosunWorld) {
         .container_id
         .clone()
         .unwrap_or_else(|| panic!("no container is running"));
-    let cmd = apply_cmd(&bundle_path, true);
+    let cmd = apply_cmd(&bundle_path, true, world.init_system_override.as_deref());
     let res = docker_exec_shell(&id, &cmd).unwrap_or_else(|e| panic!("docker exec apply: {e}"));
     world.last_exec = Some(res);
 }
@@ -260,7 +266,7 @@ pub async fn when_apply_bundle_again(world: &mut BosunWorld) {
         .container_id
         .clone()
         .unwrap_or_else(|| panic!("no container is running"));
-    let cmd = apply_cmd("/work/bundle", false);
+    let cmd = apply_cmd("/work/bundle", false, world.init_system_override.as_deref());
     let res = docker_exec_shell(&id, &cmd).unwrap_or_else(|e| panic!("docker exec apply: {e}"));
     world.last_exec = Some(res);
 }
@@ -348,8 +354,12 @@ pub async fn when_apply_bundle_with_tags(world: &mut BosunWorld, tags_csv: Strin
     } else {
         format!(" --tags={tags_csv}")
     };
+    let init_override = match world.init_system_override.as_deref() {
+        Some(v) => format!(" --init-system {v}"),
+        None => String::new(),
+    };
     let cmd = format!(
-        "bosun apply --bundle /work/bundle{tags_arg} \
+        "bosun apply --bundle /work/bundle{tags_arg}{init_override} \
          --lock-path /tmp/bosun.lock \
          --state-dir /tmp/bosun-state \
          --log-dir /tmp/bosun-log \
