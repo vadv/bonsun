@@ -78,15 +78,19 @@ impl FactsCollector {
         &self.root_fs
     }
 
-    /// Сборка всех `AtStart` фактов. Каждая сборка обёрнута
-    /// в `catch_unwind` — паника не валит весь процесс.
+    /// Сборка всех фактов с политикой `AtStart` или `AtStartAndAfterApply`.
+    /// Каждая сборка обёрнута в `catch_unwind` — паника не валит весь процесс.
     /// `collect()` запускается БЕЗ удержания borrow на кеш — это
     /// исключает re-entrant борроу-конфликт, если факт сам полезет
     /// читать другие факты через FactsView.
     pub fn collect_at_start(&self) {
         let ctx = FactCollectCtx::new(self.root_fs.clone());
         for fact in &self.facts {
-            if !matches!(fact.refresh_policy(), RefreshPolicy::AtStart) {
+            let collect_now = matches!(
+                fact.refresh_policy(),
+                RefreshPolicy::AtStart | RefreshPolicy::AtStartAndAfterApply { .. }
+            );
+            if !collect_now {
                 continue;
             }
             let name = fact.name().to_string();
@@ -104,8 +108,8 @@ impl FactsCollector {
         }
     }
 
-    /// Помечает все факты с политикой `AfterApply` и `applied_kind`
-    /// в `triggers` как dirty. Реальная пересборка ленивая.
+    /// Помечает все факты с политикой `AfterApply`/`AtStartAndAfterApply`
+    /// и `applied_kind` в `triggers` как dirty. Реальная пересборка ленивая.
     /// Сначала собираем список имён вне borrow, потом единым
     /// `borrow_mut` обновляем флаги — это исключает re-entrant борроу.
     pub fn mark_dirty_after_apply(&self, applied_kind: &ResourceKind) {
@@ -113,7 +117,10 @@ impl FactsCollector {
             .facts
             .iter()
             .filter_map(|fact| match fact.refresh_policy() {
-                RefreshPolicy::AfterApply { triggers } if triggers.contains(applied_kind) => {
+                RefreshPolicy::AfterApply { triggers }
+                | RefreshPolicy::AtStartAndAfterApply { triggers }
+                    if triggers.contains(applied_kind) =>
+                {
                     Some(fact.name().to_string())
                 }
                 _ => None,

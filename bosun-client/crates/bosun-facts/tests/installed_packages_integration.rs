@@ -94,22 +94,20 @@ fn collects_installed_packages_through_collector() {
     let c = with_default_collectors(tmp.path().to_path_buf());
     c.collect_at_start();
 
-    // installed_packages — AfterApply, snapshot его не содержит.
+    // installed_packages — AtStartAndAfterApply, snapshot его содержит
+    // сразу после collect_at_start (F02-фикс).
     let snap = c.snapshot();
-    assert!(matches!(
-        snap.get("installed_packages"),
-        FactValue::Unknown { .. }
-    ));
+    assert!(
+        snap.get("installed_packages").is_known(),
+        "installed_packages должно быть в snapshot после collect_at_start"
+    );
 
-    // Перед mark_dirty view.get для AfterApply-факта — Unknown ("unknown fact"),
-    // потому что записи в кэше ещё нет.
+    // view.get тоже возвращает Known без mark_dirty.
     let view = c.view();
-    assert!(matches!(
-        view.get("installed_packages"),
-        FactValue::Unknown { .. }
-    ));
+    assert!(view.get("installed_packages").is_known());
 
-    // После mark_dirty(apt.package) — пересборка.
+    // После mark_dirty(apt.package) — повторная пересборка. Семантика для
+    // последующих apply не меняется.
     c.mark_dirty_after_apply(&ResourceKind::from_static("apt.package"));
     let v = view.get("installed_packages");
     let map = match v {
@@ -158,13 +156,17 @@ fn snapshot_isolated_from_subsequent_marks() {
         snap.get("hostname").value().unwrap(),
         &serde_json::json!("synthetic-host")
     );
-    // Пометка dirty AfterApply-фактов не задевает snapshot.
+    // Snapshot — immutable copy: значение installed_packages в snapshot
+    // фиксируется на момент c.snapshot() и не меняется при последующих
+    // mark_dirty. Сейчас оно Known (см. F02-фикс).
+    let before = snap.get("installed_packages");
+    assert!(before.is_known());
+
     c.mark_dirty_after_apply(&ResourceKind::from_static("apt.package"));
-    // Snapshot не содержит installed_packages — он AfterApply, не успел собраться.
-    assert!(matches!(
-        snap.get("installed_packages"),
-        FactValue::Unknown { .. }
-    ));
+    let after = snap.get("installed_packages");
+    // Значения совпадают — snapshot не реагирует на dirty.
+    assert!(after.is_known());
+    assert_eq!(before.value(), after.value());
 }
 
 #[test]
@@ -173,7 +175,7 @@ fn second_get_uses_cache_without_recollect() {
     populate_root(tmp.path());
     let c = with_default_collectors(tmp.path().to_path_buf());
     c.collect_at_start();
-    c.mark_dirty_after_apply(&ResourceKind::from_static("apt.package"));
+    // С F02-фиксом installed_packages уже Known после collect_at_start.
     let view = c.view();
     let v1 = view.get("installed_packages");
     // Удаляем status-файл — если бы был второй collect, мы бы получили Unknown.

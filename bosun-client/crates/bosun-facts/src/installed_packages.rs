@@ -38,7 +38,12 @@ impl Fact for InstalledPackagesFact {
         FactCategory::Slow
     }
     fn refresh_policy(&self) -> RefreshPolicy {
-        RefreshPolicy::AfterApply {
+        // AtStartAndAfterApply: factу нужно быть Known к моменту первого
+        // apt.package plan'а — иначе plan видит Unknown, фолбэчит в Add
+        // и провоцирует ложный drift / лишний apt-get install. После каждого
+        // успешного apt.package apply факт помечается dirty и пересобирается
+        // лениво при следующем view.get.
+        RefreshPolicy::AtStartAndAfterApply {
             triggers: vec![ResourceKind::from_static("apt.package")],
         }
     }
@@ -596,12 +601,77 @@ mod tests {
     fn name_and_policy() {
         assert_eq!(InstalledPackagesFact.name(), "installed_packages");
         match InstalledPackagesFact.refresh_policy() {
-            RefreshPolicy::AfterApply { triggers } => {
+            RefreshPolicy::AtStartAndAfterApply { triggers } => {
                 assert_eq!(triggers.len(), 1);
                 assert_eq!(triggers[0].as_str(), "apt.package");
             }
-            other => panic!("expected AfterApply, got {other:?}"),
+            other => panic!("expected AtStartAndAfterApply, got {other:?}"),
         }
         assert_eq!(InstalledPackagesFact.category(), FactCategory::Slow);
+    }
+
+    // Regression-тесты для F02: до фикса installed_packages мог быть
+    // Unknown до первого apt.package apply, что давало ложный drift.
+
+    #[test]
+    fn installed_packages_is_known_at_start_without_apt_apply() {
+        use crate::collector::FactsCollector;
+        use bosun_core::FactsSource;
+
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "var/lib/dpkg/status",
+            "Package: curl\nVersion: 7.0\nStatus: install ok installed\n",
+        );
+
+        let collector = FactsCollector::new(
+            tmp.path().to_path_buf(),
+            vec![Box::new(InstalledPackagesFact)],
+        );
+        collector.collect_at_start();
+
+        let view = collector.view();
+        let v = view.get("installed_packages");
+        assert!(
+            v.is_known(),
+            "installed_packages должно быть Known после collect_at_start"
+        );
+        assert!(v.value().unwrap().get("curl").is_some());
+    }
+
+    #[test]
+    fn installed_packages_refreshes_after_apt_apply() {
+        use crate::collector::FactsCollector;
+        use bosun_core::FactsSource;
+
+        let tmp = TempDir::new().unwrap();
+        write_file(
+            tmp.path(),
+            "var/lib/dpkg/status",
+            "Package: curl\nVersion: 7.0\nStatus: install ok installed\n",
+        );
+
+        let collector = FactsCollector::new(
+            tmp.path().to_path_buf(),
+            vec![Box::new(InstalledPackagesFact)],
+        );
+        collector.collect_at_start();
+
+        // Симулируем установку нового пакета — обновляем dpkg/status.
+        write_file(
+            tmp.path(),
+            "var/lib/dpkg/status",
+            "Package: curl\nVersion: 7.0\nStatus: install ok installed\n\nPackage: nginx\nVersion: 1.0\nStatus: install ok installed\n",
+        );
+        collector.mark_dirty_after_apply(&ResourceKind::from_static("apt.package"));
+
+        let view = collector.view();
+        let v = view.get("installed_packages");
+        assert!(v.is_known());
+        assert!(
+            v.value().unwrap().get("nginx").is_some(),
+            "после apt.package apply факт должен пересобраться и увидеть nginx"
+        );
     }
 }

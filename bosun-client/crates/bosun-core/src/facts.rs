@@ -52,8 +52,16 @@ impl FactValue {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RefreshPolicy {
+    /// Собирается один раз при старте, до plan-фазы.
     AtStart,
+    /// Помечается dirty после apply ресурса, чей kind есть в `triggers`.
+    /// Не собирается до первого `view.get`/`mark_dirty`.
     AfterApply { triggers: Vec<ResourceKind> },
+    /// Собирается на старте И помечается dirty после apply резонирующих
+    /// ресурсов. Нужно для фактов, которые требуются для plan-фазы первого
+    /// прогона (installed_packages — иначе apt.package видит Unknown и
+    /// фолбэчит в Add).
+    AtStartAndAfterApply { triggers: Vec<ResourceKind> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

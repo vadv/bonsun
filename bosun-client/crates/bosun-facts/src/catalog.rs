@@ -42,39 +42,71 @@ mod tests {
         c.collect_at_start();
         let snap = c.snapshot();
         let names: Vec<&str> = snap.names().collect();
-        // Snapshot содержит только AtStart-факты (installed_packages — AfterApply).
+        // Все шесть фактов попадают в snapshot после collect_at_start:
+        // installed_packages с политикой AtStartAndAfterApply тоже собирается
+        // на старте (F02-фикс: иначе apt.package видит Unknown и фолбэчит в Add).
         assert!(names.contains(&"hostname"));
         assert!(names.contains(&"cpu_count"));
         assert!(names.contains(&"memory_mb"));
         assert!(names.contains(&"init_system"));
         assert!(names.contains(&"is_pod"));
-        assert!(!names.contains(&"installed_packages"));
-        assert_eq!(names.len(), 5);
+        assert!(names.contains(&"installed_packages"));
+        assert_eq!(names.len(), 6);
     }
 
     #[test]
-    fn installed_packages_collected_lazily_after_apply() {
+    fn installed_packages_known_at_start_when_dpkg_present() {
+        // Подготовка fake-FS root с dpkg/status: installed_packages должен
+        // быть Known сразу после collect_at_start, без необходимости
+        // звать mark_dirty_after_apply.
         let tmp = TempDir::new().unwrap();
+        let dpkg = tmp.path().join("var/lib/dpkg");
+        std::fs::create_dir_all(&dpkg).unwrap();
+        std::fs::write(
+            dpkg.join("status"),
+            "Package: nginx\nVersion: 1.18.0\nStatus: install ok installed\n",
+        )
+        .unwrap();
+
         let c = with_default_collectors(tmp.path().to_path_buf());
         c.collect_at_start();
-        // До mark_dirty факт installed_packages не виден через view.
         let view = c.view();
         let v = view.get("installed_packages");
-        match v {
-            bosun_core::FactValue::Unknown { reason } => {
-                assert!(reason.contains("unknown fact"), "got: {reason}");
-            }
-            other => panic!("expected Unknown before mark_dirty, got {other:?}"),
-        }
-        // После mark_dirty by apt.package — пересборка.
+        assert!(
+            v.is_known(),
+            "installed_packages должно быть Known после collect_at_start: {v:?}"
+        );
+        let pkgs = v.value().unwrap();
+        assert!(pkgs.get("nginx").is_some());
+    }
+
+    #[test]
+    fn installed_packages_refreshes_after_apt_apply() {
+        // После каждого apply apt.package факт installed_packages
+        // помечается dirty и пересобирается лениво.
+        let tmp = TempDir::new().unwrap();
+        let dpkg = tmp.path().join("var/lib/dpkg");
+        std::fs::create_dir_all(&dpkg).unwrap();
+        std::fs::write(
+            dpkg.join("status"),
+            "Package: a\nVersion: 1.0\nStatus: install ok installed\n",
+        )
+        .unwrap();
+
+        let c = with_default_collectors(tmp.path().to_path_buf());
+        c.collect_at_start();
+
+        // «Установили» новый пакет — обновляем dpkg/status.
+        std::fs::write(
+            dpkg.join("status"),
+            "Package: a\nVersion: 1.0\nStatus: install ok installed\n\nPackage: b\nVersion: 2.0\nStatus: install ok installed\n",
+        )
+        .unwrap();
         c.mark_dirty_after_apply(&ResourceKind::from_static("apt.package"));
-        let v2 = view.get("installed_packages");
-        // Без dpkg/status получится Unknown — но это уже из коллектора.
-        match v2 {
-            bosun_core::FactValue::Unknown { reason } => {
-                assert!(reason.contains("status"), "got: {reason}");
-            }
-            other => panic!("expected Unknown (dpkg missing), got {other:?}"),
-        }
+
+        let view = c.view();
+        let v = view.get("installed_packages");
+        assert!(v.is_known());
+        assert!(v.value().unwrap().get("b").is_some());
     }
 }
