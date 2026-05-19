@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use bosun_core::{
     defers::{replay_with_health_check, DispatchClient, Journal, ReplayReport},
     ApplyCtxBuilder, ApplyOpts, ApplyReport, Bundle, Evaluator, FactValue, HealthCheckRunner,
-    Orchestrator, Outcome, PlanCtx, PlanReport, Primitive, ResourceKind, SensitiveStore,
-    TemplateFn,
+    Orchestrator, Outcome, OverlayFactsSource, PlanCtx, PlanReport, Primitive, ResourceKind,
+    SensitiveStore, TemplateFn,
 };
 use bosun_facts::FactsCollector;
 use bosun_handles::{RunrHandle, SystemdHandle};
@@ -323,8 +323,13 @@ pub fn run(args: &ApplyArgs) -> i32 {
     let apply_ctx = builder.build();
 
     let view = facts.view();
+    // Overlay поверх view: `pg_sql.query store_as_fact` пишет в
+    // ApplyCtx::published_facts, и тот же Arc доступен здесь — следующие
+    // ресурсы в этом apply видят опубликованный факт через стандартный
+    // FactsSource::get. Без overlay они бы получали Unknown.
+    let overlay_facts = OverlayFactsSource::new(&view, apply_ctx.published_facts.clone());
     let (exit, changed, unchanged, failed, deferred, interrupted) = if args.dry_run {
-        match orchestrator.plan_only(&registry, &view, &plan_ctx) {
+        match orchestrator.plan_only(&registry, &overlay_facts, &plan_ctx) {
             Ok(report) => {
                 print_plan(&report, args.format);
                 let drift = report.has_drift();
@@ -362,7 +367,14 @@ pub fn run(args: &ApplyArgs) -> i32 {
         };
         let mut opts = ApplyOpts::default();
         opts.continue_on_error = args.continue_on_error;
-        match orchestrator.apply(&registry, &view, &mark_dirty, &plan_ctx, &apply_ctx, opts) {
+        match orchestrator.apply(
+            &registry,
+            &overlay_facts,
+            &mark_dirty,
+            &plan_ctx,
+            &apply_ctx,
+            opts,
+        ) {
             Ok(report) => {
                 print_apply(&report, args.format);
                 // Приоритет кодов: Interrupted > PartialFailure > Success.

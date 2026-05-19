@@ -128,11 +128,13 @@ pub struct ApplyCtx {
     pub health_check_runner: Arc<dyn HealthCheckRunner>,
     /// Runtime-store published-фактов: примитив (например, `pg_sql.query`
     /// с `store_as_fact=<name>`) пишет сюда результат, последующие
-    /// примитивы или вышестоящий evaluator могут прочитать. Это НЕ
-    /// FactsCollector: добавление в `published_facts` не триггерит dirty-
-    /// refresh и не виден через `FactsSource::get`. Это runtime
-    /// runtime-storage для нечастого «вывели и забыли». Чтение —
-    /// `read_published_fact`.
+    /// примитивы или вышестоящий evaluator могут прочитать. Доступ —
+    /// двумя путями: прямой `read_published_fact` для apply'я соседнего
+    /// примитива и через [`OverlayFactsSource`], которым CLI оборачивает
+    /// обычный `FactsView` для plan/apply (overlay приоритетно отдаёт
+    /// published-факты через стандартный `FactsSource::get`). Это НЕ
+    /// FactsCollector: добавление в `published_facts` не триггерит
+    /// dirty-refresh статических фактов из `bosun-facts`.
     pub published_facts: Arc<Mutex<HashMap<String, serde_json::Value>>>,
 }
 
@@ -520,6 +522,49 @@ pub trait FactsSource {
     fn get(&self, name: &str) -> crate::facts::FactValue;
 }
 
+/// Overlay-FactsSource: сначала проверяет runtime-published факты
+/// (например, `pg_sql.query store_as_fact`), и только потом — основной
+/// snapshot. Позволяет «вылитому» примитиву факту быть виденным через
+/// штатный `FactsSource::get` без отдельного API.
+///
+/// Lifetime связывает overlay с inner: оба живут только во время одного
+/// apply-цикла. `published_facts` совпадает по Arc с тем, что лежит в
+/// `ApplyCtx::published_facts` — оба используют одну и ту же
+/// внутреннюю Mutex-карту, без копирования.
+pub struct OverlayFactsSource<'a> {
+    inner: &'a dyn FactsSource,
+    published_facts: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+}
+
+impl<'a> OverlayFactsSource<'a> {
+    /// Создать overlay поверх `inner`. `published_facts` — тот же Arc,
+    /// что и в `ApplyCtx::published_facts`: оба указывают на одну
+    /// карту, читать/писать можно из обеих сторон.
+    pub fn new(
+        inner: &'a dyn FactsSource,
+        published_facts: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    ) -> Self {
+        Self {
+            inner,
+            published_facts,
+        }
+    }
+}
+
+impl<'a> FactsSource for OverlayFactsSource<'a> {
+    fn get(&self, name: &str) -> crate::facts::FactValue {
+        // PoisonError: внутренняя HashMap после паники остаётся
+        // консистентной — данные не теряются. Возвращаем как Known,
+        // чтобы предоставлять published-факты приоритетно.
+        if let Ok(guard) = self.published_facts.lock() {
+            if let Some(value) = guard.get(name) {
+                return crate::facts::FactValue::Known(value.clone());
+            }
+        }
+        self.inner.get(name)
+    }
+}
+
 /// Trait одного примитива.
 pub trait Primitive: Send + Sync {
     fn type_name(&self) -> crate::resource::ResourceKind;
@@ -547,7 +592,7 @@ pub trait Primitive: Send + Sync {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
     use std::time::Duration;
 
@@ -810,5 +855,104 @@ mod tests {
         .build();
         assert!(ctx.runr.is_some());
         assert_eq!(ctx.runr.as_ref().unwrap().base_url(), "http://stub");
+    }
+
+    /// Внутренний stub FactsSource: возвращает заранее заданное значение для
+    /// одного имени, для всего остального — Unknown. Используется тестами
+    /// OverlayFactsSource как «нижний» слой.
+    struct StubFacts {
+        name: String,
+        value: serde_json::Value,
+    }
+
+    impl FactsSource for StubFacts {
+        fn get(&self, name: &str) -> crate::facts::FactValue {
+            if name == self.name {
+                crate::facts::FactValue::Known(self.value.clone())
+            } else {
+                crate::facts::FactValue::Unknown {
+                    reason: format!("stub: unknown '{name}'"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overlay_returns_published_fact_first() {
+        // Если факт есть и в overlay, и в inner — overlay побеждает.
+        let inner = StubFacts {
+            name: "host.os".into(),
+            value: serde_json::json!("from-inner"),
+        };
+        let published = Arc::new(Mutex::new(HashMap::from([(
+            "host.os".to_string(),
+            serde_json::json!("from-overlay"),
+        )])));
+        let overlay = OverlayFactsSource::new(&inner, published);
+        match overlay.get("host.os") {
+            crate::facts::FactValue::Known(v) => assert_eq!(v, serde_json::json!("from-overlay")),
+            other => panic!("expected Known(from-overlay), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overlay_falls_through_to_inner_when_not_published() {
+        // Факт есть только в inner — overlay должен прозрачно его отдать.
+        let inner = StubFacts {
+            name: "init.system".into(),
+            value: serde_json::json!("systemd"),
+        };
+        let published = Arc::new(Mutex::new(HashMap::new()));
+        let overlay = OverlayFactsSource::new(&inner, published);
+        match overlay.get("init.system") {
+            crate::facts::FactValue::Known(v) => assert_eq!(v, serde_json::json!("systemd")),
+            other => panic!("expected Known, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overlay_returns_unknown_when_neither_layer_has_fact() {
+        let inner = StubFacts {
+            name: "x".into(),
+            value: serde_json::json!(1),
+        };
+        let published = Arc::new(Mutex::new(HashMap::new()));
+        let overlay = OverlayFactsSource::new(&inner, published);
+        match overlay.get("nonexistent") {
+            crate::facts::FactValue::Unknown { .. } => {}
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn overlay_picks_up_facts_published_after_construction() {
+        // Семантика опубликованных фактов: ресурс A пишет, ресурс B читает в
+        // ТОМ ЖЕ apply. Overlay должен видеть факт сразу после `publish_fact`,
+        // даже если был сконструирован раньше.
+        let inner = StubFacts {
+            name: "irrelevant".into(),
+            value: serde_json::json!(0),
+        };
+        let published: Arc<Mutex<HashMap<String, serde_json::Value>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let overlay = OverlayFactsSource::new(&inner, published.clone());
+
+        // До publish — Unknown.
+        assert!(matches!(
+            overlay.get("pg.roles"),
+            crate::facts::FactValue::Unknown { .. }
+        ));
+
+        // Эмулируем `ctx.publish_fact("pg.roles", ...)`.
+        published
+            .lock()
+            .unwrap()
+            .insert("pg.roles".to_string(), serde_json::json!(["admin", "ro"]));
+
+        // Теперь Known.
+        match overlay.get("pg.roles") {
+            crate::facts::FactValue::Known(v) => assert_eq!(v, serde_json::json!(["admin", "ro"])),
+            other => panic!("expected Known after publish, got {other:?}"),
+        }
     }
 }

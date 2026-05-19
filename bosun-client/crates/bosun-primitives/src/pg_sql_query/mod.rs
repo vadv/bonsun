@@ -7,10 +7,14 @@
 //! published_facts для следующих ресурсов.
 //!
 //! В отличие от Phase D-фактов из bosun-facts (`hostname`, `cpu_count` и т.п.),
-//! published_facts — runtime-only registry: они доступны только из последующих
-//! apply-вызовов через `ApplyCtx::read_published_fact`. Это сознательная
-//! асимметрия: фактовая инфраструктура — слишком тяжёлая для динамического
-//! per-bundle factset'а, а ad-hoc запросы — частые.
+//! published_facts — runtime-only registry: они доступны только в рамках
+//! одного apply-цикла. Читаются двумя способами: через
+//! `ApplyCtx::read_published_fact` (прямой доступ из apply другого примитива)
+//! и через штатный `FactsSource::get` — CLI оборачивает обычный
+//! `FactsView` в `OverlayFactsSource`, который сначала смотрит
+//! published_facts, потом основной snapshot. Это сознательная асимметрия:
+//! фактовая инфраструктура — слишком тяжёлая для динамического per-bundle
+//! factset'а, а ad-hoc запросы — частые.
 
 mod apply;
 mod plan;

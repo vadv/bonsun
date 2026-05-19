@@ -89,23 +89,43 @@ impl AptCacheBackend for RealAptCacheBackend {
 
 /// Реализация cleanup'а, выделена в свободную функцию для unit-тестов.
 ///
-/// Семантика: бежим по entries в `archives_dir` (без рекурсии), оставляем
-/// только обычные файлы с `.deb`-расширением, проверяем `modified()` и
-/// удаляем, если возраст ≥ `older_than_days * 86400`. Возвращает количество
-/// удалённых файлов. Если директория не существует — возвращает 0 без ошибки.
+/// Семантика: бежим по entries в `archives_dir` и в его подкаталоге
+/// `partial/`, оставляем только обычные файлы с `.deb`-расширением,
+/// проверяем `modified()` и удаляем, если возраст ≥ `older_than_days *
+/// 86400`. Возвращает количество удалённых файлов. Если ни одной из
+/// директорий нет — возвращает 0 без ошибки. Глубже, чем `partial/`,
+/// не идём: apt больше нигде в archives/ не хранит deb-файлы.
 pub(crate) fn cleanup_old_debs_impl(
     archives_dir: &Path,
     older_than_days: u32,
 ) -> Result<usize, String> {
-    let entries = match std::fs::read_dir(archives_dir) {
-        Ok(it) => it,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(format!("read_dir {}: {e}", archives_dir.display())),
-    };
-
     let threshold_secs = u64::from(older_than_days) * 86_400;
     let now = std::time::SystemTime::now();
     let mut removed = 0_usize;
+
+    // archives/ и archives/partial/ — оба места, где apt держит .deb-файлы.
+    // partial/ заполняется при прерванной apt-get install (network drop,
+    // диск кончился), и без cleanup'а копится бесконечно.
+    for dir in [archives_dir.to_path_buf(), archives_dir.join("partial")] {
+        cleanup_old_debs_in_dir(&dir, threshold_secs, now, &mut removed)?;
+    }
+
+    Ok(removed)
+}
+
+/// Однотировой проход по одной директории. Выделено, чтобы вызывать дважды
+/// (archives и archives/partial) без копипасты и без рекурсии.
+fn cleanup_old_debs_in_dir(
+    dir: &Path,
+    threshold_secs: u64,
+    now: std::time::SystemTime,
+    removed: &mut usize,
+) -> Result<(), String> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(it) => it,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("read_dir {}: {e}", dir.display())),
+    };
 
     for entry in entries {
         let entry = entry.map_err(|e| format!("readdir iter: {e}"))?;
@@ -130,11 +150,11 @@ pub(crate) fn cleanup_old_debs_impl(
             Err(_) => continue,
         };
         if age_secs >= threshold_secs && std::fs::remove_file(&path).is_ok() {
-            removed += 1;
+            *removed += 1;
         }
     }
 
-    Ok(removed)
+    Ok(())
 }
 
 /// Главная функция apply.
@@ -652,6 +672,52 @@ mod tests {
         std::fs::write(&f, "x").unwrap();
         // age 0 ≥ threshold 0 → удалить.
         let removed = cleanup_old_debs_impl(dir.path(), 0).unwrap();
+        assert_eq!(removed, 1);
+    }
+
+    /// `archives/partial/` копится при прерванной установке (network drop,
+    /// диск переполнен). cleanup должен заглядывать и сюда, иначе старые
+    /// `.deb` остаются навсегда.
+    #[test]
+    fn cleanup_old_debs_also_cleans_partial_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let partial = dir.path().join("partial");
+        std::fs::create_dir(&partial).unwrap();
+
+        // Старый deb в archives/ — должен быть удалён.
+        let archives_old = dir.path().join("old-top.deb");
+        std::fs::write(&archives_old, "x").unwrap();
+        let ten_days_ago = SystemTime::now() - Duration::from_secs(10 * 86_400);
+        set_mtime(&archives_old, ten_days_ago);
+
+        // Старый deb в archives/partial/ — тоже должен быть удалён.
+        let partial_old = partial.join("old-partial.deb");
+        std::fs::write(&partial_old, "x").unwrap();
+        set_mtime(&partial_old, ten_days_ago);
+
+        // Свежий deb в archives/partial/ — должен остаться.
+        let partial_fresh = partial.join("fresh-partial.deb");
+        std::fs::write(&partial_fresh, "x").unwrap();
+
+        let removed = cleanup_old_debs_impl(dir.path(), 1).unwrap();
+        assert_eq!(removed, 2, "должны быть удалены два старых файла");
+        assert!(!archives_old.exists());
+        assert!(!partial_old.exists());
+        assert!(partial_fresh.exists());
+    }
+
+    /// Если `archives/` существует, но `partial/` отсутствует — cleanup
+    /// не должен ошибаться. Сценарий типичный для свежеустановленной ноды
+    /// без прерванных apt-операций.
+    #[test]
+    fn cleanup_old_debs_works_without_partial_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old.deb");
+        std::fs::write(&old, "x").unwrap();
+        let ten_days_ago = SystemTime::now() - Duration::from_secs(10 * 86_400);
+        set_mtime(&old, ten_days_ago);
+
+        let removed = cleanup_old_debs_impl(dir.path(), 1).unwrap();
         assert_eq!(removed, 1);
     }
 

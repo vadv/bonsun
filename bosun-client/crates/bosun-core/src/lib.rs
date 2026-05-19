@@ -46,7 +46,9 @@ pub use orchestrator::{
     PlanSummary, ResourceApplyOutcome, ResourcePlan,
 };
 pub use path_safety::{resolve_within_root, PathSafetyError};
-pub use primitive::{ApplyCtx, ApplyCtxBuilder, FactsSource, PlanCtx, Primitive, PrimitiveError};
+pub use primitive::{
+    ApplyCtx, ApplyCtxBuilder, FactsSource, OverlayFactsSource, PlanCtx, Primitive, PrimitiveError,
+};
 pub use registry::{Registry, RegistryError};
 pub use resource::{Handle, Resource, ResourceId, ResourceKind, ResourceKindError};
 pub use sensitive::{SensitivePayload, SensitiveStore};
