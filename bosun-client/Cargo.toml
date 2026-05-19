@@ -5,6 +5,7 @@ members = [
     "crates/bosun-facts",
     "crates/bosun-primitives",
     "crates/bosun-cli",
+    "crates/bosun-systemd-client",
 ]
 
 [workspace.package]
@@ -38,6 +39,10 @@ procfs = "=0.16"
 num_cpus = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tokio-util = "0.7"
+tokio-test = "0.4"
+zbus = { version = "5", default-features = false, features = ["tokio"] }
+zbus_systemd = { version = "0.25901", default-features = false, features = ["systemd1", "zbus-async-tokio"] }
+futures-util = "0.3"
 debversion = "0.4"
 libc = "0.2"
 starlark = "~0.13"
