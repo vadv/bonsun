@@ -75,12 +75,11 @@ pub enum StarlarkGlueError {
 pub(crate) struct EvalState {
     pub(crate) bundle: Rc<Bundle>,
     pub(crate) primitives: Rc<HashMap<ResourceKind, Box<dyn Primitive>>>,
-    /// FactsSource хранится в state на случай если примитивы захотят его
-    /// читать через with_state в build_payload. Сейчас primitives получают
-    /// факты через materialized JSON в template-closure, но поле сохранено
-    /// для forward-совместимости с runr-integration и runtime-decision
-    /// примитивами.
-    #[allow(dead_code)]
+    /// FactsSource — read-only доступ к фактам. Сейчас используется
+    /// диспатчером `service.unit` (Phase F): читает `init_system`, чтобы
+    /// выбрать между `runr.service` и `systemd.service`. Примитивы напрямую
+    /// факты в build_payload пока не читают — им хватает materialized JSON
+    /// из template-closure.
     pub(crate) facts: Rc<dyn FactsSource>,
     /// Хранилище секретов для file.content.contents.
     pub(crate) sensitive: Arc<SensitiveStore>,
@@ -957,6 +956,309 @@ apt.package(name = "nginx")
         let err = run.result.unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("duplicate") || msg.contains("apt.package:nginx"));
+    }
+
+    /// Источник фактов с фиксированным значением `init_system`. Используется
+    /// тестами `service.unit`, где исход dispatch зависит только от этого факта.
+    struct FixedInitSystem(Option<&'static str>);
+
+    impl FactsSource for FixedInitSystem {
+        fn get(&self, name: &str) -> FactValue {
+            if name == "init_system" {
+                match self.0 {
+                    Some(value) => FactValue::Known(serde_json::Value::String(value.to_string())),
+                    None => FactValue::Unknown {
+                        reason: "init_system intentionally unset for test".into(),
+                    },
+                }
+            } else {
+                FactValue::Unknown {
+                    reason: format!("test facts have no '{name}'"),
+                }
+            }
+        }
+    }
+
+    /// Stub-примитив для `runr.service`: ничего не делает, нужен только
+    /// для регистрации в реестре через `register_primitive_call`.
+    struct MockRunrService;
+
+    impl Primitive for MockRunrService {
+        fn type_name(&self) -> ResourceKind {
+            ResourceKind::from_static("runr.service")
+        }
+        fn identity_keys(&self) -> &'static [&'static str] {
+            &["name"]
+        }
+        fn build_payload(
+            &self,
+            args: &CallArgs,
+            _ctx: &PlanCtx,
+        ) -> Result<serde_json::Value, PrimitiveError> {
+            let name = args
+                .required_str("name")
+                .map_err(|e| PrimitiveError::InvalidPayload(format!("runr.service: {e}")))?;
+            let state = args
+                .required_str("state")
+                .map_err(|e| PrimitiveError::InvalidPayload(format!("runr.service: {e}")))?;
+            Ok(serde_json::json!({"name": name, "state": state}))
+        }
+        fn plan(
+            &self,
+            _resource: &Resource,
+            _facts: &dyn FactsSource,
+            _ctx: &PlanCtx,
+        ) -> Result<Diff, PrimitiveError> {
+            Ok(Diff::NoChange)
+        }
+        fn apply(
+            &self,
+            _resource: &Resource,
+            _diff: &Diff,
+            _ctx: &ApplyCtx,
+        ) -> Result<ChangeReport, PrimitiveError> {
+            Ok(ChangeReport::no_change())
+        }
+    }
+
+    /// Stub-примитив для `systemd.service`: симметричен `MockRunrService`.
+    struct MockSystemdService;
+
+    impl Primitive for MockSystemdService {
+        fn type_name(&self) -> ResourceKind {
+            ResourceKind::from_static("systemd.service")
+        }
+        fn identity_keys(&self) -> &'static [&'static str] {
+            &["name"]
+        }
+        fn build_payload(
+            &self,
+            args: &CallArgs,
+            _ctx: &PlanCtx,
+        ) -> Result<serde_json::Value, PrimitiveError> {
+            let name = args
+                .required_str("name")
+                .map_err(|e| PrimitiveError::InvalidPayload(format!("systemd.service: {e}")))?;
+            let state = args
+                .required_str("state")
+                .map_err(|e| PrimitiveError::InvalidPayload(format!("systemd.service: {e}")))?;
+            Ok(serde_json::json!({"name": name, "state": state}))
+        }
+        fn plan(
+            &self,
+            _resource: &Resource,
+            _facts: &dyn FactsSource,
+            _ctx: &PlanCtx,
+        ) -> Result<Diff, PrimitiveError> {
+            Ok(Diff::NoChange)
+        }
+        fn apply(
+            &self,
+            _resource: &Resource,
+            _diff: &Diff,
+            _ctx: &ApplyCtx,
+        ) -> Result<ChangeReport, PrimitiveError> {
+            Ok(ChangeReport::no_change())
+        }
+    }
+
+    /// Регистрируем оба service-примитива в одном HashMap, чтобы тесты могли
+    /// проверять, какой из них реально вызвался при разных значениях факта.
+    fn primitives_with_mock_services() -> Rc<HashMap<ResourceKind, Box<dyn Primitive>>> {
+        let mut m: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
+        m.insert(
+            ResourceKind::from_static("runr.service"),
+            Box::new(MockRunrService),
+        );
+        m.insert(
+            ResourceKind::from_static("systemd.service"),
+            Box::new(MockSystemdService),
+        );
+        Rc::new(m)
+    }
+
+    /// Запустить eval с пользовательским FactsSource. Нужен тестам
+    /// `service.unit`, у которых поведение зависит от факта `init_system`.
+    fn run_with_facts(
+        bundle: Bundle,
+        primitives: Rc<HashMap<ResourceKind, Box<dyn Primitive>>>,
+        facts: Rc<dyn FactsSource>,
+    ) -> EvalRun {
+        let registry = Rc::new(RefCell::new(Registry::new()));
+        let sensitive = Arc::new(SensitiveStore::new());
+        let plan_ctx = plan_ctx();
+        let config = EvaluatorConfig {
+            bundle: Rc::new(bundle),
+            primitives,
+            facts,
+            sensitive: Arc::clone(&sensitive),
+            registry: Rc::clone(&registry),
+            plan_ctx,
+            template_fn: default_template_fn(),
+            tags: HashSet::new(),
+        };
+        let result = evaluate_manifest(config);
+        EvalRun {
+            result,
+            registry,
+            sensitive,
+        }
+    }
+
+    #[test]
+    fn service_unit_dispatches_to_systemd_for_systemd_init() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "service")
+service.unit(name = "nginx", state = "running")
+"#,
+        );
+        let facts: Rc<dyn FactsSource> = Rc::new(FixedInitSystem(Some("systemd")));
+        let run = run_with_facts(bundle, primitives_with_mock_services(), facts);
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        assert_eq!(reg.all().len(), 1);
+        let r = &reg.all()[0];
+        assert_eq!(
+            r.id,
+            ResourceId::new(&ResourceKind::from_static("systemd.service"), "nginx")
+        );
+    }
+
+    #[test]
+    fn service_unit_dispatches_to_systemd_for_mixed_init() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "service")
+service.unit(name = "nginx", state = "running")
+"#,
+        );
+        let facts: Rc<dyn FactsSource> = Rc::new(FixedInitSystem(Some("mixed-systemd-runr")));
+        let run = run_with_facts(bundle, primitives_with_mock_services(), facts);
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        // В смешанной конфигурации primary = systemd, согласно дизайну Phase F.
+        assert!(reg
+            .get(&ResourceId::new(
+                &ResourceKind::from_static("systemd.service"),
+                "nginx"
+            ))
+            .is_some());
+        assert!(reg
+            .get(&ResourceId::new(
+                &ResourceKind::from_static("runr.service"),
+                "nginx"
+            ))
+            .is_none());
+    }
+
+    #[test]
+    fn service_unit_dispatches_to_runr_for_runr_init() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "service")
+service.unit(name = "postgres", state = "running")
+"#,
+        );
+        let facts: Rc<dyn FactsSource> = Rc::new(FixedInitSystem(Some("runr")));
+        let run = run_with_facts(bundle, primitives_with_mock_services(), facts);
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        assert_eq!(reg.all().len(), 1);
+        let r = &reg.all()[0];
+        assert_eq!(
+            r.id,
+            ResourceId::new(&ResourceKind::from_static("runr.service"), "postgres")
+        );
+    }
+
+    #[test]
+    fn service_unit_fails_on_unsupported_init() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "service")
+service.unit(name = "x", state = "running")
+"#,
+        );
+        let facts: Rc<dyn FactsSource> = Rc::new(FixedInitSystem(Some("openrc")));
+        let run = run_with_facts(bundle, primitives_with_mock_services(), facts);
+        let err = run.result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unsupported init_system") && msg.contains("openrc"),
+            "expected unsupported init_system error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn service_unit_fails_when_init_system_unknown() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "service")
+service.unit(name = "x", state = "running")
+"#,
+        );
+        let facts: Rc<dyn FactsSource> = Rc::new(FixedInitSystem(None));
+        let run = run_with_facts(bundle, primitives_with_mock_services(), facts);
+        let err = run.result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("init_system fact unknown"),
+            "expected init_system unknown error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn service_unit_rejects_init_specific_kwarg() {
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "service")
+service.unit(name = "x", state = "running", cgroup_procs_path = "/sys/fs/cgroup")
+"#,
+        );
+        let facts: Rc<dyn FactsSource> = Rc::new(FixedInitSystem(Some("runr")));
+        let run = run_with_facts(bundle, primitives_with_mock_services(), facts);
+        let err = run.result.unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unexpected keyword argument") && msg.contains("cgroup_procs_path"),
+            "expected unexpected-kwarg error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn service_unit_propagates_restart_on_handle_list() {
+        // restart_on есть в allow-листе service.unit и должен сохраниться
+        // в Resource. Берём handle от apt.package как источник notify.
+        let bundle = bundle_with_manifest(
+            r#"
+load("@bosun/builtins", "apt", "service")
+trigger = apt.package(name = "nginx")
+service.unit(name = "nginx", state = "running", restart_on = [trigger])
+"#,
+        );
+        let mut primitives: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
+        primitives.insert(ResourceKind::from_static("apt.package"), Box::new(MockApt));
+        primitives.insert(
+            ResourceKind::from_static("systemd.service"),
+            Box::new(MockSystemdService),
+        );
+        let primitives = Rc::new(primitives);
+        let facts: Rc<dyn FactsSource> = Rc::new(FixedInitSystem(Some("systemd")));
+        let run = run_with_facts(bundle, primitives, facts);
+        run.result.unwrap();
+        let reg = run.registry.borrow();
+        let svc = reg
+            .get(&ResourceId::new(
+                &ResourceKind::from_static("systemd.service"),
+                "nginx",
+            ))
+            .unwrap();
+        assert_eq!(svc.restart_on.len(), 1);
+        assert_eq!(
+            svc.restart_on[0],
+            ResourceId::new(&ResourceKind::from_static("apt.package"), "nginx"),
+        );
     }
 
     #[test]

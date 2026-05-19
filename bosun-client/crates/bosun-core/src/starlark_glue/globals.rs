@@ -33,13 +33,14 @@ use crate::starlark_glue::inv_object::json_scalar_to_value;
 use crate::starlark_glue::{current_state, with_state, EvalState, StarlarkGlueError};
 
 /// Globals для bosun-манифеста. Включает namespaces `apt`, `file`, `inventory`,
-/// `tags` и функцию `template`, плюс стандартную библиотеку starlark.
+/// `tags`, `service` и функцию `template`, плюс стандартную библиотеку starlark.
 pub fn build_globals() -> Globals {
     GlobalsBuilder::standard()
         .with_namespace("apt", apt_namespace)
         .with_namespace("file", file_namespace)
         .with_namespace("inventory", inventory_namespace)
         .with_namespace("tags", tags_namespace)
+        .with_namespace("service", service_namespace)
         .with(template_fn)
         .build()
 }
@@ -191,6 +192,127 @@ fn tags_namespace(builder: &mut GlobalsBuilder) {
         let items: Vec<Value> = active.into_iter().map(|s| eval.heap().alloc(s)).collect();
         Ok(eval.heap().alloc(AllocList(items)))
     }
+}
+
+#[starlark_module]
+fn service_namespace(builder: &mut GlobalsBuilder) {
+    /// `service.unit(name=, state=, ...)` — абстрактный диспатчер unit-сервиса.
+    ///
+    /// На основе факта `init_system` выбирает между `systemd.service`
+    /// (для `systemd` и `mixed-systemd-runr`) и `runr.service` (для `runr`).
+    /// Принимает только общий поднабор параметров: всё init-специфичное
+    /// (например, `cgroup_procs_path` у runr или `condition_path_exists`
+    /// у systemd) отклоняется с явной ошибкой. Power-user в таких случаях
+    /// должен идти на конкретный примитив напрямую.
+    fn unit<'v>(
+        #[starlark(kwargs)] kwargs: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        dispatch_service_unit(kwargs, eval)
+    }
+}
+
+/// Перечень параметров, которые `service.unit` пропускает в конкретный
+/// примитив. Совпадает с тем подмножеством, которое и `runr.service`, и
+/// `systemd.service` читают в `build_payload` (плюс общая notify-инфраструктура
+/// `reload_on`/`restart_on`/`depends_on`). Любой ключ за пределами этого
+/// списка — ошибка: автор bundle'а либо обращается к init-специфичной фиче
+/// (тогда вызов должен идти на конкретный примитив), либо опечатался.
+const SERVICE_UNIT_ALLOWED_KWARGS: &[&str] = &[
+    "name",
+    "state",
+    "enable",
+    "health_check_cmd",
+    "health_check_url",
+    "health_check_expected_status",
+    "health_check_retry",
+    "health_check_retry_interval_sec",
+    "health_check_timeout_sec",
+    "validate_with",
+    "reload_on",
+    "restart_on",
+    "depends_on",
+];
+
+/// Реализация `service.unit`. Читает факт `init_system`, валидирует kwargs
+/// против allow-листа и делегирует в `register_primitive_call` с целевым
+/// `kind`.
+///
+/// Замечание про `enable`: и `runr.service`, и `systemd.service` сами назначают
+/// дефолт (false и true соответственно). Диспатчер передаёт `enable` только
+/// если ключ присутствует в исходных kwargs — это сохраняет per-init дефолт
+/// в случае «параметр не передан» и пробрасывает явное значение пользователя
+/// в случае `enable=True/False`.
+fn dispatch_service_unit<'v>(
+    kwargs: Value<'v>,
+    eval: &mut Evaluator<'v, '_, '_>,
+) -> starlark::Result<Value<'v>> {
+    reject_unexpected_service_unit_kwargs(kwargs)?;
+
+    let kind_str = with_state(resolve_service_unit_kind)
+        .ok_or_else(|| {
+            starlark::Error::new_other(anyhow::anyhow!(
+                "internal: no eval state during service.unit"
+            ))
+        })?
+        .map_err(starlark::Error::new_other)?;
+
+    register_primitive_call(kind_str, kwargs, eval)
+}
+
+/// Прочитать `init_system` из EvalState и решить, в какой примитив диспатчить.
+/// Возвращает статический литерал, чтобы дальше использовать его в
+/// `register_primitive_call` как `kind_str`.
+fn resolve_service_unit_kind(state: &EvalState) -> Result<&'static str, anyhow::Error> {
+    let fact = state.facts.get("init_system");
+    let value = fact.value().ok_or_else(|| {
+        anyhow::anyhow!(
+            "service.unit: init_system fact unknown; ensure the facts collector populated it",
+        )
+    })?;
+    let init = value.as_str().ok_or_else(|| {
+        anyhow::anyhow!(
+            "service.unit: init_system fact is not a string (got {value}); facts collector misconfiguration",
+        )
+    })?;
+    match init {
+        "systemd" | "mixed-systemd-runr" => Ok("systemd.service"),
+        "runr" => Ok("runr.service"),
+        other => Err(anyhow::anyhow!(
+            "service.unit: unsupported init_system {other:?}; expected one of \
+             systemd, mixed-systemd-runr, runr",
+        )),
+    }
+}
+
+/// Проверить, что в kwargs нет неожиданных ключей. Все доступные параметры
+/// перечислены в [`SERVICE_UNIT_ALLOWED_KWARGS`]. Это намеренно строго:
+/// init-специфичные опции (runr-only `cgroup_procs_path`, systemd-only
+/// `condition_path_exists`) должны вызывать `runr.service` / `systemd.service`
+/// напрямую, а не маскироваться под общий dispatcher.
+fn reject_unexpected_service_unit_kwargs<'v>(kwargs: Value<'v>) -> Result<(), starlark::Error> {
+    use starlark::values::dict::DictRef;
+
+    let dict = DictRef::from_value(kwargs).ok_or_else(|| {
+        starlark::Error::new_other(anyhow::anyhow!(
+            "internal: service.unit kwargs is not a dict"
+        ))
+    })?;
+    for (key, _) in dict.iter() {
+        let key_str = key.unpack_str().ok_or_else(|| {
+            starlark::Error::new_other(anyhow::anyhow!(
+                "service.unit: kwargs key must be a string, got {}",
+                key.get_type()
+            ))
+        })?;
+        if !SERVICE_UNIT_ALLOWED_KWARGS.contains(&key_str) {
+            return Err(starlark::Error::new_other(anyhow::anyhow!(
+                "service.unit: unexpected keyword argument {key_str:?}; \
+                 use runr.service(...) or systemd.service(...) directly for init-specific options",
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[starlark_module]
@@ -505,6 +627,8 @@ fn register_primitive_call<'v>(
     let kind = match kind_str {
         "apt.package" => ResourceKind::from_static("apt.package"),
         "file.content" => ResourceKind::from_static("file.content"),
+        "runr.service" => ResourceKind::from_static("runr.service"),
+        "systemd.service" => ResourceKind::from_static("systemd.service"),
         other => ResourceKind::try_new(other).map_err(|e| {
             starlark::Error::new_other(anyhow::anyhow!("invalid resource kind '{other}': {e}"))
         })?,
