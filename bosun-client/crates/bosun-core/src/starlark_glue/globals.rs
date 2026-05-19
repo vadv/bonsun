@@ -33,7 +33,8 @@ use crate::starlark_glue::inv_object::json_scalar_to_value;
 use crate::starlark_glue::{current_state, with_state, EvalState, StarlarkGlueError};
 
 /// Globals для bosun-манифеста. Включает namespaces `apt`, `file`, `inventory`,
-/// `tags`, `service` и функцию `template`, плюс стандартную библиотеку starlark.
+/// `tags`, `service`, `process` и функцию `template`, плюс стандартную
+/// библиотеку starlark.
 pub fn build_globals() -> Globals {
     GlobalsBuilder::standard()
         .with_namespace("apt", apt_namespace)
@@ -41,6 +42,7 @@ pub fn build_globals() -> Globals {
         .with_namespace("inventory", inventory_namespace)
         .with_namespace("tags", tags_namespace)
         .with_namespace("service", service_namespace)
+        .with_namespace("process", process_namespace)
         .with(template_fn)
         .build()
 }
@@ -209,6 +211,28 @@ fn service_namespace(builder: &mut GlobalsBuilder) {
         eval: &mut Evaluator<'v, '_, '_>,
     ) -> starlark::Result<Value<'v>> {
         dispatch_service_unit(kwargs, eval)
+    }
+}
+
+#[starlark_module]
+fn process_namespace(builder: &mut GlobalsBuilder) {
+    /// `process.signal(name=, signal=, process_name=|process_user=, deferred=?)`
+    /// — узкий примитив отправки allowlist-сигнала процессу.
+    ///
+    /// Позволяет реализовать chiit-кейс `defers.AddCommand(ctx,
+    /// "hup-pg-doorman", "pkill -HUP pg_doorman")` без exposing-а полного
+    /// shell-escape hatch. Сигналы ограничены `HUP`/`TERM`/`INT`/`USR1`/
+    /// `USR2`/`WINCH`/`PIPE` (без `KILL`/`STOP`/`CONT` — для остановки
+    /// процессов используйте `service.unit(state="stopped")`).
+    ///
+    /// Селектор — ровно один из `process_name`/`process_user`. По умолчанию
+    /// `deferred=True` (как в chiit-практике): запись попадает в журнал
+    /// defers и выполняется в replay-фазе.
+    fn signal<'v>(
+        #[starlark(kwargs)] kwargs: Value<'v>,
+        eval: &mut Evaluator<'v, '_, '_>,
+    ) -> starlark::Result<Value<'v>> {
+        register_primitive_call("process.signal", kwargs, eval)
     }
 }
 
@@ -635,6 +659,7 @@ fn register_primitive_call<'v>(
         "file.content" => ResourceKind::from_static("file.content"),
         "runr.service" => ResourceKind::from_static("runr.service"),
         "systemd.service" => ResourceKind::from_static("systemd.service"),
+        "process.signal" => ResourceKind::from_static("process.signal"),
         other => ResourceKind::try_new(other).map_err(|e| {
             starlark::Error::new_other(anyhow::anyhow!("invalid resource kind '{other}': {e}"))
         })?,

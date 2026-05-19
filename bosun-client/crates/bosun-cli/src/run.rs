@@ -19,7 +19,9 @@ use bosun_core::{
     Outcome, PlanCtx, PlanReport, Primitive, ResourceKind, SensitiveStore, TemplateFn,
 };
 use bosun_facts::FactsCollector;
-use bosun_primitives::{template::render_template, AptPrimitive, FilePrimitive};
+use bosun_primitives::{
+    template::render_template, AptPrimitive, FilePrimitive, ProcessSignalPrimitive,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::args::{ApplyArgs, ReportFormat};
@@ -309,6 +311,10 @@ fn build_primitives() -> HashMap<ResourceKind, Box<dyn Primitive>> {
         ResourceKind::from_static("file.content"),
         Box::new(FilePrimitive),
     );
+    m.insert(
+        ResourceKind::from_static("process.signal"),
+        Box::new(ProcessSignalPrimitive::with_real_runner()),
+    );
     m
 }
 
@@ -464,11 +470,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn build_primitives_registers_apt_and_file() {
+    fn build_primitives_registers_apt_file_and_process_signal() {
         let m = build_primitives();
         assert!(m.contains_key(&ResourceKind::from_static("apt.package")));
         assert!(m.contains_key(&ResourceKind::from_static("file.content")));
-        assert_eq!(m.len(), 2);
+        assert!(m.contains_key(&ResourceKind::from_static("process.signal")));
+        assert_eq!(m.len(), 3);
     }
 
     #[test]
