@@ -1,0 +1,6 @@
+timezone: UTC
+locale: en_US.UTF-8
+cluster_name: pg-demo
+patroni_scope: pg-demo
+pgbouncer_listen_addr: 127.0.0.1
+pgbouncer_listen_port: 6432

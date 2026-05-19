@@ -1,0 +1,11 @@
+[databases]
+* = host=127.0.0.1 port=5432
+
+[pgbouncer]
+listen_addr = {{ inv.pgbouncer_listen_addr }}
+listen_port = {{ inv.pgbouncer_listen_port }}
+auth_type = scram-sha-256
+auth_file = /etc/pgbouncer/userlist.txt
+pool_mode = {{ inv.pgbouncer_pool_mode }}
+default_pool_size = {{ inv.pgbouncer_default_pool_size }}
+max_client_conn = {{ inv.max_connections }}

@@ -117,3 +117,11 @@ Feature: Bundle directory structure
     When I run "bosun bundle validate --bundle /work/bundle --tags=bdd" inside the container
     Then exit code is 3
     And output contains "inventory/missing.yaml"
+
+  @bundle-validate @bundle-roles
+  Scenario: examples/multi-role-pg validates with staging tag
+    Given a fresh container
+    And the bundle from "examples/multi-role-pg/bundle"
+    When I run "bosun bundle validate --bundle /work/bundle --tags=staging" inside the container
+    Then exit code is 0
+    And output contains "evaluate OK"

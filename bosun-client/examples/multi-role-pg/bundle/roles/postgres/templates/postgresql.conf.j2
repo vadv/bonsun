@@ -1,0 +1,18 @@
+data_directory = '{{ inv.data_dir }}'
+hba_file = '/etc/postgresql/15/main/pg_hba.conf'
+
+listen_addresses = '*'
+port = 5432
+max_connections = {{ inv.max_connections }}
+
+shared_buffers = {{ inv.shared_buffers }}
+work_mem = {{ inv.work_mem }}
+maintenance_work_mem = {{ inv.maintenance_work_mem }}
+effective_cache_size = {{ inv.effective_cache_size }}
+
+wal_level = {{ inv.wal_level }}
+max_wal_senders = {{ inv.max_wal_senders }}
+hot_standby = {{ inv.hot_standby }}
+
+timezone = '{{ inv.timezone }}'
+log_timezone = '{{ inv.timezone }}'

@@ -1,0 +1,13 @@
+scope: {{ inv.patroni_scope }}
+name: {{ inv.cluster_name }}-node
+
+postgresql:
+  data_dir: {{ inv.data_dir }}
+  bin_dir: /usr/lib/postgresql/15/bin
+  parameters:
+    max_connections: {{ inv.max_connections }}
+    max_wal_senders: {{ inv.max_wal_senders }}
+    shared_buffers: {{ inv.shared_buffers }}
+
+replication:
+  replicas: {{ inv.patroni_replicas }}

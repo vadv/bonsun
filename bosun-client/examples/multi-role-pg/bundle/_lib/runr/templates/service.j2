@@ -1,0 +1,12 @@
+[Unit]
+Description=runr-managed {{ inv.name }}
+After=network-online.target
+
+[Service]
+Type=simple
+User={{ inv.user }}
+ExecStart={{ inv.exec_start }}
+Restart={{ inv.restart }}
+
+[Install]
+WantedBy=multi-user.target

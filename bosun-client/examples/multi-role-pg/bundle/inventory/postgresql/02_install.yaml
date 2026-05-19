@@ -1,0 +1,4 @@
+data_dir: /var/lib/postgresql/15/main
+initdb_locale: en_US.UTF-8
+initdb_encoding: UTF8
+initdb_data_checksums: true

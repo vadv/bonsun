@@ -1,0 +1,9 @@
+shared_buffers: 8GB
+work_mem: 32MB
+maintenance_work_mem: 512MB
+effective_cache_size: 24GB
+max_connections: 400
+max_wal_senders: 20
+pgbouncer_pool_mode: transaction
+pgbouncer_default_pool_size: 50
+patroni_replicas: 2
