@@ -102,8 +102,17 @@ pub fn apply(
     // в сигнатуре, потому что Primitive::apply требует это.
     let _ = diff;
 
+    // F07: для Update сохраняем существующий owner/group, если spec
+    // не задал явно. Иначе bosun под root'ом превращал бы файлы в
+    // root:root — гриб для postgres/nginx/etc, чьи conf-файлы owned
+    // непривилегированным юзером.
+    let existing_owner = observed.as_ref().map(|m| {
+        use std::os::unix::fs::MetadataExt as _;
+        (m.uid(), m.gid())
+    });
+
     tracing::info!(path = %target.display(), "writing file");
-    write_atomic(target, contents.as_bytes(), &spec)?;
+    write_atomic(target, contents.as_bytes(), &spec, existing_owner)?;
 
     Ok(ChangeReport::changed(format!(
         "wrote {} (sha256={})",
@@ -114,7 +123,17 @@ pub fn apply(
 
 /// Запись через `tempfile` в той же родительской директории, `fsync`, `chmod`,
 /// `chown`, потом `rename`. Атомарность даёт rename внутри одной FS.
-fn write_atomic(target: &Path, body: &[u8], spec: &FileContentSpec) -> Result<(), PrimitiveError> {
+///
+/// `existing_owner` (uid, gid) существующего target'а — используется
+/// для случая, когда spec.owner / spec.group не заданы при Update:
+/// чтобы не «обнулять» текущего владельца до процесса (root:root
+/// при запуске под root).
+fn write_atomic(
+    target: &Path,
+    body: &[u8],
+    spec: &FileContentSpec,
+    existing_owner: Option<(u32, u32)>,
+) -> Result<(), PrimitiveError> {
     let parent = target.parent().ok_or_else(|| {
         PrimitiveError::InvalidPayload(format!(
             "target {} has no parent directory",
@@ -158,18 +177,34 @@ fn write_atomic(target: &Path, body: &[u8], spec: &FileContentSpec) -> Result<()
         source: e,
     })?;
 
-    // chown до rename, если запрошены owner/group.
-    if spec.owner.is_some() || spec.group.is_some() {
-        let want_uid = match &spec.owner {
-            Some(name) => resolve_owner(name)?,
+    // F07: chown всегда вызывается с целевыми (uid, gid), независимо от
+    // того, задал ли spec явно owner/group. Правила выбора:
+    //   spec.owner=Some → resolve;
+    //   spec.owner=None + existing_owner=Some → берём текущего;
+    //   spec.owner=None + existing_owner=None (новый файл) → tempfile (= current euid).
+    // То же для gid. Так Update без явного owner/group не сбрасывает
+    // владельца в root:root.
+    let want_uid = match &spec.owner {
+        Some(name) => Some(resolve_owner(name)?),
+        None => existing_owner.map(|(u, _)| u),
+    };
+    let want_gid = match &spec.group {
+        Some(name) => Some(resolve_group(name)?),
+        None => existing_owner.map(|(_, g)| g),
+    };
+    if want_uid.is_some() || want_gid.is_some() {
+        // Если одна из сторон осталась None (новый файл, spec не указал
+        // ту же сторону), берём текущий uid/gid tempfile'а — это euid процесса.
+        let final_uid = match want_uid {
+            Some(u) => u,
             None => unix_meta_uid(tmp.path())?,
         };
-        let want_gid = match &spec.group {
-            Some(name) => resolve_group(name)?,
+        let final_gid = match want_gid {
+            Some(g) => g,
             None => unix_meta_gid(tmp.path())?,
         };
         let is_root = current_euid() == 0;
-        chown_if_needed(tmp.path(), want_uid, want_gid, is_root)?;
+        chown_if_needed(tmp.path(), final_uid, final_gid, is_root)?;
     }
 
     let target_buf = target.to_path_buf();
@@ -460,6 +495,130 @@ mod tests {
             events.iter().any(|e| e.contains("writing file")),
             "expected 'writing file' event; got: {events:?}",
         );
+    }
+
+    // F07 regression: ownership preservation. На non-root тестах мы не
+    // можем chown'ить файл в другого пользователя; используем chown в
+    // того же uid/gid процесса, чтобы протестировать «no-op preserve».
+
+    #[test]
+    fn apply_preserves_existing_owner_when_spec_omits() {
+        // Симулируем существующий target с owner=current_euid/gid
+        // (это то что мы можем сделать без root). Spec не указывает
+        // owner/group — bosun должен оставить файл с тем же uid/gid,
+        // а не пытаться сбросить в default-tempfile значения (которые
+        // тоже текущие — это no-op chown в любом случае; критический
+        // тест — что bosun не вернул ChownNotPermitted, пытаясь
+        // chown'нуть в чужого).
+        use std::os::unix::fs::MetadataExt as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("conf");
+        std::fs::write(&target, b"old content").unwrap();
+        let orig_meta = std::fs::metadata(&target).unwrap();
+        let orig_uid = orig_meta.uid();
+        let orig_gid = orig_meta.gid();
+
+        let (resource, _sha) = make_resource(target.to_str().unwrap(), "new content", 0o644);
+        let store = Arc::new(SensitiveStore::new());
+        store.put(
+            resource.id.clone(),
+            SensitivePayload::new("new content".into()),
+        );
+        let ctx = ctx_with_store_and_backup(Arc::clone(&store), tmp.path().join("backup"));
+
+        let diff = Diff::Update {
+            from: serde_json::json!({"sha": "old"}),
+            to: serde_json::json!({"sha": "new"}),
+            description: "update".into(),
+        };
+        apply(&resource, &diff, &ctx).unwrap();
+
+        let new_meta = std::fs::metadata(&target).unwrap();
+        assert_eq!(new_meta.uid(), orig_uid, "uid должен сохраниться");
+        assert_eq!(new_meta.gid(), orig_gid, "gid должен сохраниться");
+        assert_eq!(std::fs::read(&target).unwrap(), b"new content");
+    }
+
+    #[test]
+    fn apply_preserves_existing_uid_when_only_group_specified() {
+        // spec задаёт только group (тут — текущая группа процесса по
+        // имени, чтобы не упереться в ChownNotPermitted). owner должен
+        // взяться из existing target, а не из process.
+        use std::os::unix::fs::MetadataExt as _;
+
+        if current_euid() == 0 {
+            // Под root ChownNotPermitted не сработает, тест неинформативен
+            // относительно poveden'ия non-root; пропускаем.
+            return;
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("conf");
+        std::fs::write(&target, b"old").unwrap();
+        let orig_meta = std::fs::metadata(&target).unwrap();
+        let orig_uid = orig_meta.uid();
+        let orig_gid = orig_meta.gid();
+
+        // Резолвим имя текущей группы — оно должно быть в /etc/group и
+        // совпадать с gid процесса. Если не получается — пропускаем
+        // (контейнерные окружения).
+        let group_name = match resolve_group_by_gid(orig_gid) {
+            Some(n) => n,
+            None => {
+                eprintln!("skipping: cannot resolve group name for gid={orig_gid}");
+                return;
+            }
+        };
+
+        let sha = sha256_hex(b"new");
+        let payload = serde_json::json!({
+            "path": target.to_str().unwrap(),
+            "mode": 0o644_u32,
+            "group": group_name,
+            "content_sha256": sha,
+            "content_size": 3_u64,
+        });
+        let kind = ResourceKind::from_static("file.content");
+        let id = ResourceId::new(&kind, target.to_str().unwrap());
+        let resource = Resource {
+            id: id.clone(),
+            kind,
+            spec_version: 1,
+            payload,
+            reload_on: Vec::new(),
+            depends_on: Vec::new(),
+        };
+        let store = Arc::new(SensitiveStore::new());
+        store.put(id, SensitivePayload::new("new".into()));
+        let ctx = ctx_with_store_and_backup(Arc::clone(&store), tmp.path().join("backup"));
+
+        let diff = Diff::Update {
+            from: serde_json::json!({}),
+            to: serde_json::json!({}),
+            description: "x".into(),
+        };
+        apply(&resource, &diff, &ctx).unwrap();
+
+        let new_meta = std::fs::metadata(&target).unwrap();
+        assert_eq!(new_meta.uid(), orig_uid);
+        assert_eq!(new_meta.gid(), orig_gid);
+    }
+
+    /// Резолвить gid → name через /etc/group. None если запись не найдена.
+    fn resolve_group_by_gid(gid: u32) -> Option<String> {
+        let text = std::fs::read_to_string("/etc/group").ok()?;
+        for line in text.lines() {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() >= 3 {
+                if let Ok(g) = parts[2].parse::<u32>() {
+                    if g == gid {
+                        return Some(parts[0].to_string());
+                    }
+                }
+            }
+        }
+        None
     }
 
     #[test]
