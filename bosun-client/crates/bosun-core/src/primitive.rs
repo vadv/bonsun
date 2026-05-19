@@ -22,7 +22,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
-use bosun_handles::{RunrHandle, ServiceStatus, SystemdHandle};
+use bosun_handles::{RunrHandle, ServiceStatus, SystemdHandle, TimerStatus};
 use tokio_util::sync::CancellationToken;
 
 use crate::defers::Journal;
@@ -67,6 +67,9 @@ pub struct PlanCtx {
 /// apply: одного HTTP-call'а хватает на сравнение plan/apply для всех
 /// `runr.service` ресурсов в манифесте. `OnceLock` обеспечивает lazy-init и
 /// безопасную инициализацию single-shot.
+///
+/// `runr_timer_statuses` — аналогичный кэш для `runr.timer_statuses()`:
+/// на 10 таймерах в одном bundle экономит 9 HTTP round-trip'ов.
 ///
 /// `validator` — исполнитель `validate_with`-команд. Передаётся в Arc, чтобы
 /// тесты подменяли spawn без зависимости от системных бинарей.
@@ -114,6 +117,9 @@ pub struct ApplyCtx {
     /// Кэш ответа `runr.service_statuses()` на весь apply. См. описание
     /// поля.
     pub runr_service_statuses: Arc<OnceLock<Vec<ServiceStatus>>>,
+    /// Кэш ответа `runr.timer_statuses()` на весь apply. См. описание
+    /// поля.
+    pub runr_timer_statuses: Arc<OnceLock<Vec<TimerStatus>>>,
     /// Исполнитель `validate_with`-команд (`nginx -t`, etc). В production
     /// CLI собирает `RealValidateRunner`; в тестах примитивы подменяют
     /// mock, который записывает argv и возвращает заранее заданный
@@ -395,6 +401,7 @@ impl ApplyCtxBuilder {
             runr_daemon_reload_done: Arc::new(AtomicBool::new(false)),
             systemd_daemon_reload_done: Arc::new(AtomicBool::new(false)),
             runr_service_statuses: Arc::new(OnceLock::new()),
+            runr_timer_statuses: Arc::new(OnceLock::new()),
             validator: self
                 .validator
                 .unwrap_or_else(|| Arc::new(RealValidateRunner)),
