@@ -1,0 +1,58 @@
+# cargo-deny configuration for bosun-client.
+#
+# Runs in CI via .github/workflows/security.yml. Local check:
+#   cd bosun-client && cargo deny --all-features check
+#
+# Documentation: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# bosun ships as a static musl binary on Linux. We do not target Windows or
+# macOS in production, so narrowing the graph keeps the check focused on what
+# actually ends up on a node.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "x86_64-unknown-linux-musl" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-musl" },
+]
+all-features = true
+
+[advisories]
+# `unmaintained = "workspace"` only fires for crates the workspace pulls in
+# directly, ignoring deep transitive advisories we cannot act on.
+unmaintained = "workspace"
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+deny = [
+    # OpenSSL pulls libssl/libcrypto into the musl binary and breaks static
+    # linking. Workspace pins ureq/rcgen/postgres to rustls + ring instead.
+    { crate = "openssl", use-instead = "rustls" },
+    { crate = "openssl-sys", use-instead = "rustls" },
+    { crate = "native-tls", use-instead = "rustls" },
+]
+
+[licenses]
+# 0.93 is the cargo-deny default and balances false positives against missed
+# matches when text-scanning a LICENSE file.
+confidence-threshold = 0.93
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "MIT",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+]
+# Workspace crates are `publish = false` and license = "Proprietary"; deny
+# would otherwise reject them since "Proprietary" is not in `allow`.
+private = { ignore = true }
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

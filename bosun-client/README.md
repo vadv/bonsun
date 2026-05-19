@@ -1,5 +1,9 @@
 # bosun-client
 
+![CI](https://github.com/vadv/bonsun/actions/workflows/ci.yml/badge.svg)
+![musl-build](https://github.com/vadv/bonsun/actions/workflows/musl-build.yml/badge.svg?branch=main)
+![security](https://github.com/vadv/bonsun/actions/workflows/security.yml/badge.svg)
+
 bosun-client — SCM-агент на Rust. Запускается под root, читает декларативный
 bundle на Starlark, собирает факты о ноде, считает план и применяет ресурсы
 с advisory-lock'ом. Аналог chef/puppet/ansible, заточенный под парк
