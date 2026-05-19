@@ -196,34 +196,7 @@ impl UsersBackend for RealUsersBackend {
 
     fn useradd(&self, opts: &UserAddOpts) -> Result<(), UsersError> {
         self.require_root()?;
-        let mut argv: Vec<String> = vec!["useradd".to_string()];
-        if opts.system {
-            argv.push("--system".into());
-        }
-        if let Some(uid) = opts.uid {
-            argv.push("--uid".into());
-            argv.push(uid.to_string());
-        }
-        if let Some(ref group) = opts.group {
-            argv.push("--gid".into());
-            argv.push(group.clone());
-        }
-        if let Some(ref shell) = opts.shell {
-            argv.push("--shell".into());
-            argv.push(shell.clone());
-        }
-        if let Some(ref home) = opts.home {
-            argv.push("--home-dir".into());
-            argv.push(home.to_string_lossy().into_owned());
-        }
-        if opts.no_create_home {
-            argv.push("--no-create-home".into());
-        }
-        if let Some(ref c) = opts.comment {
-            argv.push("--comment".into());
-            argv.push(c.clone());
-        }
-        argv.push(opts.name.clone());
+        let argv = build_useradd_argv(opts);
         run_command(&argv)
     }
 
@@ -234,69 +207,143 @@ impl UsersBackend for RealUsersBackend {
             // вызвали — это no-op, без exec'а.
             return Ok(());
         }
-        let mut argv: Vec<String> = vec!["usermod".into()];
-        if let Some(uid) = opts.uid {
-            argv.push("--uid".into());
-            argv.push(uid.to_string());
-        }
-        if let Some(ref group) = opts.group {
-            argv.push("--gid".into());
-            argv.push(group.clone());
-        }
-        if let Some(ref shell) = opts.shell {
-            argv.push("--shell".into());
-            argv.push(shell.clone());
-        }
-        if let Some(ref home) = opts.home {
-            argv.push("--home".into());
-            argv.push(home.to_string_lossy().into_owned());
-        }
-        if let Some(ref c) = opts.comment {
-            argv.push("--comment".into());
-            argv.push(c.clone());
-        }
-        argv.push(opts.name.clone());
+        let argv = build_usermod_argv(opts);
         run_command(&argv)
     }
 
     fn userdel(&self, name: &str) -> Result<(), UsersError> {
         self.require_root()?;
-        let argv = vec!["userdel".to_string(), name.to_string()];
+        let argv = build_userdel_argv(name);
         run_command(&argv)
     }
 
     fn groupadd(&self, opts: &GroupAddOpts) -> Result<(), UsersError> {
         self.require_root()?;
-        let mut argv: Vec<String> = vec!["groupadd".into()];
-        if opts.system {
-            argv.push("--system".into());
-        }
-        if let Some(gid) = opts.gid {
-            argv.push("--gid".into());
-            argv.push(gid.to_string());
-        }
-        argv.push(opts.name.clone());
+        let argv = build_groupadd_argv(opts);
         run_command(&argv)
     }
 
     fn groupmod(&self, opts: &GroupModOpts) -> Result<(), UsersError> {
         self.require_root()?;
-        let mut argv: Vec<String> = vec!["groupmod".into()];
-        let Some(gid) = opts.gid else {
+        if opts.gid.is_none() {
             // Если gid не задан — менять нечего, no-op без exec'а.
             return Ok(());
-        };
-        argv.push("--gid".into());
-        argv.push(gid.to_string());
-        argv.push(opts.name.clone());
+        }
+        let argv = build_groupmod_argv(opts);
         run_command(&argv)
     }
 
     fn groupdel(&self, name: &str) -> Result<(), UsersError> {
         self.require_root()?;
-        let argv = vec!["groupdel".to_string(), name.to_string()];
+        let argv = build_groupdel_argv(name);
         run_command(&argv)
     }
+}
+
+/// Сборка argv для `useradd`. Каждый Option-флаг добавляется только если
+/// задан; имя пользователя идёт последним аргументом. Выделена отдельной
+/// функцией, чтобы покрыть direct-тестами условные ветки без spawn'а.
+pub(crate) fn build_useradd_argv(opts: &UserAddOpts) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["useradd".to_string()];
+    if opts.system {
+        argv.push("--system".into());
+    }
+    if let Some(uid) = opts.uid {
+        argv.push("--uid".into());
+        argv.push(uid.to_string());
+    }
+    if let Some(ref group) = opts.group {
+        argv.push("--gid".into());
+        argv.push(group.clone());
+    }
+    if let Some(ref shell) = opts.shell {
+        argv.push("--shell".into());
+        argv.push(shell.clone());
+    }
+    if let Some(ref home) = opts.home {
+        argv.push("--home-dir".into());
+        argv.push(home.to_string_lossy().into_owned());
+    }
+    if opts.no_create_home {
+        argv.push("--no-create-home".into());
+    }
+    if let Some(ref c) = opts.comment {
+        argv.push("--comment".into());
+        argv.push(c.clone());
+    }
+    argv.push(opts.name.clone());
+    argv
+}
+
+/// Сборка argv для `usermod`. Caller обязан проверить `opts.is_empty()`
+/// перед вызовом — пустой `usermod` тут не отсекается, чтобы builder
+/// оставался чистой функцией без скрытого no-op результата.
+pub(crate) fn build_usermod_argv(opts: &UserModOpts) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["usermod".into()];
+    if let Some(uid) = opts.uid {
+        argv.push("--uid".into());
+        argv.push(uid.to_string());
+    }
+    if let Some(ref group) = opts.group {
+        argv.push("--gid".into());
+        argv.push(group.clone());
+    }
+    if let Some(ref shell) = opts.shell {
+        argv.push("--shell".into());
+        argv.push(shell.clone());
+    }
+    if let Some(ref home) = opts.home {
+        argv.push("--home".into());
+        argv.push(home.to_string_lossy().into_owned());
+    }
+    if let Some(ref c) = opts.comment {
+        argv.push("--comment".into());
+        argv.push(c.clone());
+    }
+    argv.push(opts.name.clone());
+    argv
+}
+
+/// Сборка argv для `userdel`. По умолчанию домашняя директория
+/// сохраняется (см. ADR в `users_user::mod`); trait `UsersBackend`
+/// сейчас не экспонирует флаг `--remove`, удаление файлов — отдельный
+/// шаг bundle'а через `file.delete`.
+pub(crate) fn build_userdel_argv(name: &str) -> Vec<String> {
+    vec!["userdel".to_string(), name.to_string()]
+}
+
+/// Сборка argv для `groupadd`. `--system` и `--gid` — единственные
+/// флаги, экспонируемые на trait-уровне; остальные опции `groupadd(8)`
+/// (например, `--password`) сознательно не поддерживаются.
+pub(crate) fn build_groupadd_argv(opts: &GroupAddOpts) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["groupadd".into()];
+    if opts.system {
+        argv.push("--system".into());
+    }
+    if let Some(gid) = opts.gid {
+        argv.push("--gid".into());
+        argv.push(gid.to_string());
+    }
+    argv.push(opts.name.clone());
+    argv
+}
+
+/// Сборка argv для `groupmod`. Caller обязан проверить, что `opts.gid`
+/// задан — пустой `groupmod` без `--gid` здесь не отсекается, чтобы
+/// builder оставался чистым.
+pub(crate) fn build_groupmod_argv(opts: &GroupModOpts) -> Vec<String> {
+    let mut argv: Vec<String> = vec!["groupmod".into()];
+    if let Some(gid) = opts.gid {
+        argv.push("--gid".into());
+        argv.push(gid.to_string());
+    }
+    argv.push(opts.name.clone());
+    argv
+}
+
+/// Сборка argv для `groupdel`. Имя группы — единственный аргумент.
+pub(crate) fn build_groupdel_argv(name: &str) -> Vec<String> {
+    vec!["groupdel".to_string(), name.to_string()]
 }
 
 /// Запустить argv через std::process::Command, синхронно дождаться exit'а.
@@ -464,5 +511,243 @@ mod tests {
                 None => panic!("{msg}"),
             }
         }
+    }
+
+    // ---- builder tests: useradd ----
+
+    #[test]
+    fn build_useradd_argv_minimum() {
+        // Минимальный набор: только имя пользователя без флагов.
+        let opts = UserAddOpts {
+            name: "alice".into(),
+            ..Default::default()
+        };
+        let argv = build_useradd_argv(&opts);
+        assert_eq!(argv, vec!["useradd".to_string(), "alice".into()]);
+    }
+
+    #[test]
+    fn build_useradd_argv_with_system() {
+        // system=true → флаг --system добавлен сразу после имени бинаря.
+        let opts = UserAddOpts {
+            name: "alice".into(),
+            system: true,
+            ..Default::default()
+        };
+        let argv = build_useradd_argv(&opts);
+        assert_eq!(argv[0], "useradd");
+        assert!(
+            argv.iter().any(|a| a == "--system"),
+            "--system must be present, got argv={argv:?}",
+        );
+        // Имя пользователя — последний аргумент.
+        assert_eq!(argv.last().unwrap(), "alice");
+    }
+
+    #[test]
+    fn build_useradd_argv_with_uid() {
+        // uid=5432 → "--uid 5432".
+        let opts = UserAddOpts {
+            name: "alice".into(),
+            uid: Some(5432),
+            ..Default::default()
+        };
+        let argv = build_useradd_argv(&opts);
+        let uid_pos = argv.iter().position(|a| a == "--uid").unwrap();
+        assert_eq!(argv[uid_pos + 1], "5432");
+    }
+
+    #[test]
+    fn build_useradd_argv_with_group() {
+        // group=postgres → "--gid postgres".
+        let opts = UserAddOpts {
+            name: "alice".into(),
+            group: Some("postgres".into()),
+            ..Default::default()
+        };
+        let argv = build_useradd_argv(&opts);
+        let gid_pos = argv.iter().position(|a| a == "--gid").unwrap();
+        assert_eq!(argv[gid_pos + 1], "postgres");
+    }
+
+    #[test]
+    fn build_useradd_argv_with_shell() {
+        // shell=/bin/false → "--shell /bin/false".
+        let opts = UserAddOpts {
+            name: "alice".into(),
+            shell: Some("/bin/false".into()),
+            ..Default::default()
+        };
+        let argv = build_useradd_argv(&opts);
+        let pos = argv.iter().position(|a| a == "--shell").unwrap();
+        assert_eq!(argv[pos + 1], "/bin/false");
+    }
+
+    #[test]
+    fn build_useradd_argv_with_home() {
+        // home=/var/lib/postgres → "--home-dir /var/lib/postgres".
+        let opts = UserAddOpts {
+            name: "alice".into(),
+            home: Some(PathBuf::from("/var/lib/postgres")),
+            ..Default::default()
+        };
+        let argv = build_useradd_argv(&opts);
+        let pos = argv.iter().position(|a| a == "--home-dir").unwrap();
+        assert_eq!(argv[pos + 1], "/var/lib/postgres");
+    }
+
+    #[test]
+    fn build_useradd_argv_with_no_create_home() {
+        // no_create_home=true → "--no-create-home".
+        let opts = UserAddOpts {
+            name: "alice".into(),
+            no_create_home: true,
+            ..Default::default()
+        };
+        let argv = build_useradd_argv(&opts);
+        assert!(
+            argv.iter().any(|a| a == "--no-create-home"),
+            "--no-create-home must be present, got argv={argv:?}",
+        );
+    }
+
+    #[test]
+    fn build_useradd_argv_with_comment() {
+        // comment задан → "--comment 'X'". Содержимое уходит одним
+        // элементом argv (без shell-escaping'а).
+        let opts = UserAddOpts {
+            name: "alice".into(),
+            comment: Some("postgres role".into()),
+            ..Default::default()
+        };
+        let argv = build_useradd_argv(&opts);
+        let pos = argv.iter().position(|a| a == "--comment").unwrap();
+        assert_eq!(argv[pos + 1], "postgres role");
+    }
+
+    #[test]
+    fn build_useradd_argv_full_combo_keeps_name_last() {
+        // Все опции вместе — имя всё ещё в самом конце.
+        let opts = UserAddOpts {
+            name: "postgres".into(),
+            uid: Some(5432),
+            group: Some("postgres".into()),
+            shell: Some("/bin/bash".into()),
+            home: Some(PathBuf::from("/var/lib/postgres")),
+            no_create_home: false,
+            system: true,
+            comment: Some("PostgreSQL admin".into()),
+        };
+        let argv = build_useradd_argv(&opts);
+        assert_eq!(argv.last().unwrap(), "postgres");
+        assert_eq!(argv[0], "useradd");
+    }
+
+    // ---- builder tests: usermod ----
+
+    #[test]
+    fn build_usermod_argv_changes_shell() {
+        // shell=new → "--shell new" в argv.
+        let opts = UserModOpts {
+            name: "alice".into(),
+            shell: Some("/bin/zsh".into()),
+            ..Default::default()
+        };
+        let argv = build_usermod_argv(&opts);
+        let pos = argv.iter().position(|a| a == "--shell").unwrap();
+        assert_eq!(argv[pos + 1], "/bin/zsh");
+        // Имя пользователя в конце.
+        assert_eq!(argv.last().unwrap(), "alice");
+        assert_eq!(argv[0], "usermod");
+    }
+
+    #[test]
+    fn build_usermod_argv_changes_uid_and_group() {
+        // uid и group вместе → оба флага присутствуют в argv.
+        let opts = UserModOpts {
+            name: "alice".into(),
+            uid: Some(1001),
+            group: Some("staff".into()),
+            ..Default::default()
+        };
+        let argv = build_usermod_argv(&opts);
+        assert!(argv.contains(&"--uid".to_string()));
+        assert!(argv.contains(&"--gid".to_string()));
+        assert!(argv.contains(&"1001".to_string()));
+        assert!(argv.contains(&"staff".to_string()));
+    }
+
+    // ---- builder tests: userdel ----
+
+    #[test]
+    fn build_userdel_argv_minimum() {
+        // userdel без флагов: ["userdel", "name"].
+        let argv = build_userdel_argv("alice");
+        assert_eq!(argv, vec!["userdel".to_string(), "alice".into()]);
+    }
+
+    // ---- builder tests: groupadd ----
+
+    #[test]
+    fn build_groupadd_argv_minimum() {
+        // Только имя группы.
+        let opts = GroupAddOpts {
+            name: "postgres".into(),
+            ..Default::default()
+        };
+        let argv = build_groupadd_argv(&opts);
+        assert_eq!(argv, vec!["groupadd".to_string(), "postgres".into()]);
+    }
+
+    #[test]
+    fn build_groupadd_argv_with_gid() {
+        // gid=5432 → "--gid 5432".
+        let opts = GroupAddOpts {
+            name: "postgres".into(),
+            gid: Some(5432),
+            ..Default::default()
+        };
+        let argv = build_groupadd_argv(&opts);
+        let pos = argv.iter().position(|a| a == "--gid").unwrap();
+        assert_eq!(argv[pos + 1], "5432");
+        assert_eq!(argv.last().unwrap(), "postgres");
+    }
+
+    #[test]
+    fn build_groupadd_argv_with_system() {
+        // system=true → "--system".
+        let opts = GroupAddOpts {
+            name: "postgres".into(),
+            system: true,
+            ..Default::default()
+        };
+        let argv = build_groupadd_argv(&opts);
+        assert!(argv.contains(&"--system".to_string()));
+        assert_eq!(argv.last().unwrap(), "postgres");
+    }
+
+    // ---- builder tests: groupmod ----
+
+    #[test]
+    fn build_groupmod_argv_gid() {
+        // gid задан → "--gid N" в argv.
+        let opts = GroupModOpts {
+            name: "postgres".into(),
+            gid: Some(5433),
+        };
+        let argv = build_groupmod_argv(&opts);
+        let pos = argv.iter().position(|a| a == "--gid").unwrap();
+        assert_eq!(argv[pos + 1], "5433");
+        assert_eq!(argv.last().unwrap(), "postgres");
+        assert_eq!(argv[0], "groupmod");
+    }
+
+    // ---- builder tests: groupdel ----
+
+    #[test]
+    fn build_groupdel_argv_minimum() {
+        // groupdel без флагов.
+        let argv = build_groupdel_argv("postgres");
+        assert_eq!(argv, vec!["groupdel".to_string(), "postgres".into()]);
     }
 }
