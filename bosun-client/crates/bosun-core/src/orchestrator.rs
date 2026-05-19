@@ -13,7 +13,7 @@
 //! callback `&dyn Fn(&ResourceKind)`, который вызывающий бэкэнд (CLI) связывает
 //! с реальной коллекцией.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use serde::Serialize;
@@ -284,6 +284,12 @@ impl Orchestrator {
         let mut resources = Vec::with_capacity(total);
         let mut summary = ApplySummary::default();
         let mut aborted = false;
+        // Транзитивный skip: набор ресурсов, чьи apply не завершились
+        // успешно (Failed/Interrupted/Skipped). Любой ресурс с depends_on,
+        // пересекающимся с этим набором, пропускается БЕЗ apply, чтобы не
+        // оставлять ноду в неконсистентном состоянии. Deferred сюда не
+        // попадает — это транзиентная задержка, не настоящий провал.
+        let mut failed_or_interrupted: HashSet<ResourceId> = HashSet::new();
 
         for id in order {
             if aborted {
@@ -316,12 +322,42 @@ impl Orchestrator {
                     message: String::new(),
                 });
                 summary.failed += 1;
+                failed_or_interrupted.insert(id.clone());
                 if !opts.continue_on_error {
                     aborted = true;
                 }
                 continue;
             };
             let kind = resource.kind.clone();
+
+            // Транзитивный skip: проверяем depends_on против набора уже
+            // упавших ресурсов. reload_on/restart_on здесь не учитываются —
+            // это notify-каналы, не hard-dependency: если источник reload
+            // упал, целевой сервис всё равно должен apply'нуться, но
+            // notify не запишется в ctx.record_changed и restart/reload
+            // не сработает.
+            if let Some(failed_dep) = resource
+                .depends_on
+                .iter()
+                .find(|dep| failed_or_interrupted.contains(*dep))
+            {
+                let message = format!("skipped: transitive failure of dependency '{failed_dep}'");
+                tracing::info!(
+                    dependency = %failed_dep,
+                    "skipping resource due to failed dependency",
+                );
+                resources.push(ResourceApplyOutcome {
+                    id: id.clone(),
+                    kind,
+                    outcome: Outcome::Skipped,
+                    message,
+                });
+                summary.skipped += 1;
+                // Транзитивный skip распространяется дальше: внук тоже
+                // увидит failed_or_interrupted и пропустится.
+                failed_or_interrupted.insert(id);
+                continue;
+            }
             let Some(primitive) = self.primitives.get(&kind) else {
                 let message = format!("no primitive registered for kind '{kind}'");
                 resources.push(ResourceApplyOutcome {
@@ -333,6 +369,7 @@ impl Orchestrator {
                     message,
                 });
                 summary.failed += 1;
+                failed_or_interrupted.insert(id);
                 if !opts.continue_on_error {
                     aborted = true;
                 }
@@ -365,6 +402,7 @@ impl Orchestrator {
                         message: reason,
                     });
                     summary.interrupted += 1;
+                    failed_or_interrupted.insert(id);
                     aborted = true;
                     continue;
                 }
@@ -380,6 +418,7 @@ impl Orchestrator {
                         message,
                     });
                     summary.failed += 1;
+                    failed_or_interrupted.insert(id);
                     if !opts.continue_on_error {
                         aborted = true;
                     }
@@ -467,6 +506,7 @@ impl Orchestrator {
                     // молотить вхолостую.
                     let reason = "apply cancelled by deadline or signal".to_string();
                     tracing::info!("apply cancelled");
+                    failed_or_interrupted.insert(id.clone());
                     resources.push(ResourceApplyOutcome {
                         id,
                         kind,
@@ -497,6 +537,7 @@ impl Orchestrator {
                 Err(e) => {
                     let (message, error_text) = describe_primitive_error(&e);
                     tracing::warn!(error = %e, "apply failed");
+                    failed_or_interrupted.insert(id.clone());
                     resources.push(ResourceApplyOutcome {
                         id,
                         kind,
@@ -984,15 +1025,199 @@ mod tests {
     }
 
     #[test]
-    fn apply_with_continue_on_error_processes_all_resources() {
+    fn apply_continue_on_error_skips_dependants_of_failed_parent() {
+        // continue_on_error=true: упавший parent (curl) НЕ блокирует прогон,
+        // но child (nginx depends_on curl) пропускается, чтобы не оставить
+        // ноду в неконсистентном состоянии. Это и есть M1.
         let mut reg = Registry::new();
         let curl = reg.add(resource("apt.package", "curl", vec![])).unwrap();
         reg.add(resource("apt.package", "nginx", vec![curl]))
             .unwrap();
 
         let log = Arc::new(std::sync::Mutex::new(Vec::new()));
-        // plan: оба Add. apply: pop порядок: первый pop = apply curl, второй pop = apply nginx.
-        // Стек pop забирает с конца; ставим [Ok nginx, Err curl] чтобы pop дал Err первым.
+        // plan: оба Add. apply curl возвращает Err — nginx даже до apply не
+        // должен дойти.
+        let mut primitives: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
+        primitives.insert(
+            kind("apt.package"),
+            Box::new(RecordingPrimitive::new(
+                kind("apt.package"),
+                Arc::clone(&log),
+                vec![PlanResult::Add("a"), PlanResult::Add("b")],
+                vec![ApplyResult::Err("err curl")],
+            )),
+        );
+
+        let orchestrator = Orchestrator::new(primitives);
+        let dirty_log: RefCell<Vec<ResourceKind>> = RefCell::new(Vec::new());
+        let mark_dirty = |k: &ResourceKind| dirty_log.borrow_mut().push(k.clone());
+        let report = orchestrator
+            .apply(
+                &reg,
+                &NoFacts,
+                &mark_dirty,
+                &plan_ctx(),
+                &apply_ctx(),
+                ApplyOpts {
+                    continue_on_error: true,
+                },
+            )
+            .unwrap();
+
+        let log_snapshot = log.lock().unwrap().clone();
+        // curl: plan + apply (упал). nginx: даже plan не вызывается — мы
+        // обрываем до плана, как только обнаружили транзитивную failure.
+        assert_eq!(
+            log_snapshot
+                .iter()
+                .filter(|s| s.starts_with("plan:"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            log_snapshot
+                .iter()
+                .filter(|s| s.starts_with("apply:"))
+                .count(),
+            1
+        );
+
+        // mark_dirty вызван один раз — только перед apply curl (nginx
+        // пропущен до plan).
+        assert_eq!(dirty_log.borrow().len(), 1);
+
+        assert_eq!(report.summary.failed, 1);
+        assert_eq!(report.summary.changed, 0);
+        assert_eq!(report.summary.skipped, 1);
+
+        // Сообщение skip должно ссылаться на parent.
+        let nginx_outcome = report
+            .resources
+            .iter()
+            .find(|r| r.id.as_str() == "apt.package:nginx")
+            .unwrap();
+        assert!(matches!(nginx_outcome.outcome, Outcome::Skipped));
+        assert!(
+            nginx_outcome.message.contains("apt.package:curl"),
+            "skip message should reference failed parent, got: {}",
+            nginx_outcome.message,
+        );
+    }
+
+    #[test]
+    fn apply_continue_on_error_applies_independent_resources_when_other_fails() {
+        // continue_on_error=true: упавший curl не блокирует независимый
+        // ресурс kafka. depends_on пустой, kafka должен apply'нуться.
+        let mut reg = Registry::new();
+        reg.add(resource("apt.package", "curl", vec![])).unwrap();
+        reg.add(resource("apt.package", "kafka", vec![])).unwrap();
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Topo с независимыми ресурсами недетерминирован, поэтому apply
+        // должен пройти ровно дважды: один упадёт, один успешен.
+        let mut primitives: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
+        primitives.insert(
+            kind("apt.package"),
+            Box::new(RecordingPrimitive::new(
+                kind("apt.package"),
+                Arc::clone(&log),
+                vec![PlanResult::Add("a"), PlanResult::Add("b")],
+                vec![ApplyResult::Ok("installed"), ApplyResult::Err("err")],
+            )),
+        );
+
+        let orchestrator = Orchestrator::new(primitives);
+        let dirty_log: RefCell<Vec<ResourceKind>> = RefCell::new(Vec::new());
+        let mark_dirty = |k: &ResourceKind| dirty_log.borrow_mut().push(k.clone());
+        let report = orchestrator
+            .apply(
+                &reg,
+                &NoFacts,
+                &mark_dirty,
+                &plan_ctx(),
+                &apply_ctx(),
+                ApplyOpts {
+                    continue_on_error: true,
+                },
+            )
+            .unwrap();
+
+        // Оба ресурса дошли до apply (independent).
+        let log_snapshot = log.lock().unwrap().clone();
+        assert_eq!(
+            log_snapshot
+                .iter()
+                .filter(|s| s.starts_with("apply:"))
+                .count(),
+            2
+        );
+
+        assert_eq!(report.summary.failed, 1);
+        assert_eq!(report.summary.changed, 1);
+        assert_eq!(report.summary.skipped, 0);
+    }
+
+    #[test]
+    fn apply_continue_on_error_runs_when_parent_succeeds() {
+        // Negative-case: parent curl успешен → child nginx apply'нется
+        // штатно, без skip.
+        let mut reg = Registry::new();
+        let curl = reg.add(resource("apt.package", "curl", vec![])).unwrap();
+        reg.add(resource("apt.package", "nginx", vec![curl]))
+            .unwrap();
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Стек pop с конца: ставим [Ok nginx, Ok curl] — порядок применения
+        // curl→nginx.
+        let mut primitives: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
+        primitives.insert(
+            kind("apt.package"),
+            Box::new(RecordingPrimitive::new(
+                kind("apt.package"),
+                Arc::clone(&log),
+                vec![PlanResult::Add("a"), PlanResult::Add("b")],
+                vec![ApplyResult::Ok("ok nginx"), ApplyResult::Ok("ok curl")],
+            )),
+        );
+
+        let orchestrator = Orchestrator::new(primitives);
+        let dirty_log: RefCell<Vec<ResourceKind>> = RefCell::new(Vec::new());
+        let mark_dirty = |k: &ResourceKind| dirty_log.borrow_mut().push(k.clone());
+        let report = orchestrator
+            .apply(
+                &reg,
+                &NoFacts,
+                &mark_dirty,
+                &plan_ctx(),
+                &apply_ctx(),
+                ApplyOpts {
+                    continue_on_error: true,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(report.summary.changed, 2);
+        assert_eq!(report.summary.skipped, 0);
+        assert_eq!(report.summary.failed, 0);
+    }
+
+    #[test]
+    fn apply_continue_on_error_does_not_skip_for_reload_on_failed_parent() {
+        // reload_on/restart_on — notify-каналы, НЕ hard-dependency. Если
+        // источник reload (curl) упал — целевой service (nginx) всё равно
+        // должен apply'нуться (просто не получит notify).
+        let mut reg = Registry::new();
+        let curl = reg.add(resource("apt.package", "curl", vec![])).unwrap();
+        // nginx reload_on=[curl], depends_on=[]. Семантика: reload-источник
+        // — мягкая зависимость, не блокирующая apply.
+        let nginx = resource("apt.package", "nginx", vec![]);
+        let nginx = Resource {
+            reload_on: vec![curl],
+            ..nginx
+        };
+        reg.add(nginx).unwrap();
+
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut primitives: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
         primitives.insert(
             kind("apt.package"),
@@ -1020,14 +1245,8 @@ mod tests {
             )
             .unwrap();
 
+        // 2 apply: curl упал, nginx применился несмотря на reload_on.
         let log_snapshot = log.lock().unwrap().clone();
-        assert_eq!(
-            log_snapshot
-                .iter()
-                .filter(|s| s.starts_with("plan:"))
-                .count(),
-            2
-        );
         assert_eq!(
             log_snapshot
                 .iter()
@@ -1035,10 +1254,6 @@ mod tests {
                 .count(),
             2
         );
-
-        // mark_dirty вызван дважды — перед каждым apply.
-        assert_eq!(dirty_log.borrow().len(), 2);
-
         assert_eq!(report.summary.failed, 1);
         assert_eq!(report.summary.changed, 1);
         assert_eq!(report.summary.skipped, 0);
