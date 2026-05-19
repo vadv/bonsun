@@ -31,10 +31,31 @@ fn apply_help_lists_all_documented_flags() {
         "--log-dir",
         "--backup-dir",
         "--metric-file",
+        // Phase J: новые флаги для runr/systemd клиентов и defers.
+        "--runr-url",
+        "--runr-timeout-sec",
+        "--defers-dir",
+        "--defer-max-attempts",
     ] {
         assert!(
             stdout.contains(flag),
             "apply --help missing flag {flag}; got:\n{stdout}",
+        );
+    }
+}
+
+#[test]
+fn status_help_lists_all_documented_flags() {
+    let output = bosun()
+        .args(["status", "--help"])
+        .output()
+        .expect("binary runs");
+    assert!(output.status.success(), "exit: {:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for flag in ["--defers-dir", "--format", "--clear", "--clear-all-manual"] {
+        assert!(
+            stdout.contains(flag),
+            "status --help missing flag {flag}; got:\n{stdout}",
         );
     }
 }

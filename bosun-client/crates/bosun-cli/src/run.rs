@@ -15,21 +15,26 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bosun_core::{
-    defers::Journal, ApplyCtx, ApplyOpts, ApplyReport, Bundle, Evaluator, FactValue, Orchestrator,
-    Outcome, PlanCtx, PlanReport, Primitive, ResourceKind, SensitiveStore, TemplateFn,
+    defers::{replay_with_health_check, Journal, ReplayReport},
+    ApplyCtxBuilder, ApplyOpts, ApplyReport, Bundle, Evaluator, FactValue, HealthCheckRunner,
+    Orchestrator, Outcome, PlanCtx, PlanReport, Primitive, ResourceKind, SensitiveStore,
+    TemplateFn,
 };
 use bosun_facts::FactsCollector;
+use bosun_handles::{RunrHandle, SystemdHandle};
 use bosun_primitives::{
-    template::render_template, AptPrimitive, FilePrimitive, ProcessSignalPrimitive,
-    RealHealthCheckRunner,
+    dispatch::RealDispatchClient, template::render_template, AptPrimitive, FilePrimitive,
+    ProcessSignalPrimitive, RealHealthCheckRunner,
 };
+use bosun_runr_client::Client as RunrClient;
+use bosun_systemd_client::BlockingSystemdManager;
 use tokio_util::sync::CancellationToken;
 
 use crate::args::{ApplyArgs, ReportFormat};
 use crate::bootstrap::{self, LockOutcome};
 use crate::exit_code;
 use crate::logging;
-use crate::metric::{self, FactStateEntry, MetricSnapshot};
+use crate::metric::{self, DeferReplayStats, FactStateEntry, MetricSnapshot};
 use crate::tags_metric;
 
 const TRACKED_FACTS: &[&str] = &[
@@ -82,6 +87,11 @@ pub fn run(args: &ApplyArgs) -> i32 {
                 resources_deferred: 0,
                 resources_interrupted: 0,
                 fact_states: Vec::new(),
+                defers_pending: 0,
+                defers_replay_stats: DeferReplayStats::default(),
+                defers_replay_runs: 0,
+                runr_reachable: None,
+                systemd_reachable: None,
             };
             if let Err(e) = metric::write_atomic(&args.metric_file, &snapshot) {
                 eprintln!("bosun: failed to write skip metric file: {e}");
@@ -160,6 +170,77 @@ pub fn run(args: &ApplyArgs) -> i32 {
         },
     );
 
+    // Phase J: defers журнал и handle'ы runr/systemd инициализируются ДО
+    // evaluate manifest'а. Это нужно, чтобы pre-replay прошёл по journal'у
+    // оставшемуся с прошлого прогона, до того как новый apply начнёт
+    // что-то enqueue'ить (иначе можно стереть/субсумировать ещё не
+    // выполненный restart полезной нагрузкой текущего цикла).
+    let defers = match Journal::open(&args.defers_dir) {
+        Ok(j) => Arc::new(j),
+        Err(e) => {
+            tracing::error!(error = %e, "failed to open defer journal");
+            return exit_code::CLI_ENV_ERROR;
+        }
+    };
+
+    // Phase J: handle'ы runr/systemd инициализируются по init_system факту.
+    // `systemd` → systemd dbus client; `runr` / `mixed-*` → runr HTTP client;
+    // `unknown` или другие — оба None, replay будет пропускать соответствующие
+    // entries как `client_unavailable`.
+    let init_system = init_system_value(&snapshot);
+    let needs_systemd = init_system_requires_systemd(init_system.as_deref());
+    let needs_runr = init_system_requires_runr(init_system.as_deref());
+
+    let mut runr_reachable: Option<bool> = None;
+    let mut systemd_reachable: Option<bool> = None;
+
+    let runr_handle: Option<Arc<dyn RunrHandle>> = if needs_runr {
+        let client = RunrClient::new(
+            args.runr_url.clone(),
+            Duration::from_secs(args.runr_timeout_sec.into()),
+        );
+        runr_reachable = Some(true);
+        Some(Arc::new(client) as Arc<dyn RunrHandle>)
+    } else {
+        None
+    };
+
+    let systemd_handle: Option<Arc<dyn SystemdHandle>> = if needs_systemd {
+        match BlockingSystemdManager::connect_system() {
+            Ok(m) => {
+                systemd_reachable = Some(true);
+                Some(Arc::new(m) as Arc<dyn SystemdHandle>)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "systemd dbus unavailable, falling back to defer-only");
+                systemd_reachable = Some(false);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Phase I: production health_check runner (cmd + url).
+    let health_check_runner: Arc<dyn HealthCheckRunner> = Arc::new(RealHealthCheckRunner::new());
+
+    // Phase J: pre-replay по journal'у до evaluate. Так оператор
+    // гарантированно получает успех на defer'ы, оставшиеся с прошлого
+    // прогона, до того как evaluate/apply начнёт enqueue'ить новые.
+    let dispatcher = RealDispatchClient::new(runr_handle.clone(), systemd_handle.clone());
+    let mut replay_runs: u32 = 0;
+    let mut replay_stats = DeferReplayStats::default();
+    if let Some(report) = run_replay_phase(
+        &defers,
+        &dispatcher,
+        health_check_runner.as_ref(),
+        &cancel,
+        "pre",
+    ) {
+        replay_runs += 1;
+        accumulate_replay_stats(&mut replay_stats, &report);
+    }
+
     let evaluator_primitives = build_primitives();
 
     let sensitive = Arc::new(SensitiveStore::new());
@@ -181,35 +262,23 @@ pub fn run(args: &ApplyArgs) -> i32 {
 
     let orchestrator = Orchestrator::new(build_primitives());
 
-    // Phase D: defers журнал на tmpfs. CLI-флаги для пути и handle'ов
-    // runr/systemd подключаются в Phase J; пока используем стандартный
-    // путь `/tmp/bosun-defers/` и None-handle'ы.
-    let defers = match Journal::open("/tmp/bosun-defers") {
-        Ok(j) => Arc::new(j),
-        Err(e) => {
-            tracing::error!(error = %e, "failed to open defer journal");
-            return exit_code::CLI_ENV_ERROR;
-        }
-    };
-    // Phase I: подключаем production health_check runner (cmd + url).
-    // Validate-runner оставляем дефолтным (RealValidateRunner внутри
-    // ApplyCtx::with_runners сам не выставится — передаём явно).
-    let validator: Arc<dyn bosun_core::ValidateRunner> = Arc::new(bosun_core::RealValidateRunner);
-    let health_check_runner: Arc<dyn bosun_core::HealthCheckRunner> =
-        Arc::new(RealHealthCheckRunner::new());
-    let apply_ctx = ApplyCtx::with_runners(
+    let mut builder = ApplyCtxBuilder::new(
         deadline,
         cancel.clone(),
-        tracing::Span::current(),
         sensitive.clone(),
         args.backup_dir.clone(),
         args.log_dir.clone(),
-        defers,
-        None,
-        None,
-        validator,
-        health_check_runner,
-    );
+        defers.clone(),
+    )
+    .log_span(tracing::Span::current())
+    .health_check_runner(health_check_runner.clone());
+    if let Some(h) = runr_handle.clone() {
+        builder = builder.runr(h);
+    }
+    if let Some(h) = systemd_handle.clone() {
+        builder = builder.systemd(h);
+    }
+    let apply_ctx = builder.build();
 
     let view = facts.view();
     let (exit, changed, unchanged, failed, deferred, interrupted) = if args.dry_run {
@@ -273,6 +342,23 @@ pub fn run(args: &ApplyArgs) -> i32 {
         }
     };
 
+    // Phase J: post-replay после evaluate+apply. Захватывает defer'ы,
+    // которые сам apply enqueue'нул, если они теперь могут быть выполнены
+    // (например, validate прошёл с предыдущего цикла, но сервис был
+    // unavailable; теперь handle поднялся).
+    if let Some(report) = run_replay_phase(
+        &defers,
+        &dispatcher,
+        health_check_runner.as_ref(),
+        &cancel,
+        "post",
+    ) {
+        replay_runs += 1;
+        accumulate_replay_stats(&mut replay_stats, &report);
+    }
+
+    let defers_pending = metric::count_pending_defers(defers.root());
+
     let duration = started.elapsed().as_secs_f64();
     let fact_states = build_fact_states(&facts);
     let snapshot = MetricSnapshot {
@@ -287,6 +373,11 @@ pub fn run(args: &ApplyArgs) -> i32 {
         resources_deferred: deferred,
         resources_interrupted: interrupted,
         fact_states,
+        defers_pending,
+        defers_replay_stats: replay_stats,
+        defers_replay_runs: replay_runs,
+        runr_reachable,
+        systemd_reachable,
     };
     if let Err(e) = metric::write_atomic(&args.metric_file, &snapshot) {
         tracing::warn!(error = %e, "failed to write metric file");
@@ -484,6 +575,77 @@ impl WithDefaultCollectorsPath for FactsCollector {
     }
 }
 
+/// Достать строковое значение факта `init_system` из snapshot'а.
+/// `None` означает `Unknown`/`Stale` — относим к unsupported.
+fn init_system_value(snapshot: &bosun_facts::FactsSnapshot) -> Option<String> {
+    use bosun_core::FactsSource;
+    match snapshot.get("init_system") {
+        FactValue::Known(serde_json::Value::String(s)) => Some(s),
+        FactValue::Stale {
+            value: serde_json::Value::String(s),
+            ..
+        } => Some(s),
+        _ => None,
+    }
+}
+
+/// Нужен ли в этом прогоне systemd dbus handle. Включает явный `systemd`
+/// и смешанную конфигурацию `mixed-systemd-runr` (по spec'у Phase J).
+fn init_system_requires_systemd(value: Option<&str>) -> bool {
+    matches!(value, Some("systemd") | Some("mixed-systemd-runr"))
+}
+
+/// Нужен ли в этом прогоне runr HTTP handle. Включает явный `runr` и
+/// `mixed-systemd-runr`.
+fn init_system_requires_runr(value: Option<&str>) -> bool {
+    matches!(value, Some("runr") | Some("mixed-systemd-runr"))
+}
+
+/// Прогон одной фазы replay. Возвращает `Some(report)` если list_sorted
+/// прошёл, `None` если journal недоступен (тогда метрики не двигаем —
+/// post-mortem из tracing-логов виднее).
+fn run_replay_phase(
+    journal: &Journal,
+    dispatcher: &RealDispatchClient,
+    health: &dyn HealthCheckRunner,
+    cancel: &CancellationToken,
+    phase: &'static str,
+) -> Option<ReplayReport> {
+    match replay_with_health_check(journal, dispatcher, health, cancel) {
+        Ok(report) => {
+            tracing::info!(
+                phase = phase,
+                executed = report.executed,
+                failed = report.failed,
+                skipped_unavailable = report.skipped_unavailable,
+                manual_clear = report.promoted_to_manual_clear,
+                health_check_failed = report.health_check_failed,
+                "defers replay phase complete",
+            );
+            Some(report)
+        }
+        Err(e) => {
+            tracing::warn!(phase = phase, error = %e, "defers replay phase failed");
+            None
+        }
+    }
+}
+
+/// Аккумулирует ReplayReport в running totals для метрики.
+fn accumulate_replay_stats(stats: &mut DeferReplayStats, report: &ReplayReport) {
+    stats.executed_ok = stats.executed_ok.saturating_add(report.executed);
+    stats.executed_failed = stats
+        .executed_failed
+        .saturating_add(report.failed)
+        .saturating_add(report.health_check_failed);
+    stats.client_unavailable = stats
+        .client_unavailable
+        .saturating_add(report.skipped_unavailable);
+    stats.promoted_manual_clear = stats
+        .promoted_manual_clear
+        .saturating_add(report.promoted_to_manual_clear);
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -537,5 +699,66 @@ mod tests {
                 "fact value must be null/scalar/object after materialization, got {value:?}",
             );
         }
+    }
+
+    #[test]
+    fn init_system_requires_systemd_matches_expected_values() {
+        // Чистый systemd → нужен systemd handle.
+        assert!(init_system_requires_systemd(Some("systemd")));
+        // Смешанный — оба handle'а.
+        assert!(init_system_requires_systemd(Some("mixed-systemd-runr")));
+        // runr-only — нет.
+        assert!(!init_system_requires_systemd(Some("runr")));
+        // Unknown — нет.
+        assert!(!init_system_requires_systemd(Some("init")));
+        assert!(!init_system_requires_systemd(None));
+    }
+
+    #[test]
+    fn init_system_requires_runr_matches_expected_values() {
+        assert!(init_system_requires_runr(Some("runr")));
+        assert!(init_system_requires_runr(Some("mixed-systemd-runr")));
+        assert!(!init_system_requires_runr(Some("systemd")));
+        assert!(!init_system_requires_runr(Some("init")));
+        assert!(!init_system_requires_runr(None));
+    }
+
+    #[test]
+    fn accumulate_replay_stats_sums_across_invocations() {
+        let mut stats = DeferReplayStats::default();
+        let report1 = ReplayReport {
+            executed: 2,
+            failed: 1,
+            skipped_unavailable: 0,
+            promoted_to_manual_clear: 0,
+            health_check_failed: 0,
+        };
+        let report2 = ReplayReport {
+            executed: 1,
+            failed: 0,
+            skipped_unavailable: 3,
+            promoted_to_manual_clear: 1,
+            health_check_failed: 2,
+        };
+        accumulate_replay_stats(&mut stats, &report1);
+        accumulate_replay_stats(&mut stats, &report2);
+        assert_eq!(stats.executed_ok, 3);
+        // failed + health_check_failed считаются вместе.
+        assert_eq!(stats.executed_failed, 3);
+        assert_eq!(stats.client_unavailable, 3);
+        assert_eq!(stats.promoted_manual_clear, 1);
+    }
+
+    #[test]
+    fn init_system_value_returns_none_for_unknown_or_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let collector: FactsCollector =
+            bosun_facts::with_default_collectors(tmp.path().to_path_buf());
+        collector.collect_at_start();
+        let snapshot = collector.snapshot();
+        // На тестовом root'е без /proc/1/comm init_system должен быть
+        // Unknown → init_system_value возвращает None.
+        let v = init_system_value(&snapshot);
+        assert_eq!(v, None);
     }
 }

@@ -27,7 +27,7 @@ pub mod tracing_test_util;
 
 pub use bundle::{Bundle, BundleError, BundleInventoryConfig, BundleMetadata};
 pub use call_args::{ArgValue, CallArgs, CallArgsError};
-pub use defers::HealthCheck;
+pub use defers::{HealthCheck, Journal};
 pub use diff::{ChangeReport, Diff};
 pub use digest::sha256_hex;
 pub use evaluator::Evaluator;
@@ -46,7 +46,7 @@ pub use orchestrator::{
     PlanSummary, ResourceApplyOutcome, ResourcePlan,
 };
 pub use path_safety::{resolve_within_root, PathSafetyError};
-pub use primitive::{ApplyCtx, FactsSource, PlanCtx, Primitive, PrimitiveError};
+pub use primitive::{ApplyCtx, ApplyCtxBuilder, FactsSource, PlanCtx, Primitive, PrimitiveError};
 pub use registry::{Registry, RegistryError};
 pub use resource::{Handle, Resource, ResourceId, ResourceKind, ResourceKindError};
 pub use sensitive::{SensitivePayload, SensitiveStore};

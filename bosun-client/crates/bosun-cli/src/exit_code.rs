@@ -21,6 +21,12 @@ pub const EVAL_ERROR: i32 = 3;
 /// директории, не удалось открыть lock-файл.
 pub const CLI_ENV_ERROR: i32 = 4;
 
+/// `bosun status` обнаружил `*.manual_clear` файлы в journal'е — оператор
+/// должен разобраться с зависшими defer'ами. Семантически это «частичный
+/// провал»: код пересекается с APPLY_PARTIAL_FAILURE по значению (1), но
+/// именован отдельно ради ясности интентов и алертов.
+pub const STATUS_MANUAL_CLEAR_PRESENT: i32 = 1;
+
 /// Apply прерван SIGTERM/SIGINT или истечением `--deadline-sec`.
 /// 130 — POSIX-стандарт (128 + SIGINT=2). Внешний оркестратор по этому
 /// коду понимает: «процесс прервали извне, попытка незавершена»,
@@ -58,5 +64,13 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), all_codes.len(), "exit codes must be distinct");
+    }
+
+    #[test]
+    fn status_manual_clear_present_overlaps_with_apply_partial_failure_by_design() {
+        // Документируем намеренное совпадение значений (1): обе семантики
+        // означают «оператор должен посмотреть». Если кому-то будет нужно
+        // разделить — поменять STATUS_MANUAL_CLEAR_PRESENT на свободный код.
+        assert_eq!(STATUS_MANUAL_CLEAR_PRESENT, APPLY_PARTIAL_FAILURE);
     }
 }

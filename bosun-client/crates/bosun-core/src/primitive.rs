@@ -75,9 +75,9 @@ pub struct PlanCtx {
 /// Production CLI подключает `RealHealthCheckRunner` из `bosun-primitives`;
 /// тесты подменяют mock; default — `NoopHealthCheckRunner` (см. TODO ниже).
 ///
-/// TODO: число полей перевалило за 13 — необходим builder-pattern, чтобы
-/// конструкторы не разрастались дальше. Не блокирует Phase I; запланирован
-/// отдельной задачей в Phase J/K.
+/// Phase J: вместо разрастающихся `new`/`with_validator`/`with_runners`
+/// конструкторов есть [`ApplyCtxBuilder`]. Legacy-конструкторы оставлены
+/// для совместимости с существующими тестами примитивов.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct ApplyCtx {
@@ -214,6 +214,9 @@ impl ApplyCtx {
     /// `std::process::Command`); тесты Phase I подменяют mock-runner,
     /// чтобы проверять retry-логику и cancellation без зависимости от
     /// сети и системных бинарей.
+    ///
+    /// Phase J: legacy-конструктор оставлен для существующих тестов
+    /// примитивов. В новом коде используй [`ApplyCtxBuilder`].
     #[allow(clippy::too_many_arguments)]
     pub fn with_runners(
         deadline: Instant,
@@ -228,23 +231,18 @@ impl ApplyCtx {
         validator: Arc<dyn ValidateRunner>,
         health_check_runner: Arc<dyn HealthCheckRunner>,
     ) -> Self {
-        Self {
-            deadline,
-            cancel,
-            log_span,
-            sensitive,
-            backup_root,
-            log_dir,
-            changed_resources: Arc::new(Mutex::new(HashSet::new())),
-            defers,
-            runr,
-            systemd,
-            runr_daemon_reload_done: Arc::new(AtomicBool::new(false)),
-            systemd_daemon_reload_done: Arc::new(AtomicBool::new(false)),
-            runr_service_statuses: Arc::new(OnceLock::new()),
-            validator,
-            health_check_runner,
+        let mut builder =
+            ApplyCtxBuilder::new(deadline, cancel, sensitive, backup_root, log_dir, defers)
+                .log_span(log_span)
+                .validator(validator)
+                .health_check_runner(health_check_runner);
+        if let Some(h) = runr {
+            builder = builder.runr(h);
         }
+        if let Some(h) = systemd {
+            builder = builder.systemd(h);
+        }
+        builder.build()
     }
 
     pub fn cancelled_or_past_deadline(&self) -> bool {
@@ -269,6 +267,140 @@ impl ApplyCtx {
         match self.changed_resources.lock() {
             Ok(guard) => guard.contains(id),
             Err(_) => false,
+        }
+    }
+}
+
+/// Builder для [`ApplyCtx`]. Введён в Phase J: ApplyCtx разросся до 15 полей,
+/// и сигнатуры `new`/`with_validator`/`with_runners` стали неподъёмными.
+///
+/// Обязательные поля (`deadline`, `cancel`, `sensitive`, `backup_root`,
+/// `log_dir`, `defers`) задаются в [`ApplyCtxBuilder::new`]. Остальные —
+/// через setter'ы; при отсутствии используются sensible defaults
+/// ([`tracing::Span::none`], `None` для runr/systemd, [`RealValidateRunner`],
+/// [`NoopHealthCheckRunner`]).
+///
+/// Пример использования из CLI:
+///
+/// ```no_run
+/// # use std::path::PathBuf;
+/// # use std::sync::Arc;
+/// # use std::time::{Duration, Instant};
+/// # use bosun_core::{ApplyCtxBuilder, SensitiveStore};
+/// # use bosun_core::defers::Journal;
+/// # use tokio_util::sync::CancellationToken;
+/// # let tmp = tempfile::tempdir().unwrap();
+/// # let journal = Arc::new(Journal::open(tmp.path()).unwrap());
+/// let ctx = ApplyCtxBuilder::new(
+///     Instant::now() + Duration::from_secs(60),
+///     CancellationToken::new(),
+///     Arc::new(SensitiveStore::new()),
+///     PathBuf::from("/var/backups/bosun"),
+///     PathBuf::from("/var/log/bosun"),
+///     journal,
+/// )
+/// .build();
+/// ```
+#[non_exhaustive]
+pub struct ApplyCtxBuilder {
+    deadline: Instant,
+    cancel: CancellationToken,
+    sensitive: Arc<SensitiveStore>,
+    backup_root: PathBuf,
+    log_dir: PathBuf,
+    defers: Arc<Journal>,
+    log_span: Option<tracing::Span>,
+    runr: Option<Arc<dyn RunrHandle>>,
+    systemd: Option<Arc<dyn SystemdHandle>>,
+    validator: Option<Arc<dyn ValidateRunner>>,
+    health_check_runner: Option<Arc<dyn HealthCheckRunner>>,
+}
+
+impl ApplyCtxBuilder {
+    /// Создаёт builder с обязательными полями. Остальные настраиваются через
+    /// setter'ы; если не вызвать — применятся sensible defaults.
+    pub fn new(
+        deadline: Instant,
+        cancel: CancellationToken,
+        sensitive: Arc<SensitiveStore>,
+        backup_root: PathBuf,
+        log_dir: PathBuf,
+        defers: Arc<Journal>,
+    ) -> Self {
+        Self {
+            deadline,
+            cancel,
+            sensitive,
+            backup_root,
+            log_dir,
+            defers,
+            log_span: None,
+            runr: None,
+            systemd: None,
+            validator: None,
+            health_check_runner: None,
+        }
+    }
+
+    /// Привязать tracing-span к ApplyCtx. По умолчанию используется
+    /// [`tracing::Span::none`].
+    pub fn log_span(mut self, span: tracing::Span) -> Self {
+        self.log_span = Some(span);
+        self
+    }
+
+    /// Подключить runr-клиент. На ноде с `init_system = systemd` оставить
+    /// без вызова — поле будет `None`.
+    pub fn runr(mut self, handle: Arc<dyn RunrHandle>) -> Self {
+        self.runr = Some(handle);
+        self
+    }
+
+    /// Подключить systemd-клиент. На ноде с `init_system = runr` оставить
+    /// без вызова — поле будет `None`.
+    pub fn systemd(mut self, handle: Arc<dyn SystemdHandle>) -> Self {
+        self.systemd = Some(handle);
+        self
+    }
+
+    /// Подменить runner валидаторов (`validate_with`). По умолчанию —
+    /// [`RealValidateRunner`] (исполняет argv через std::process::Command).
+    pub fn validator(mut self, validator: Arc<dyn ValidateRunner>) -> Self {
+        self.validator = Some(validator);
+        self
+    }
+
+    /// Подменить runner health-check'ов. По умолчанию —
+    /// [`NoopHealthCheckRunner`]; production CLI обязан явно передать
+    /// `RealHealthCheckRunner`.
+    pub fn health_check_runner(mut self, runner: Arc<dyn HealthCheckRunner>) -> Self {
+        self.health_check_runner = Some(runner);
+        self
+    }
+
+    /// Собирает [`ApplyCtx`]. Никаких отказов на этом шаге нет — все
+    /// обязательные поля проверяются типом при вызове `new`.
+    pub fn build(self) -> ApplyCtx {
+        ApplyCtx {
+            deadline: self.deadline,
+            cancel: self.cancel,
+            log_span: self.log_span.unwrap_or_else(tracing::Span::none),
+            sensitive: self.sensitive,
+            backup_root: self.backup_root,
+            log_dir: self.log_dir,
+            changed_resources: Arc::new(Mutex::new(HashSet::new())),
+            defers: self.defers,
+            runr: self.runr,
+            systemd: self.systemd,
+            runr_daemon_reload_done: Arc::new(AtomicBool::new(false)),
+            systemd_daemon_reload_done: Arc::new(AtomicBool::new(false)),
+            runr_service_statuses: Arc::new(OnceLock::new()),
+            validator: self
+                .validator
+                .unwrap_or_else(|| Arc::new(RealValidateRunner)),
+            health_check_runner: self
+                .health_check_runner
+                .unwrap_or_else(|| Arc::new(NoopHealthCheckRunner)),
         }
     }
 }
@@ -509,5 +641,151 @@ mod tests {
         assert!(!ctx.is_changed(&id));
         ctx.record_changed(&id);
         assert!(ctx.is_changed(&id));
+    }
+
+    #[test]
+    fn apply_ctx_builder_with_defaults_matches_legacy_new() {
+        // Без вызова setter'ов builder должен производить ApplyCtx с теми же
+        // default'ами, что и legacy `ApplyCtx::new`: пустой span, None handle'ы,
+        // RealValidateRunner, NoopHealthCheckRunner.
+        use crate::sensitive::SensitiveStore;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let journal = Arc::new(Journal::open(tmp.path()).unwrap());
+        let ctx = ApplyCtxBuilder::new(
+            Instant::now() + Duration::from_secs(60),
+            CancellationToken::new(),
+            Arc::new(SensitiveStore::new()),
+            PathBuf::from("/tmp/backup"),
+            PathBuf::from("/tmp/log"),
+            journal.clone(),
+        )
+        .build();
+        assert!(ctx.runr.is_none());
+        assert!(ctx.systemd.is_none());
+        assert_eq!(ctx.backup_root, PathBuf::from("/tmp/backup"));
+        assert_eq!(ctx.log_dir, PathBuf::from("/tmp/log"));
+    }
+
+    #[test]
+    fn apply_ctx_builder_sets_runr_and_systemd_when_supplied() {
+        use crate::sensitive::SensitiveStore;
+        use tempfile::TempDir;
+
+        // Стаб-реализации: возвращают ошибки, нам важно только что Some
+        // в ApplyCtx.
+        struct FakeRunr;
+        impl RunrHandle for FakeRunr {
+            fn base_url(&self) -> &str {
+                "http://stub"
+            }
+            fn daemon_info(&self) -> Result<bosun_handles::DaemonInfo, bosun_handles::RunrError> {
+                unreachable!()
+            }
+            fn daemon_reload(&self) -> Result<bosun_handles::ActionAck, bosun_handles::RunrError> {
+                unreachable!()
+            }
+            fn service_start(
+                &self,
+                _: &str,
+                _: bool,
+            ) -> Result<bosun_handles::ActionAck, bosun_handles::RunrError> {
+                unreachable!()
+            }
+            fn service_stop(
+                &self,
+                _: &str,
+                _: bool,
+                _: Option<&str>,
+            ) -> Result<bosun_handles::ActionAck, bosun_handles::RunrError> {
+                unreachable!()
+            }
+            fn service_restart(
+                &self,
+                _: &str,
+            ) -> Result<bosun_handles::ActionAck, bosun_handles::RunrError> {
+                unreachable!()
+            }
+            fn service_reload(
+                &self,
+                _: &str,
+            ) -> Result<bosun_handles::ActionAck, bosun_handles::RunrError> {
+                unreachable!()
+            }
+            fn timer_start(
+                &self,
+                _: &str,
+            ) -> Result<bosun_handles::ActionAck, bosun_handles::RunrError> {
+                unreachable!()
+            }
+            fn timer_stop(
+                &self,
+                _: &str,
+            ) -> Result<bosun_handles::ActionAck, bosun_handles::RunrError> {
+                unreachable!()
+            }
+            fn timer_enable(
+                &self,
+                _: &str,
+                _: bool,
+            ) -> Result<bosun_handles::ActionAck, bosun_handles::RunrError> {
+                unreachable!()
+            }
+            fn timer_disable(
+                &self,
+                _: &str,
+                _: bool,
+            ) -> Result<bosun_handles::ActionAck, bosun_handles::RunrError> {
+                unreachable!()
+            }
+            fn service_statuses(
+                &self,
+            ) -> Result<Vec<bosun_handles::ServiceStatus>, bosun_handles::RunrError> {
+                unreachable!()
+            }
+            fn timer_statuses(
+                &self,
+            ) -> Result<Vec<bosun_handles::TimerStatus>, bosun_handles::RunrError> {
+                unreachable!()
+            }
+            fn units_list(
+                &self,
+            ) -> Result<Vec<bosun_handles::UnitListItem>, bosun_handles::RunrError> {
+                unreachable!()
+            }
+            fn verify_restart(
+                &self,
+                _: &str,
+                _: &bosun_handles::ServiceStatus,
+                _: std::time::Duration,
+                _: std::time::Duration,
+            ) -> Result<bosun_handles::ServiceStatus, bosun_handles::RunrError> {
+                unreachable!()
+            }
+            fn verify_start(
+                &self,
+                _: &str,
+                _: std::time::Duration,
+                _: std::time::Duration,
+            ) -> Result<bosun_handles::ServiceStatus, bosun_handles::RunrError> {
+                unreachable!()
+            }
+        }
+
+        let tmp = TempDir::new().unwrap();
+        let journal = Arc::new(Journal::open(tmp.path()).unwrap());
+        let ctx = ApplyCtxBuilder::new(
+            Instant::now() + Duration::from_secs(60),
+            CancellationToken::new(),
+            Arc::new(SensitiveStore::new()),
+            PathBuf::from("/tmp/backup"),
+            PathBuf::from("/tmp/log"),
+            journal,
+        )
+        .runr(Arc::new(FakeRunr))
+        .build();
+        assert!(ctx.runr.is_some());
+        assert_eq!(ctx.runr.as_ref().unwrap().base_url(), "http://stub");
     }
 }

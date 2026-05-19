@@ -16,7 +16,11 @@ workspace = true
 [dependencies]
 bosun-core = { path = "../bosun-core" }
 bosun-facts = { path = "../bosun-facts" }
+bosun-handles = { path = "../bosun-handles" }
 bosun-primitives = { path = "../bosun-primitives" }
+# Phase J: реальные клиенты подключаются в CLI по факту `init_system`.
+bosun-runr-client = { path = "../bosun-runr-client" }
+bosun-systemd-client = { path = "../bosun-systemd-client" }
 clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

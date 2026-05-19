@@ -8,6 +8,7 @@ mod exit_code;
 mod logging;
 mod metric;
 mod run;
+mod status;
 mod tags_metric;
 
 use clap::Parser;
@@ -23,6 +24,7 @@ fn main() {
         args::Command::Bundle(bundle_cli) => match bundle_cli.command {
             args::BundleSubcommand::Validate(validate_args) => bundle_validate::run(&validate_args),
         },
+        args::Command::Status(status_args) => status::run(&status_args),
     };
     std::process::exit(code);
 }

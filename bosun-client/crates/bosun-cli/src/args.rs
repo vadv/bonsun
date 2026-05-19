@@ -22,6 +22,8 @@ pub enum Command {
     Apply(ApplyArgs),
     /// Bundle utilities (validate, ...).
     Bundle(BundleCli),
+    /// Inspect or clear the deferred-actions journal.
+    Status(StatusArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -107,6 +109,50 @@ pub struct ApplyArgs {
         default_value = "/var/lib/node_exporter/textfile_collector/bosun.prom"
     )]
     pub metric_file: PathBuf,
+
+    /// Базовый URL runr-демона. Подключение строится, только если
+    /// `init_system` факт показывает `runr` или `mixed-systemd-runr`.
+    #[arg(long, default_value = "http://127.0.0.1:8010")]
+    pub runr_url: String,
+
+    /// Таймаут одного HTTP-вызова runr.
+    #[arg(long, default_value_t = 10)]
+    pub runr_timeout_sec: u32,
+
+    /// Корень journal'а defers (tmpfs by design).
+    #[arg(long, default_value = "/tmp/bosun-defers")]
+    pub defers_dir: PathBuf,
+
+    /// Максимум попыток на одну defer-запись до промоушена в `.manual_clear`.
+    /// Это глобальный CLI-дефолт, который используется при отсутствии
+    /// явного значения в самом записи (Phase D-G делают snapshot
+    /// max_attempts из записи; CLI-флаг — fallback).
+    #[arg(long, default_value_t = 3)]
+    pub defer_max_attempts: u32,
+}
+
+/// Аргументы `bosun status` (Phase J). Команда без апплая показывает, что
+/// лежит в journal'е defer'ов и умеет очищать ручные `.manual_clear`-файлы.
+#[derive(Debug, clap::Args)]
+pub struct StatusArgs {
+    /// Корень journal'а defers (по умолчанию — тот же, что у `bosun apply`).
+    #[arg(long, default_value = "/tmp/bosun-defers")]
+    pub defers_dir: PathBuf,
+
+    /// Формат вывода: `text` (таблица) или `json` (массив объектов).
+    #[arg(long, default_value_t = StatusFormat::Text, value_enum)]
+    pub format: StatusFormat,
+
+    /// Удалить конкретный defer/manual_clear по id. Принимает либо
+    /// канонический id (`systemd.restart:nginx.service`), либо полное имя
+    /// файла. Сначала ищется среди `*.deferred`, потом — `*.manual_clear`.
+    #[arg(long)]
+    pub clear: Option<String>,
+
+    /// Удалить все `*.manual_clear` файлы. Используется оператором после
+    /// разбирательства с зависшими defer'ами.
+    #[arg(long, default_value_t = false)]
+    pub clear_all_manual: bool,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -156,6 +202,23 @@ impl std::fmt::Display for ReportFormat {
         let s = match self {
             ReportFormat::Text => "text",
             ReportFormat::Json => "json",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Формат вывода `bosun status`.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum StatusFormat {
+    Text,
+    Json,
+}
+
+impl std::fmt::Display for StatusFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            StatusFormat::Text => "text",
+            StatusFormat::Json => "json",
         };
         f.write_str(s)
     }
@@ -277,5 +340,79 @@ mod tests {
             .unwrap_err();
         let s = format!("{err}");
         assert!(s.contains("log-level") || s.contains("trace"));
+    }
+
+    #[test]
+    fn apply_defaults_for_runr_and_defers_match_spec() {
+        // Phase J: новые флаги имеют production-defaults, описанные в плане.
+        let cli = Cli::try_parse_from(["bosun", "apply", "--bundle", "/b"]).unwrap();
+        let Command::Apply(args) = cli.command else {
+            panic!("expected apply")
+        };
+        assert_eq!(args.runr_url, "http://127.0.0.1:8010");
+        assert_eq!(args.runr_timeout_sec, 10);
+        assert_eq!(args.defers_dir, PathBuf::from("/tmp/bosun-defers"));
+        assert_eq!(args.defer_max_attempts, 3);
+    }
+
+    #[test]
+    fn apply_runr_and_defers_overrides_applied() {
+        let cli = Cli::try_parse_from([
+            "bosun",
+            "apply",
+            "--bundle",
+            "/b",
+            "--runr-url",
+            "http://127.0.0.1:9999",
+            "--runr-timeout-sec",
+            "30",
+            "--defers-dir",
+            "/var/tmp/defers",
+            "--defer-max-attempts",
+            "5",
+        ])
+        .unwrap();
+        let Command::Apply(args) = cli.command else {
+            panic!("expected apply")
+        };
+        assert_eq!(args.runr_url, "http://127.0.0.1:9999");
+        assert_eq!(args.runr_timeout_sec, 30);
+        assert_eq!(args.defers_dir, PathBuf::from("/var/tmp/defers"));
+        assert_eq!(args.defer_max_attempts, 5);
+    }
+
+    #[test]
+    fn status_subcommand_parses_with_defaults() {
+        let cli = Cli::try_parse_from(["bosun", "status"]).unwrap();
+        let Command::Status(args) = cli.command else {
+            panic!("expected status")
+        };
+        assert_eq!(args.defers_dir, PathBuf::from("/tmp/bosun-defers"));
+        assert!(matches!(args.format, StatusFormat::Text));
+        assert!(args.clear.is_none());
+        assert!(!args.clear_all_manual);
+    }
+
+    #[test]
+    fn status_subcommand_with_overrides() {
+        let cli = Cli::try_parse_from([
+            "bosun",
+            "status",
+            "--defers-dir",
+            "/var/tmp/defers",
+            "--format",
+            "json",
+            "--clear",
+            "systemd.restart:nginx",
+            "--clear-all-manual",
+        ])
+        .unwrap();
+        let Command::Status(args) = cli.command else {
+            panic!("expected status")
+        };
+        assert_eq!(args.defers_dir, PathBuf::from("/var/tmp/defers"));
+        assert!(matches!(args.format, StatusFormat::Json));
+        assert_eq!(args.clear.as_deref(), Some("systemd.restart:nginx"));
+        assert!(args.clear_all_manual);
     }
 }

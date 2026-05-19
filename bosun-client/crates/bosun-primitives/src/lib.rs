@@ -5,6 +5,7 @@
 //! `process.signal`.
 
 pub mod apt_package;
+pub mod dispatch;
 pub mod file_content;
 pub mod health_check;
 pub mod process_signal;
@@ -16,6 +17,7 @@ pub mod systemd_timer;
 pub mod template;
 
 pub use apt_package::{AptPackageSpec, AptPrimitive};
+pub use dispatch::RealDispatchClient;
 pub use file_content::{sha256_hex, FileContentSpec, FilePrimitive};
 pub use health_check::RealHealthCheckRunner;
 pub use process_signal::{
