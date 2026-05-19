@@ -10,6 +10,7 @@ pub mod facts;
 pub mod health_check;
 pub mod inventory;
 pub mod orchestrator;
+pub mod pacer;
 pub mod path_safety;
 pub mod primitive;
 pub mod registry;
@@ -45,6 +46,7 @@ pub use orchestrator::{
     ApplyOpts, ApplyReport, ApplySummary, Orchestrator, Outcome, PlanFailure, PlanReport,
     PlanSummary, ResourceApplyOutcome, ResourcePlan,
 };
+pub use pacer::PacerConfig;
 pub use path_safety::{resolve_within_root, PathSafetyError};
 pub use primitive::{
     ApplyCtx, ApplyCtxBuilder, FactsSource, OverlayFactsSource, PlanCtx, Primitive, PrimitiveError,

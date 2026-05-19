@@ -129,6 +129,25 @@ pub struct ApplyArgs {
     /// max_attempts из записи; CLI-флаг — fallback).
     #[arg(long, default_value_t = 3)]
     pub defer_max_attempts: u32,
+
+    /// Pacer: целевая длительность размазывания apply'я (секунды). `0`
+    /// (дефолт) — pacer выключен, поведение идентично прежним фазам.
+    /// При значении `> 0` orchestrator вставляет cancel-aware sleep между
+    /// ресурсами; интервал — `target / N`, clamp'нутый к
+    /// `[pacer-min-interval-ms, pacer-max-interval-ms]`.
+    #[arg(long, default_value_t = 0)]
+    pub pacer_target_sec: u32,
+
+    /// Pacer: нижняя граница интервала между ресурсами (миллисекунды).
+    /// Защищает от вырожденного случая «много ресурсов, sleep по
+    /// микросекунде».
+    #[arg(long, default_value_t = 60)]
+    pub pacer_min_interval_ms: u32,
+
+    /// Pacer: верхняя граница интервала между ресурсами (миллисекунды).
+    /// Защищает от вырожденного случая «target большой, ресурсов мало».
+    #[arg(long, default_value_t = 100)]
+    pub pacer_max_interval_ms: u32,
 }
 
 /// Аргументы `bosun status` (Phase J). Команда без апплая показывает, что
@@ -379,6 +398,43 @@ mod tests {
         assert_eq!(args.runr_timeout_sec, 30);
         assert_eq!(args.defers_dir, PathBuf::from("/var/tmp/defers"));
         assert_eq!(args.defer_max_attempts, 5);
+    }
+
+    #[test]
+    fn apply_pacer_defaults_disabled() {
+        // Phase S: дефолты соответствуют выключенному pacer'у (target=0).
+        // Это backward-compat: `bosun apply` без новых флагов работает
+        // идентично прежним фазам.
+        let cli = Cli::try_parse_from(["bosun", "apply", "--bundle", "/b"]).unwrap();
+        let Command::Apply(args) = cli.command else {
+            panic!("expected apply")
+        };
+        assert_eq!(args.pacer_target_sec, 0);
+        assert_eq!(args.pacer_min_interval_ms, 60);
+        assert_eq!(args.pacer_max_interval_ms, 100);
+    }
+
+    #[test]
+    fn apply_pacer_overrides_applied() {
+        let cli = Cli::try_parse_from([
+            "bosun",
+            "apply",
+            "--bundle",
+            "/b",
+            "--pacer-target-sec",
+            "30",
+            "--pacer-min-interval-ms",
+            "50",
+            "--pacer-max-interval-ms",
+            "120",
+        ])
+        .unwrap();
+        let Command::Apply(args) = cli.command else {
+            panic!("expected apply")
+        };
+        assert_eq!(args.pacer_target_sec, 30);
+        assert_eq!(args.pacer_min_interval_ms, 50);
+        assert_eq!(args.pacer_max_interval_ms, 120);
     }
 
     #[test]

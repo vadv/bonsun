@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use bosun_core::{
     defers::{replay_with_health_check, DispatchClient, Journal, ReplayReport},
     ApplyCtxBuilder, ApplyOpts, ApplyReport, Bundle, Evaluator, FactValue, HealthCheckRunner,
-    Orchestrator, Outcome, OverlayFactsSource, PlanCtx, PlanReport, Primitive, ResourceKind,
-    SensitiveStore, TemplateFn,
+    Orchestrator, Outcome, OverlayFactsSource, PacerConfig, PlanCtx, PlanReport, Primitive,
+    ResourceKind, SensitiveStore, TemplateFn,
 };
 use bosun_facts::FactsCollector;
 use bosun_handles::{RunrHandle, SystemdHandle};
@@ -367,6 +367,11 @@ pub fn run(args: &ApplyArgs) -> i32 {
         };
         let mut opts = ApplyOpts::default();
         opts.continue_on_error = args.continue_on_error;
+        opts.pacer = PacerConfig::new(
+            args.pacer_target_sec,
+            args.pacer_min_interval_ms,
+            args.pacer_max_interval_ms,
+        );
         match orchestrator.apply(
             &registry,
             &overlay_facts,

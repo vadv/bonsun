@@ -19,6 +19,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use serde::Serialize;
 
 use crate::diff::Diff;
+use crate::health_check::cancellable_sleep;
+use crate::pacer::PacerConfig;
 use crate::primitive::{ApplyCtx, FactsSource, PlanCtx, Primitive, PrimitiveError};
 use crate::registry::{Registry, RegistryError};
 use crate::resource::{ResourceId, ResourceKind};
@@ -30,6 +32,10 @@ pub struct ApplyOpts {
     /// Если true — после Err продолжаем выполнение остальных ресурсов,
     /// собираем ошибки в отчёт. Если false — первый Err прерывает прогон.
     pub continue_on_error: bool,
+    /// Pacer-конфиг: размазывает apply по времени, вставляя cancel-aware
+    /// sleep между ресурсами. По умолчанию выключен (`PacerConfig::default`
+    /// = `disabled`), и поведение совпадает с прежней фазой.
+    pub pacer: PacerConfig,
 }
 
 /// План одного ресурса.
@@ -291,7 +297,47 @@ impl Orchestrator {
         // попадает — это транзиентная задержка, не настоящий провал.
         let mut failed_or_interrupted: HashSet<ResourceId> = HashSet::new();
 
-        for id in order {
+        // Pacer-интервал считается один раз для всего прогона: число
+        // ресурсов известно из топо-порядка. При выключенном pacer'е
+        // или одиночном ресурсе sleep'ы не делаются.
+        let pacer_interval = opts.pacer.interval_for(total);
+        let pacer_enabled = !pacer_interval.is_zero();
+
+        for (idx, id) in order.into_iter().enumerate() {
+            // Pacer-sleep вставляется ПЕРЕД каждой итерацией кроме первой:
+            // эквивалентно «sleep после предыдущего ресурса». Делаем это
+            // в начале, а не в конце цикла, чтобы не модифицировать
+            // многочисленные `continue` в теле. Если sleep прервали через
+            // cancel — текущий ресурс отчитывается Interrupted, прогон
+            // обрывается. Семантически это равно «apply того же ресурса
+            // вернул Cancelled»: ресурс ещё не применили, причина —
+            // внешний сигнал, а не сбой ресурса.
+            if idx > 0 && pacer_enabled && !aborted {
+                tracing::trace!(
+                    interval_ms = pacer_interval.as_millis() as u64,
+                    "pacer sleep",
+                );
+                if !cancellable_sleep(pacer_interval, &apply_ctx.cancel) {
+                    tracing::info!("pacer sleep cancelled");
+                    let kind = registry
+                        .get(&id)
+                        .map(|r| r.kind.clone())
+                        .unwrap_or_else(|| ResourceKind::from_static("unknown"));
+                    let reason = "apply cancelled during pacer sleep".to_string();
+                    failed_or_interrupted.insert(id.clone());
+                    resources.push(ResourceApplyOutcome {
+                        id,
+                        kind,
+                        outcome: Outcome::Interrupted {
+                            reason: reason.clone(),
+                        },
+                        message: reason,
+                    });
+                    summary.interrupted += 1;
+                    aborted = true;
+                    continue;
+                }
+            }
             if aborted {
                 // Прогон прерван предыдущим Err при continue_on_error=false.
                 // Оставшиеся ресурсы помечаем Skipped — это явный сигнал
