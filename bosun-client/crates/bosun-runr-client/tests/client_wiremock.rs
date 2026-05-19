@@ -663,3 +663,127 @@ async fn verify_restart_increment_but_not_running_returns_timeout_error() {
     .unwrap_err();
     assert!(matches!(err, RunrError::RestartNotObserved { .. }));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_start_returns_status_when_state_is_running() {
+    let server = MockServer::start().await;
+    // Свежестартующий сервис: restarts=0, state=Running.
+    // verify_start не должен опираться на инкремент restarts.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/services/statuses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "name": "pg",
+                "state": "Running",
+                "pid": 100,
+                "restarts": 0u64,
+                "in_state_for_ms": 200,
+                "uptime_ms": 200,
+                "autostart": true,
+                "memory_rss_anon_bytes": 0,
+                "memory_rss_file_bytes": 0,
+                "cpu_usage_percent": 0.0,
+            }
+        ])))
+        .mount(&server)
+        .await;
+    let client = client_for(&server);
+    let status = blocking(move || {
+        bosun_runr_client::verify_start(
+            &client,
+            "pg",
+            Duration::from_millis(20),
+            Duration::from_secs(1),
+        )
+    })
+    .await
+    .unwrap();
+    assert_eq!(status.state, "Running");
+    assert_eq!(status.restarts, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_start_returns_service_start_failed_on_failed_state() {
+    let server = MockServer::start().await;
+    // Сервис попал в Failed сразу после start — verify_start должен
+    // вернуть ошибку немедленно, не дожидаясь deadline'а.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/services/statuses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "name": "pg",
+                "state": "Failed",
+                "restarts": 0u64,
+                "in_state_for_ms": 50,
+                "autostart": true,
+                "memory_rss_anon_bytes": 0,
+                "memory_rss_file_bytes": 0,
+                "cpu_usage_percent": 0.0,
+            }
+        ])))
+        .mount(&server)
+        .await;
+    let client = client_for(&server);
+    let started_at = std::time::Instant::now();
+    let err = blocking(move || {
+        bosun_runr_client::verify_start(
+            &client,
+            "pg",
+            Duration::from_millis(20),
+            // Большой deadline — должны вернуться раньше его, увидев Failed.
+            Duration::from_secs(10),
+        )
+    })
+    .await
+    .unwrap_err();
+    let elapsed = started_at.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "verify_start не вернулся быстро на Failed: {elapsed:?}",
+    );
+    match err {
+        RunrError::ServiceStartFailed { unit } => assert_eq!(unit, "pg"),
+        other => panic!("expected ServiceStartFailed, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_start_returns_start_not_observed_on_timeout() {
+    let server = MockServer::start().await;
+    // Сервис висит в Starting — не Running и не Failed, верифицируем
+    // что после deadline возвращается StartNotObserved с last_state.
+    Mock::given(method("GET"))
+        .and(path("/api/v1/services/statuses"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+            {
+                "name": "pg",
+                "state": "Starting",
+                "restarts": 0u64,
+                "in_state_for_ms": 100,
+                "autostart": true,
+                "memory_rss_anon_bytes": 0,
+                "memory_rss_file_bytes": 0,
+                "cpu_usage_percent": 0.0,
+            }
+        ])))
+        .mount(&server)
+        .await;
+    let client = client_for(&server);
+    let err = blocking(move || {
+        bosun_runr_client::verify_start(
+            &client,
+            "pg",
+            Duration::from_millis(20),
+            Duration::from_millis(200),
+        )
+    })
+    .await
+    .unwrap_err();
+    match err {
+        RunrError::StartNotObserved { unit, last_state } => {
+            assert_eq!(unit, "pg");
+            assert_eq!(last_state, "Starting");
+        }
+        other => panic!("expected StartNotObserved, got {other:?}"),
+    }
+}

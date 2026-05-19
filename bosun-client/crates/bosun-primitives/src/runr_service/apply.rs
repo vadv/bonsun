@@ -11,9 +11,12 @@
 //! 4. Прогнать `decide_action_runr(spec, snapshot, notify-флаги)`.
 //! 5. На `Action::Restart` / `Action::Reload` — enqueue defer ДО реального
 //!    вызова runr (at-least-once: при крэше после enqueue replay подберёт).
-//! 6. На `Action::Start` / `Action::Stop` — синхронно через runr-клиент с
-//!    последующим `verify_restart` (для Stop verify не нужен — runr
-//!    возвращает 200 после успешной остановки).
+//! 6. На `Action::Start` / `Action::Stop` — синхронно через runr-клиент.
+//!    Для Start после ответа runr ждём `verify_start` (state=Running),
+//!    отдельный helper от `verify_restart`: у нового процесса счётчик
+//!    `restarts` остаётся 0 и не подходит как критерий успеха.
+//!    Для Stop verify не нужен — runr возвращает 200 после успешной
+//!    остановки.
 //! 7. Маппинг ошибок: `RunrError::Unavailable` → `RunrUnavailable`
 //!    (deferrable), остальные → `Apply { reason }` (non-deferrable).
 
@@ -27,7 +30,7 @@ use bosun_runr_client::{RunrError, ServiceStatus};
 use super::plan::{decide_action_runr, Action};
 use super::spec::RunrServiceSpec;
 
-/// Поллинг-интервал для `verify_restart` после синхронного Start.
+/// Поллинг-интервал для `verify_start` после синхронного Start.
 const VERIFY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Бюджет общего ожидания, после которого verify считается провалившимся.
 const VERIFY_POLL_TOTAL: Duration = Duration::from_secs(15);
@@ -132,63 +135,32 @@ fn get_or_fetch_statuses<R: bosun_handles::RunrHandle + ?Sized>(
     Ok(stored.clone())
 }
 
-/// Синхронно запустить unit + verify.
+/// Синхронно запустить unit и убедиться, что он добрался до `Running`.
+///
+/// Раньше здесь стоял `verify_restart`, опирающийся на инкремент счётчика
+/// `restarts`. Для start-с-нуля счётчик у нового процесса равен 0 и не
+/// двигается, поэтому таймаут «restart не наблюдался» был ложным сигналом —
+/// и, что хуже, мы трактовали его как «success (idempotent)», маскируя
+/// сценарий «сервис упал в Failed сразу после start». Теперь критерий
+/// прямой: `state == "Running"` ⇒ Ok, `state == "Failed"` ⇒ Err
+/// (`ServiceStartFailed`), таймаут ⇒ Err (`StartNotObserved`).
+///
+/// Параметр `before` не используется здесь, остаётся для симметрии
+/// с restart-веткой (если когда-то понадобится сравнивать pid'ы).
 fn execute_start<R: bosun_handles::RunrHandle + ?Sized>(
     runr: &R,
     spec: &RunrServiceSpec,
-    before: Option<&ServiceStatus>,
+    _before: Option<&ServiceStatus>,
 ) -> Result<ChangeReport, PrimitiveError> {
     tracing::info!(unit = %spec.name, "runr.service: start");
     runr.service_start(&spec.name, true)
         .map_err(|e| map_runr_error(e, runr.base_url(), "service_start"))?;
-    // Verify: ждём, пока state снова станет Running. Используем before
-    // snapshot, если он есть, иначе синтезируем zero-baseline — verify
-    // дождётся первого state=Running и завершится.
-    let baseline = baseline_for_start(spec, before);
-    match runr.verify_restart(
-        &spec.name,
-        &baseline,
-        VERIFY_POLL_INTERVAL,
-        VERIFY_POLL_TOTAL,
-    ) {
-        Ok(_after) => Ok(ChangeReport::changed(format!(
+    match runr.verify_start(&spec.name, VERIFY_POLL_INTERVAL, VERIFY_POLL_TOTAL) {
+        Ok(_status) => Ok(ChangeReport::changed(format!(
             "started runr.service:{}",
             spec.name
         ))),
-        // Если verify не дождался restart-инкремента, но мы только что
-        // вызвали start, это означает, что сервис мог уже быть running до
-        // нашего start (idempotent=true): runr вернёт 200 без действия,
-        // restarts не инкрементится. Признаём это успехом.
-        Err(RunrError::RestartNotObserved { .. }) => Ok(ChangeReport::changed(format!(
-            "started runr.service:{} (idempotent)",
-            spec.name
-        ))),
-        Err(e) => Err(map_runr_error(e, runr.base_url(), "verify_restart")),
-    }
-}
-
-/// Базовая линия для verify после Start. Если сервис уже был в snapshot'е,
-/// используем его restarts-счётчик. Иначе синтезируем минимальный
-/// ServiceStatus с restarts=0 — verify будет ждать, пока счётчик не
-/// инкрементится.
-fn baseline_for_start(spec: &RunrServiceSpec, before: Option<&ServiceStatus>) -> ServiceStatus {
-    if let Some(s) = before {
-        return s.clone();
-    }
-    ServiceStatus {
-        name: spec.name.clone(),
-        state: "Unknown".to_string(),
-        pid: None,
-        restarts: 0,
-        in_state_for_ms: 0,
-        uptime_ms: None,
-        downtime_ms: None,
-        next_restart_in_ms: None,
-        started_at: None,
-        autostart: false,
-        memory_rss_anon_bytes: 0,
-        memory_rss_file_bytes: 0,
-        cpu_usage_percent: 0.0,
+        Err(e) => Err(map_runr_error(e, runr.base_url(), "verify_start")),
     }
 }
 
@@ -304,6 +276,14 @@ fn map_runr_error(err: RunrError, base_url: &str, op: &str) -> PrimitiveError {
         RunrError::RestartNotObserved { unit } => PrimitiveError::Apply {
             reason: format!("runr restart of {unit} not observed (op={op})"),
         },
+        RunrError::StartNotObserved { unit, last_state } => PrimitiveError::Apply {
+            reason: format!(
+                "runr start of {unit} did not reach Running (last={last_state}, op={op})"
+            ),
+        },
+        RunrError::ServiceStartFailed { unit } => PrimitiveError::Apply {
+            reason: format!("runr {unit} entered Failed after start (op={op})"),
+        },
         RunrError::Io(e) => PrimitiveError::RunrUnavailable {
             base_url: base_url.to_string(),
             reason: format!("{op}: i/o error: {e}"),
@@ -347,6 +327,9 @@ mod tests {
         start_error: Mutex<Option<RunrError>>,
         // Snapshot, который вернёт verify_restart (поднимет restarts на 1).
         verify_after_restarts: AtomicU32,
+        // Что вернуть на verify_start: None → Ok(state=Running), Some(err) →
+        // тестируем сценарии Failed/Timeout.
+        verify_start_error: Mutex<Option<RunrError>>,
     }
 
     impl MockRunr {
@@ -357,6 +340,7 @@ mod tests {
                 daemon_reload_count: AtomicU32::new(0),
                 start_error: Mutex::new(None),
                 verify_after_restarts: AtomicU32::new(1),
+                verify_start_error: Mutex::new(None),
             }
         }
         fn calls(&self) -> Vec<String> {
@@ -495,6 +479,32 @@ mod tests {
                 cpu_usage_percent: 0.0,
             })
         }
+        fn verify_start(
+            &self,
+            name: &str,
+            _poll_interval: Duration,
+            _poll_total: Duration,
+        ) -> Result<ServiceStatus, RunrError> {
+            self.record(&format!("verify_start:{name}"));
+            if let Some(err) = self.verify_start_error.lock().unwrap().take() {
+                return Err(err);
+            }
+            Ok(ServiceStatus {
+                name: name.to_string(),
+                state: "Running".to_string(),
+                pid: Some(42),
+                restarts: 0,
+                in_state_for_ms: 100,
+                uptime_ms: Some(100),
+                downtime_ms: None,
+                next_restart_in_ms: None,
+                started_at: Some("2026-05-19T00:00:00Z".to_string()),
+                autostart: false,
+                memory_rss_anon_bytes: 0,
+                memory_rss_file_bytes: 0,
+                cpu_usage_percent: 0.0,
+            })
+        }
     }
 
     fn status(name: &str, state: &str, restarts: u64) -> ServiceStatus {
@@ -616,10 +626,60 @@ mod tests {
         // daemon_reload и service_statuses и service_start идут в этом порядке.
         assert!(calls.iter().any(|c| c == "daemon_reload"));
         assert!(calls.iter().any(|c| c == "service_start:svc"));
-        // verify_restart должен быть вызван.
-        assert!(calls.iter().any(|c| c == "verify_restart:svc"));
+        // verify_start должен быть вызван — для старта смотрим state=Running,
+        // не инкремент restarts (он у новой инстанции равен 0).
+        assert!(calls.iter().any(|c| c == "verify_start:svc"));
+        // verify_restart НЕ должен быть вызван для start-сценария.
+        assert!(!calls.iter().any(|c| c == "verify_restart:svc"));
         // service_restart НЕ должен быть вызван напрямую.
         assert!(!calls.iter().any(|c| c == "service_restart:svc"));
+    }
+
+    #[test]
+    fn apply_start_fails_when_service_enters_failed_state() {
+        // Регрессия H4: раньше execute_start использовал verify_restart,
+        // и failed-сервис мог отчитаться success (idempotent). Теперь
+        // verify_start возвращает ServiceStartFailed, что мапится в
+        // PrimitiveError::Apply.
+        let mock = Arc::new(MockRunr::new(vec![]));
+        *mock.verify_start_error.lock().unwrap() =
+            Some(RunrError::ServiceStartFailed { unit: "svc".into() });
+        let r = make_resource("svc", ServiceState::Running);
+        let (_tmp, ctx) = make_ctx_with_runr(Some(mock.clone()));
+        let err = run(&r, &force_update_diff(&r), &ctx).unwrap_err();
+        match err {
+            PrimitiveError::Apply { reason } => {
+                assert!(
+                    reason.contains("Failed"),
+                    "expected 'Failed' in reason, got: {reason}"
+                );
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
+        assert!(mock.calls().iter().any(|c| c == "service_start:svc"));
+        assert!(mock.calls().iter().any(|c| c == "verify_start:svc"));
+    }
+
+    #[test]
+    fn apply_start_fails_on_verify_start_timeout() {
+        // StartNotObserved → Apply error, не молчаливый success.
+        let mock = Arc::new(MockRunr::new(vec![]));
+        *mock.verify_start_error.lock().unwrap() = Some(RunrError::StartNotObserved {
+            unit: "svc".into(),
+            last_state: "Starting".into(),
+        });
+        let r = make_resource("svc", ServiceState::Running);
+        let (_tmp, ctx) = make_ctx_with_runr(Some(mock.clone()));
+        let err = run(&r, &force_update_diff(&r), &ctx).unwrap_err();
+        match err {
+            PrimitiveError::Apply { reason } => {
+                assert!(
+                    reason.contains("not reach Running") || reason.contains("Starting"),
+                    "got reason: {reason}"
+                );
+            }
+            other => panic!("expected Apply, got {other:?}"),
+        }
     }
 
     #[test]
@@ -776,6 +836,14 @@ mod tests {
                 &self,
                 _: &str,
                 _: &ServiceStatus,
+                _: Duration,
+                _: Duration,
+            ) -> Result<ServiceStatus, RunrError> {
+                unimplemented!()
+            }
+            fn verify_start(
+                &self,
+                _: &str,
                 _: Duration,
                 _: Duration,
             ) -> Result<ServiceStatus, RunrError> {

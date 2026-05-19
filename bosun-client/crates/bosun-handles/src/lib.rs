@@ -58,6 +58,17 @@ pub trait RunrHandle: Send + Sync {
         poll_interval: Duration,
         poll_total: Duration,
     ) -> Result<ServiceStatus, RunrError>;
+    /// Polling-проверка старта: ждёт `state == "Running"` без опоры на
+    /// инкремент `restarts`. Для start-сценариев счётчик равен 0 у
+    /// свежезапущенного процесса, и `verify_restart` дал бы false
+    /// negative. Если сервис попал в `Failed` — возвращает
+    /// `ServiceStartFailed` сразу, не ждёт.
+    fn verify_start(
+        &self,
+        name: &str,
+        poll_interval: Duration,
+        poll_total: Duration,
+    ) -> Result<ServiceStatus, RunrError>;
 }
 
 impl RunrHandle for bosun_runr_client::Client {
@@ -116,6 +127,14 @@ impl RunrHandle for bosun_runr_client::Client {
         poll_total: Duration,
     ) -> Result<ServiceStatus, RunrError> {
         bosun_runr_client::verify_restart(self, name, before, poll_interval, poll_total)
+    }
+    fn verify_start(
+        &self,
+        name: &str,
+        poll_interval: Duration,
+        poll_total: Duration,
+    ) -> Result<ServiceStatus, RunrError> {
+        bosun_runr_client::verify_start(self, name, poll_interval, poll_total)
     }
 }
 

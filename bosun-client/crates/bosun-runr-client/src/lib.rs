@@ -14,6 +14,8 @@
 //!   [`ActionAck`], [`DaemonInfo`], [`CgroupMetrics`], [`UnitKind`].
 //! - [`verify::verify_restart`] — polling-верификация рестарта по диффу
 //!   `restarts` и состояния `state == "Running"`.
+//! - [`verify::verify_start`] — polling-верификация старта (только
+//!   `state == "Running"`, без опоры на инкремент `restarts`).
 //!
 //! Никаких `reqwest`/`hyper`/`tokio` в production-зависимостях: runr доступен
 //! только через `localhost`, fork+exec шелла не нужен, асинхронность не
@@ -29,4 +31,4 @@ pub use error::RunrError;
 pub use types::{
     ActionAck, CgroupMetrics, DaemonInfo, ServiceStatus, TimerStatus, UnitKind, UnitListItem,
 };
-pub use verify::verify_restart;
+pub use verify::{verify_restart, verify_start};

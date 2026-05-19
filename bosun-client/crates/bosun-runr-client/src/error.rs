@@ -57,6 +57,19 @@ pub enum RunrError {
     #[error("restart of {unit} did not produce observed restart increment")]
     RestartNotObserved { unit: String },
 
+    /// Polling-цикл `verify_start` истёк до того, как сервис перешёл в
+    /// `Running`. Стартующий сервис должен дойти до `Running` сам — для
+    /// рестарта подходит инкремент `restarts`, для старта с нуля счётчик
+    /// не двигается, поэтому критерий другой.
+    #[error("start of {unit} did not reach Running state in time (last={last_state})")]
+    StartNotObserved { unit: String, last_state: String },
+
+    /// Сервис перешёл в `Failed` после `service_start`. Это не таймаут —
+    /// runr или сам unit сообщили о crash'е или non-zero exit. В отличие
+    /// от `StartNotObserved` ждать дольше бесполезно.
+    #[error("start of {unit} resulted in Failed state")]
+    ServiceStartFailed { unit: String },
+
     /// Локальная I/O-ошибка (чтение/запись HTTP-потока, чтение env и т.п.).
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
