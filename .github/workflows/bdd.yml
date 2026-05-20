@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Verify docker available
         run: docker version
@@ -124,7 +124,7 @@ jobs:
     # public-репе без приватных секретов.
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Verify privileged docker
         # Probe ловит хосты без privileged-режима до основной сборки.
