@@ -21,11 +21,21 @@ all-features = true
 # `unmaintained = "workspace"` only fires for crates the workspace pulls in
 # directly, ignoring deep transitive advisories we cannot act on.
 unmaintained = "workspace"
-ignore = []
+ignore = [
+    # RSA Marvin Attack timing sidechannel — нет fixed upgrade со стороны
+    # upstream `rsa` (на 2026-05-20). cert.tls использует rsa только для
+    # генерации self-signed key inside bosun-client, без передачи private key
+    # ненадёжной стороне и без timing-sensitive операций над приватным ключом.
+    # Если upstream выпустит fix — убрать из ignore и пересобрать.
+    "RUSTSEC-2023-0071",
+]
 
 [bans]
 multiple-versions = "warn"
+# Wildcards разрешены ТОЛЬКО для path-зависимостей внутри workspace.
+# Внешние крейты обязаны быть запинены к версии. См. `allow-wildcard-paths`.
 wildcards = "deny"
+allow-wildcard-paths = true
 deny = [
     # OpenSSL pulls libssl/libcrypto into the musl binary and breaks static
     # linking. Workspace pins ureq/rcgen/postgres to rustls + ring instead.
@@ -43,6 +53,8 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
+    "CC0-1.0",                # tiny-keccak (через rcgen) — public-domain равно permissive
+    "CDLA-Permissive-2.0",    # webpki-roots (через ureq) — Linux Foundation data license, permissive
     "ISC",
     "MIT",
     "Unicode-3.0",
