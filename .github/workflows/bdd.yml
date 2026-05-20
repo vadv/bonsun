@@ -1,11 +1,18 @@
 name: bdd
 
-# BDD scenarios (Phase K) are the integration gate for primitives through the
-# Starlark glue. The run is heavy (build test-base image, cucumber on 100+
-# scenarios) so it lives in a separate workflow that fires on push to main and
-# on manual dispatch. PRs go through ci.yml; maintainers trigger this before
-# merging to verify nothing in the Starlark glue or primitive impls broke the
-# scenarios.
+# BDD scenarios (Phase K) — главный gate для примитивов через Starlark glue.
+# Сборка тяжёлая (test-base image + cucumber на 100+ сценариев), поэтому
+# workflow отделён от ci.yml и стреляет на push в main и по dispatch.
+#
+# В большинстве сценариев участвуют только bosun + системные утилиты
+# (apt, useradd, dbus, openssl); runr-supervisor нужен ровно одному
+# тегу — @runr-service. runr живёт в приватном gitlab.ozon.ru репозитории,
+# public-форк bosun без maintainer-секретов клонировать его не может.
+# Поэтому workflow всегда запускает BDD и только переключается между
+# двумя режимами:
+# - есть RUNR_REPO_URL+RUNR_DEPLOY_KEY → клонируем runr, собираем
+#   test-base с runr-бинарём, прогоняем все теги;
+# - секретов нет → собираем test-base без runr, прогоняем «not @runr-service».
 on:
   push:
     branches: [main]
@@ -32,13 +39,6 @@ jobs:
   bdd-default:
     name: bdd (default scenarios)
     runs-on: ubuntu-22.04
-    # The BDD pipeline needs the runr supervisor binary built from runr source.
-    # runr lives in a private gitlab repository (gitlab.ozon.ru/.../runr) and a
-    # public GitHub runner cannot clone it without credentials. The job checks
-    # the RUNR_REPO_URL organisation secret and the RUNR_DEPLOY_KEY ssh key;
-    # if either is missing the job emits a skip notice and exits clean. This
-    # lets maintainers gate the workflow on a configured private fork while
-    # still letting external contributors see a green checkmark.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -60,13 +60,8 @@ jobs:
           RUNR_REPO_URL: ${{ secrets.RUNR_REPO_URL }}
           RUNR_DEPLOY_KEY: ${{ secrets.RUNR_DEPLOY_KEY }}
         run: |
-          if [ -z "$RUNR_REPO_URL" ]; then
-            echo "RUNR_REPO_URL secret is not set; BDD scenarios requiring runr will be skipped"
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if [ -z "$RUNR_DEPLOY_KEY" ]; then
-            echo "RUNR_DEPLOY_KEY secret is not set; cannot clone $RUNR_REPO_URL"
+          if [ -z "$RUNR_REPO_URL" ] || [ -z "$RUNR_DEPLOY_KEY" ]; then
+            echo "::notice::RUNR_REPO_URL/RUNR_DEPLOY_KEY secrets not set; BDD без @runr-service сценариев"
             echo "available=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -79,31 +74,22 @@ jobs:
           echo "available=true" >> "$GITHUB_OUTPUT"
           echo "RUNR_SOURCE_DIR=$GITHUB_WORKSPACE/runr-src" >> "$GITHUB_ENV"
 
-      - name: Skip notice when runr unavailable
-        if: steps.runr_check.outputs.available != 'true'
-        run: |
-          echo "::warning::Skipping BDD: runr source not available. Set RUNR_REPO_URL and RUNR_DEPLOY_KEY secrets to enable."
-          echo "BDD scenarios depend on a real runr supervisor binary built from the runr project."
-          echo "Without it the test-base image cannot be assembled and all @docker-tagged scenarios cannot run."
-
       - name: Build bosun (bookworm)
-        if: steps.runr_check.outputs.available == 'true'
         run: make bosun-bookworm
 
-      - name: Build runr (bookworm)
-        if: steps.runr_check.outputs.available == 'true'
-        run: make runr-bookworm
-
-      - name: Build test-base image
+      - name: Build test-base image (with runr)
         if: steps.runr_check.outputs.available == 'true'
         run: make docker-base
 
-      - name: Run BDD (default, excludes @systemd-privileged)
+      - name: Build test-base image (without runr)
+        if: steps.runr_check.outputs.available != 'true'
+        # RUNR_SOURCE_DIR пустой → docker-base собирает --target=base.
+        # Makefile подхватит ../../runr на dev-машинах; для CI явно
+        # обнуляем переменную, чтобы исключить случайное обнаружение.
+        run: RUNR_SOURCE_DIR= make docker-base
+
+      - name: Run BDD (full coverage, runr available)
         if: steps.runr_check.outputs.available == 'true'
-        # `make test-bdd` automatically excludes @systemd-privileged via the
-        # filtering in crates/bosun-cli/tests/bdd/main.rs unless the
-        # BDD_SYSTEMD_PRIVILEGED env var is set. If the operator passed a
-        # tags filter via workflow_dispatch we forward it.
         env:
           BDD_INPUT_TAGS: ${{ github.event.inputs.tags }}
         run: |
@@ -113,20 +99,35 @@ jobs:
             make test-bdd
           fi
 
+      - name: Run BDD (без @runr-service, runr недоступен)
+        if: steps.runr_check.outputs.available != 'true'
+        env:
+          BDD_INPUT_TAGS: ${{ github.event.inputs.tags }}
+        # RUNR_SOURCE_DIR пустой → Makefile дописывает `not @runr-service`
+        # к итоговому фильтру независимо от TAGS. Это покрывает ~80
+        # сценариев из 90+ без приватного runr.
+        run: |
+          if [ -n "$BDD_INPUT_TAGS" ]; then
+            RUNR_SOURCE_DIR= make test-bdd TAGS="$BDD_INPUT_TAGS"
+          else
+            RUNR_SOURCE_DIR= make test-bdd
+          fi
+
   bdd-systemd-privileged:
     name: bdd (@systemd-privileged scenarios)
     runs-on: ubuntu-22.04
-    # @systemd-privileged scenarios run systemd as PID 1 inside
-    # `docker run --privileged --cgroupns=private`. This requires docker on
-    # the runner to allow privileged containers. Standard ubuntu-22.04 GitHub
-    # runners support this; self-hosted rootless setups do not.
+    # @systemd-privileged сценарии гоняют systemd как PID 1 внутри
+    # `docker run --privileged --cgroupns=private`. Стандартный
+    # ubuntu-22.04 GitHub runner это поддерживает; rootless self-hosted —
+    # нет. Сценарии общаются с PID 1 через dbus и не используют runr —
+    # поэтому job собирает test-base без runr-бинаря и работает на
+    # public-репе без приватных секретов.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Verify privileged docker
-        # Standard GitHub runners allow privileged containers; this probe
-        # surfaces the failure mode early when the host doesn't.
+        # Probe ловит хосты без privileged-режима до основной сборки.
         run: |
           docker run --rm --privileged debian:bookworm-slim true
 
@@ -138,43 +139,13 @@ jobs:
         with:
           workspaces: bosun-client
 
-      - name: Check runr source availability
-        id: runr_check
-        env:
-          RUNR_REPO_URL: ${{ secrets.RUNR_REPO_URL }}
-          RUNR_DEPLOY_KEY: ${{ secrets.RUNR_DEPLOY_KEY }}
-        run: |
-          if [ -z "$RUNR_REPO_URL" ] || [ -z "$RUNR_DEPLOY_KEY" ]; then
-            echo "RUNR_REPO_URL / RUNR_DEPLOY_KEY not set; skipping privileged BDD"
-            echo "available=false" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          mkdir -p ~/.ssh
-          echo "$RUNR_DEPLOY_KEY" > ~/.ssh/runr_id
-          chmod 600 ~/.ssh/runr_id
-          ssh-keyscan -t rsa,ecdsa,ed25519 gitlab.ozon.ru >> ~/.ssh/known_hosts 2>/dev/null || true
-          GIT_SSH_COMMAND="ssh -i ~/.ssh/runr_id -o IdentitiesOnly=yes" \
-            git clone --depth 1 "$RUNR_REPO_URL" "$GITHUB_WORKSPACE/runr-src"
-          echo "available=true" >> "$GITHUB_OUTPUT"
-          echo "RUNR_SOURCE_DIR=$GITHUB_WORKSPACE/runr-src" >> "$GITHUB_ENV"
-
-      - name: Skip notice when runr unavailable
-        if: steps.runr_check.outputs.available != 'true'
-        run: |
-          echo "::warning::Skipping privileged BDD: runr source not available."
-
       - name: Build bosun (bookworm)
-        if: steps.runr_check.outputs.available == 'true'
         run: make bosun-bookworm
 
-      - name: Build runr (bookworm)
-        if: steps.runr_check.outputs.available == 'true'
-        run: make runr-bookworm
-
-      - name: Build test-base image
-        if: steps.runr_check.outputs.available == 'true'
-        run: make docker-base
+      - name: Build test-base image (without runr)
+        # systemd-сценариям runr не нужен; принудительно отключаем
+        # автоопределение, чтобы dev-layout не тащил runr в этот job.
+        run: RUNR_SOURCE_DIR= make docker-base
 
       - name: Run BDD (@systemd-privileged only)
-        if: steps.runr_check.outputs.available == 'true'
-        run: make test-bdd-systemd
+        run: RUNR_SOURCE_DIR= make test-bdd-systemd

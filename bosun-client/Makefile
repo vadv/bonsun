@@ -31,8 +31,21 @@ fmt:
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings -D clippy::unwrap_used -D clippy::expect_used
 
-docker-base: runr-bookworm
-	docker build -t $(BOSUN_TEST_IMAGE) -f docker/test-base.Dockerfile .
+# test-base образ собирается в двух режимах в зависимости от наличия
+# исходников runr (`RUNR_SOURCE_DIR`):
+# - есть RUNR_SOURCE_DIR → строим бинарь runr и собираем `--target=with-runr`,
+#   образ покрывает все сценарии включая `@runr-service`;
+# - нет RUNR_SOURCE_DIR → собираем `--target=base` без runr-бинаря,
+#   образ покрывает 80+ сценариев, кроме `@runr-service`.
+# Public CI без приватного runr-репозитория попадает во вторую ветку.
+docker-base:
+ifneq ($(RUNR_SOURCE_DIR),)
+	$(MAKE) runr-bookworm
+	docker build --target=with-runr -t $(BOSUN_TEST_IMAGE) -f docker/test-base.Dockerfile .
+else
+	@echo "RUNR_SOURCE_DIR не задан: собираем test-base без runr-бинаря (--target=base)"
+	docker build --target=base -t $(BOSUN_TEST_IMAGE) -f docker/test-base.Dockerfile .
+endif
 
 # Сборка bosun в bookworm-контейнере: получаем бинарь, совместимый по glibc
 # с debian:bookworm-slim. Кладём в target/bookworm-release/bosun, чтобы не
@@ -67,10 +80,31 @@ runr-bookworm:
 # Run BDD: make test-bdd
 # Filter by tag: make test-bdd TAGS=@apt-package
 # Combine tags: make test-bdd TAGS='@apt-package and not @slow'
-test-bdd: runr-bookworm docker-base bosun-bookworm
+#
+# Без RUNR_SOURCE_DIR test-base собирается без runr-бинаря (см. docker-base),
+# и `@runr-service` сценарии в таком образе бы упали на отсутствии
+# /usr/local/bin/runr. Чтобы public-CI не пытался их запускать, в этом
+# режиме раннер дописывает `not @runr-service` к итоговому фильтру.
+# С RUNR_SOURCE_DIR фильтр берётся ровно как задан в TAGS.
+ifeq ($(RUNR_SOURCE_DIR),)
+BDD_DEFAULT_TAGS := not @runr-service
+else
+BDD_DEFAULT_TAGS :=
+endif
+ifeq ($(strip $(TAGS)),)
+BDD_TAGS := $(BDD_DEFAULT_TAGS)
+else
+ifeq ($(BDD_DEFAULT_TAGS),)
+BDD_TAGS := $(TAGS)
+else
+BDD_TAGS := ($(TAGS)) and $(BDD_DEFAULT_TAGS)
+endif
+endif
+
+test-bdd: docker-base bosun-bookworm
 	BOSUN_TEST_IMAGE=$(BOSUN_TEST_IMAGE) \
 	BOSUN_BINARY=$(CURDIR)/target/bookworm-release/bosun \
-	cargo test -p bosun-cli --features bdd --test bdd --release -- $(if $(TAGS),--tags '$(TAGS)',)
+	cargo test -p bosun-cli --features bdd --test bdd --release -- $(if $(strip $(BDD_TAGS)),--tags '$(BDD_TAGS)',)
 
 # Сценарии `@systemd-privileged` запускают настоящий systemd как PID 1
 # в `docker run --privileged --cgroupns=private`. Обычный `test-bdd`
@@ -81,7 +115,11 @@ test-bdd: runr-bookworm docker-base bosun-bookworm
 # Требует: docker, имеющий право поднимать privileged-контейнеры на
 # host'е (rootless docker не подходит — systemd сам монтирует tmpfs
 # в /sys/fs/cgroup внутри namespace'а).
-test-bdd-systemd: runr-bookworm docker-base bosun-bookworm
+#
+# Сами systemd-сценарии общаются с PID 1 через dbus и не трогают
+# runr-бинарь — поэтому target собирается без runr через docker-base
+# и работает в public-CI без приватного RUNR_SOURCE_DIR.
+test-bdd-systemd: docker-base bosun-bookworm
 	BOSUN_TEST_IMAGE=$(BOSUN_TEST_IMAGE) \
 	BOSUN_BINARY=$(CURDIR)/target/bookworm-release/bosun \
 	BDD_SYSTEMD_PRIVILEGED=1 \

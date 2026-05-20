@@ -1,4 +1,11 @@
-FROM debian:bookworm-slim
+# Multi-stage сборка: `base` собирается без runr-binary и покрывает все
+# BDD-сценарии, кроме `@runr-service`. Stage `with-runr` поверх `base`
+# добавляет настоящий supervisor-бинарь для сценариев, которые поднимают
+# runr daemon внутри контейнера. CI на public-репе без приватного
+# RUNR_REPO_URL собирает `--target=base` и прогоняет ~80 сценариев без
+# runr; локальный dev и CI с RUNR_SOURCE_DIR собирают `--target=with-runr`
+# и покрывают всё.
+FROM debian:bookworm-slim AS base
 
 # Базовый образ для BDD-сценариев bosun. Все примитивы, которые имитируют
 # реальные системные действия (useradd, sysctl, pkill, gpg --show-keys,
@@ -26,12 +33,6 @@ FROM debian:bookworm-slim
 #   остаётся, чтобы systemd-в-PID1-режиме мог стартовать без доустановки.
 # - postgresql-client (psql) — для pg_sql.exec/pg_sql.query сценариев,
 #   когда docker-compose поднимает реальный postgres рядом.
-# - runr: настоящий supervisor-демон из локального проекта runr. Бинарь
-#   собирается отдельно через `make runr-bookworm` в том же
-#   rust:1-bookworm-контейнере, что и bosun, чтобы GLIBC совпал с базой
-#   образа. Сценарии @runr-service поднимают его через docker exec
-#   (`runr supervisor &`), сами создают /etc/runr/<name>.service и
-#   проверяют реальные ответы HTTP API на 127.0.0.1:8010.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
     ca-certificates curl python3 \
@@ -47,14 +48,10 @@ RUN apt-get update \
 # timeout (30s) в apt_package::recovery. Сохранение кеша сокращает
 # время каждого `bosun apply` с apt.package до миллисекунд.
 
-# Реальный runr supervisor. См. Makefile target `runr-bookworm` —
-# артефакт собирается из локальных исходников и кладётся в
-# target/runr-bookworm/runr. Если файл отсутствует, сборка docker-base
-# падает с понятным сообщением: запускайте `make runr-bookworm` или
-# целиком `make test-bdd`, который тянет цепочку зависимостей.
-COPY target/runr-bookworm/runr /usr/local/bin/runr
-RUN chmod +x /usr/local/bin/runr \
- && mkdir -p /etc/runr /var/log/runr
+# Каталоги для runr создаются и в base-stage. `@runr-service` сценарии
+# монтируют сюда unit-файлы через `docker exec`, и пустые пути не мешают
+# другим сценариям. Это даёт `with-runr` только COPY бинаря.
+RUN mkdir -p /etc/runr /var/log/runr
 
 # Для systemd-as-PID1-режима (`@systemd-privileged` сценарии). systemd
 # слушает SIGRTMIN+3 как «graceful exit для контейнера» — без этого
@@ -65,3 +62,13 @@ RUN chmod +x /usr/local/bin/runr \
 STOPSIGNAL SIGRTMIN+3
 
 WORKDIR /work
+
+# Stage `with-runr` — добавляет настоящий runr supervisor поверх base.
+# Бинарь собирается отдельно через `make runr-bookworm` в том же
+# rust:1-bookworm-контейнере, что и bosun, чтобы GLIBC совпал с базой
+# образа. Сценарии @runr-service поднимают его через docker exec
+# (`runr supervisor &`), сами создают /etc/runr/<name>.service и
+# проверяют реальные ответы HTTP API на 127.0.0.1:8010.
+FROM base AS with-runr
+COPY target/runr-bookworm/runr /usr/local/bin/runr
+RUN chmod +x /usr/local/bin/runr
