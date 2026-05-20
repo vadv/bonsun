@@ -89,7 +89,14 @@ impl CommandRunner for RealCommandRunner {
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // LC_ALL=C / LANG=C: фиксируем POSIX-локаль для child. apt/dpkg на
+            // ноде с de_DE / ru_RU выдают переведённый stderr — analyze_install_result
+            // парсит английские подстроки («dpkg was interrupted», «Unable to
+            // locate package»), без этих env-переменных recoverable ошибка стала бы
+            // OtherFailure и ресурс ушёл в Failed без шанса на dpkg --configure -a.
+            .env("LC_ALL", "C")
+            .env("LANG", "C");
 
         // SAFETY: pre_exec выполняется между fork и exec в child-процессе.
         // libc::setpgid(0, 0) — POSIX, без побочных эффектов для родителя.
@@ -226,9 +233,10 @@ pub enum InstallOutcome {
 /// Разобрать результат `apt-get install` в категорию для recovery.
 ///
 /// Pattern-matching по подстрокам stderr — это договорённость spec'а:
-/// regex был бы хрупкий, а localized stderr apt-get у нас всегда английский
-/// (мы запускаем под `LC_ALL=C` через переменные среды CLI; даже без неё
-/// английский — дефолт для не-интерактивного режима).
+/// regex был бы хрупкий, а stderr apt-get гарантированно английский,
+/// потому что `RealCommandRunner` выставляет `LC_ALL=C` и `LANG=C` для
+/// всех spawn'ов apt/dpkg. На ноде с любой системной локалью child
+/// получает POSIX, и подстроки матчатся одинаково.
 pub fn analyze_install_result(result: &CommandResult) -> InstallOutcome {
     match result.exit_code {
         Some(0) => InstallOutcome::Success,
@@ -418,6 +426,31 @@ mod tests {
             PrimitiveError::Io { context, .. } => assert!(context.starts_with("spawn ")),
             other => panic!("expected Io, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn real_command_runner_sets_lc_all_and_lang_for_child() {
+        // Регрессия H1: child должен видеть LC_ALL=C и LANG=C, иначе на
+        // локализованной ноде analyze_install_result не сматчит stderr.
+        // Тест запускает `sh -c 'printf %s "$LC_ALL|$LANG"'` и проверяет вывод.
+        let runner = RealCommandRunner;
+        let cancel = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = runner
+            .run(
+                "sh",
+                &["-c", "printf %s \"$LC_ALL|$LANG\""],
+                deadline,
+                &cancel,
+            )
+            .unwrap();
+        assert_eq!(result.exit_code, Some(0));
+        assert_eq!(
+            result.stdout.trim(),
+            "C|C",
+            "child должен унаследовать LC_ALL=C и LANG=C, получили '{}'",
+            result.stdout
+        );
     }
 
     #[test]
