@@ -1,6 +1,7 @@
 # bosun-client
 
 ![CI](https://github.com/vadv/bonsun/actions/workflows/ci.yml/badge.svg)
+![BDD](https://github.com/vadv/bonsun/actions/workflows/bdd.yml/badge.svg?branch=main)
 ![musl-build](https://github.com/vadv/bonsun/actions/workflows/musl-build.yml/badge.svg?branch=main)
 ![security](https://github.com/vadv/bonsun/actions/workflows/security.yml/badge.svg)
 

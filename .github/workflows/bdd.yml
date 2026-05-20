@@ -1,0 +1,180 @@
+name: bdd
+
+# BDD scenarios (Phase K) are the integration gate for primitives through the
+# Starlark glue. The run is heavy (build test-base image, cucumber on 100+
+# scenarios) so it lives in a separate workflow that fires on push to main and
+# on manual dispatch. PRs go through ci.yml; maintainers trigger this before
+# merging to verify nothing in the Starlark glue or primitive impls broke the
+# scenarios.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tags:
+        description: 'Cucumber tag expression to filter scenarios (e.g. @apt-package, or "@apt-package and not @todo-skip")'
+        required: false
+        default: ''
+
+concurrency:
+  group: bdd-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+defaults:
+  run:
+    working-directory: bosun-client
+
+jobs:
+  bdd-default:
+    name: bdd (default scenarios)
+    runs-on: ubuntu-22.04
+    # The BDD pipeline needs the runr supervisor binary built from runr source.
+    # runr lives in a private gitlab repository (gitlab.ozon.ru/.../runr) and a
+    # public GitHub runner cannot clone it without credentials. The job checks
+    # the RUNR_REPO_URL organisation secret and the RUNR_DEPLOY_KEY ssh key;
+    # if either is missing the job emits a skip notice and exits clean. This
+    # lets maintainers gate the workflow on a configured private fork while
+    # still letting external contributors see a green checkmark.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify docker available
+        run: docker version
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bosun-client
+
+      - name: Check runr source availability
+        id: runr_check
+        env:
+          RUNR_REPO_URL: ${{ secrets.RUNR_REPO_URL }}
+          RUNR_DEPLOY_KEY: ${{ secrets.RUNR_DEPLOY_KEY }}
+        run: |
+          if [ -z "$RUNR_REPO_URL" ]; then
+            echo "RUNR_REPO_URL secret is not set; BDD scenarios requiring runr will be skipped"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$RUNR_DEPLOY_KEY" ]; then
+            echo "RUNR_DEPLOY_KEY secret is not set; cannot clone $RUNR_REPO_URL"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p ~/.ssh
+          echo "$RUNR_DEPLOY_KEY" > ~/.ssh/runr_id
+          chmod 600 ~/.ssh/runr_id
+          ssh-keyscan -t rsa,ecdsa,ed25519 gitlab.ozon.ru >> ~/.ssh/known_hosts 2>/dev/null || true
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/runr_id -o IdentitiesOnly=yes" \
+            git clone --depth 1 "$RUNR_REPO_URL" "$GITHUB_WORKSPACE/runr-src"
+          echo "available=true" >> "$GITHUB_OUTPUT"
+          echo "RUNR_SOURCE_DIR=$GITHUB_WORKSPACE/runr-src" >> "$GITHUB_ENV"
+
+      - name: Skip notice when runr unavailable
+        if: steps.runr_check.outputs.available != 'true'
+        run: |
+          echo "::warning::Skipping BDD: runr source not available. Set RUNR_REPO_URL and RUNR_DEPLOY_KEY secrets to enable."
+          echo "BDD scenarios depend on a real runr supervisor binary built from the runr project."
+          echo "Without it the test-base image cannot be assembled and all @docker-tagged scenarios cannot run."
+
+      - name: Build bosun (bookworm)
+        if: steps.runr_check.outputs.available == 'true'
+        run: make bosun-bookworm
+
+      - name: Build runr (bookworm)
+        if: steps.runr_check.outputs.available == 'true'
+        run: make runr-bookworm
+
+      - name: Build test-base image
+        if: steps.runr_check.outputs.available == 'true'
+        run: make docker-base
+
+      - name: Run BDD (default, excludes @systemd-privileged)
+        if: steps.runr_check.outputs.available == 'true'
+        # `make test-bdd` automatically excludes @systemd-privileged via the
+        # filtering in crates/bosun-cli/tests/bdd/main.rs unless the
+        # BDD_SYSTEMD_PRIVILEGED env var is set. If the operator passed a
+        # tags filter via workflow_dispatch we forward it.
+        env:
+          BDD_INPUT_TAGS: ${{ github.event.inputs.tags }}
+        run: |
+          if [ -n "$BDD_INPUT_TAGS" ]; then
+            make test-bdd TAGS="$BDD_INPUT_TAGS"
+          else
+            make test-bdd
+          fi
+
+  bdd-systemd-privileged:
+    name: bdd (@systemd-privileged scenarios)
+    runs-on: ubuntu-22.04
+    # @systemd-privileged scenarios run systemd as PID 1 inside
+    # `docker run --privileged --cgroupns=private`. This requires docker on
+    # the runner to allow privileged containers. Standard ubuntu-22.04 GitHub
+    # runners support this; self-hosted rootless setups do not.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify privileged docker
+        # Standard GitHub runners allow privileged containers; this probe
+        # surfaces the failure mode early when the host doesn't.
+        run: |
+          docker run --rm --privileged debian:bookworm-slim true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bosun-client
+
+      - name: Check runr source availability
+        id: runr_check
+        env:
+          RUNR_REPO_URL: ${{ secrets.RUNR_REPO_URL }}
+          RUNR_DEPLOY_KEY: ${{ secrets.RUNR_DEPLOY_KEY }}
+        run: |
+          if [ -z "$RUNR_REPO_URL" ] || [ -z "$RUNR_DEPLOY_KEY" ]; then
+            echo "RUNR_REPO_URL / RUNR_DEPLOY_KEY not set; skipping privileged BDD"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mkdir -p ~/.ssh
+          echo "$RUNR_DEPLOY_KEY" > ~/.ssh/runr_id
+          chmod 600 ~/.ssh/runr_id
+          ssh-keyscan -t rsa,ecdsa,ed25519 gitlab.ozon.ru >> ~/.ssh/known_hosts 2>/dev/null || true
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/runr_id -o IdentitiesOnly=yes" \
+            git clone --depth 1 "$RUNR_REPO_URL" "$GITHUB_WORKSPACE/runr-src"
+          echo "available=true" >> "$GITHUB_OUTPUT"
+          echo "RUNR_SOURCE_DIR=$GITHUB_WORKSPACE/runr-src" >> "$GITHUB_ENV"
+
+      - name: Skip notice when runr unavailable
+        if: steps.runr_check.outputs.available != 'true'
+        run: |
+          echo "::warning::Skipping privileged BDD: runr source not available."
+
+      - name: Build bosun (bookworm)
+        if: steps.runr_check.outputs.available == 'true'
+        run: make bosun-bookworm
+
+      - name: Build runr (bookworm)
+        if: steps.runr_check.outputs.available == 'true'
+        run: make runr-bookworm
+
+      - name: Build test-base image
+        if: steps.runr_check.outputs.available == 'true'
+        run: make docker-base
+
+      - name: Run BDD (@systemd-privileged only)
+        if: steps.runr_check.outputs.available == 'true'
+        run: make test-bdd-systemd
