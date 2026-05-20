@@ -50,6 +50,51 @@ fn docker_run_detached(image: &str) -> anyhow::Result<String> {
     Ok(id)
 }
 
+/// Поднять контейнер, в котором PID 1 — это `/lib/systemd/systemd`.
+/// Используется только `@systemd-privileged` сценариями. Требует
+/// `docker --privileged` (host cap'ы) и `--cgroupns=private`, чтобы
+/// systemd создал свою иерархию cgroup'ов внутри контейнера. Без этих
+/// флагов systemd падает на mount(/sys/fs/cgroup, ...) либо не получает
+/// доступ к unit-файлам.
+///
+/// Возвращает container id; контейнер запущен в detached-режиме. Вызывающий
+/// должен дополнительно дождаться готовности systemd через
+/// `wait_for_systemd_ready` (boot занимает ~3-5 секунд на холодном bookworm).
+pub fn docker_run_systemd(image: &str) -> anyhow::Result<String> {
+    let output = Command::new("docker")
+        .args([
+            "run",
+            "-d",
+            "--rm",
+            "--privileged",
+            "--cgroupns=private",
+            "--tmpfs",
+            "/run",
+            "--tmpfs",
+            "/tmp",
+            "--stop-signal=SIGRTMIN+3",
+            "-w",
+            CONTAINER_WORKDIR,
+            image,
+            "/lib/systemd/systemd",
+            "--system",
+            "--unit=multi-user.target",
+        ])
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "docker run (systemd) failed: {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let id = String::from_utf8(output.stdout)?.trim().to_string();
+    if id.is_empty() {
+        anyhow::bail!("docker run (systemd) returned empty container id");
+    }
+    Ok(id)
+}
+
 /// Остановить контейнер (best-effort).
 pub fn docker_kill(container_id: &str) {
     let _ = Command::new("docker")
@@ -107,7 +152,7 @@ pub fn docker_exec_args(container_id: &str, args: &[&str]) -> anyhow::Result<Doc
 }
 
 /// Сделать `chmod +x` для bosun внутри контейнера.
-fn install_bosun_binary(container_id: &str, host_binary: &Path) -> anyhow::Result<()> {
+pub fn install_bosun_binary(container_id: &str, host_binary: &Path) -> anyhow::Result<()> {
     docker_cp_into(container_id, host_binary, "/usr/local/bin/bosun")?;
     let res = docker_exec_args(container_id, &["chmod", "+x", "/usr/local/bin/bosun"])?;
     if res.exit_code != 0 {

@@ -78,12 +78,24 @@ impl SystemdManager {
     /// becomes true for a unit whose on-disk file has changed since the
     /// daemon last loaded it). Callers typically resolve the answer for a
     /// single hot unit and call `daemon_reload()` once if any return true.
+    ///
+    /// If the unit is not yet loaded (systemd has never seen it), `GetUnit`
+    /// returns `NoSuchUnit`. We map that to `Ok(false)`: there is no stale
+    /// in-memory state to refresh — the next `StartUnit` will load the unit
+    /// from disk. This matches the production scenario where `file.content`
+    /// has just rendered the unit file and bosun's apply path then calls
+    /// `systemd.service`.
     pub async fn needs_daemon_reload(&self, unit_name: &str) -> Result<bool, SystemdError> {
-        let unit_path = self
-            .proxy
-            .get_unit(unit_name.to_string())
-            .await
-            .map_err(|err| SystemdError::from_zbus(err, "needs_daemon_reload", unit_name))?;
+        let unit_path = match self.proxy.get_unit(unit_name.to_string()).await {
+            Ok(p) => p,
+            Err(err) => {
+                let mapped = SystemdError::from_zbus(err, "needs_daemon_reload", unit_name);
+                if matches!(mapped, SystemdError::NoSuchUnit(_)) {
+                    return Ok(false);
+                }
+                return Err(mapped);
+            }
+        };
         let unit_proxy = UnitProxy::new(&self.conn, unit_path)
             .await
             .map_err(|err| SystemdError::from_zbus(err, "needs_daemon_reload", unit_name))?;

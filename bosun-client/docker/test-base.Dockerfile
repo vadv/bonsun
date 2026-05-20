@@ -19,10 +19,11 @@ FROM debian:bookworm-slim
 #   payload defer-файлов в шагах сценария.
 # - openssl → проверка cert.tls сертификатов (CN, validity) без
 #   зависимости от Rust-парсера.
-# - dbus-daemon + python3-dbusmock — заготовка для systemd.service-сценариев,
-#   которые требуют поднятого system bus с mock'ом org.freedesktop.systemd1.
-#   Без --privileged настоящий systemd в контейнере не запустится, но mock
-#   через dbus-daemon --system работает.
+# - dbus-daemon — system bus, через который bosun-systemd-client общается с
+#   PID 1. systemd-as-PID1 поднимается только в @systemd-privileged
+#   сценариях (см. test-bdd-systemd); обычный test-bdd запускает контейнер
+#   с `tail -f /dev/null`, dbus-daemon никем не используется, но пакет
+#   остаётся, чтобы systemd-в-PID1-режиме мог стартовать без доустановки.
 # - postgresql-client (psql) — для pg_sql.exec/pg_sql.query сценариев,
 #   когда docker-compose поднимает реальный postgres рядом.
 # - runr: настоящий supervisor-демон из локального проекта runr. Бинарь
@@ -33,7 +34,7 @@ FROM debian:bookworm-slim
 #   проверяют реальные ответы HTTP API на 127.0.0.1:8010.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-    ca-certificates curl python3 python3-dbusmock \
+    ca-certificates curl python3 \
     dbus dbus-bin dbus-user-session \
     procps psmisc passwd \
     gnupg2 jq openssl \
@@ -54,5 +55,13 @@ RUN apt-get update \
 COPY target/runr-bookworm/runr /usr/local/bin/runr
 RUN chmod +x /usr/local/bin/runr \
  && mkdir -p /etc/runr /var/log/runr
+
+# Для systemd-as-PID1-режима (`@systemd-privileged` сценарии). systemd
+# слушает SIGRTMIN+3 как «graceful exit для контейнера» — без этого
+# `docker stop` ждёт 10 секунд default-таймаута SIGTERM, прежде чем
+# отправить SIGKILL. Для обычного PID1 = `tail -f /dev/null` сигнал
+# тоже валиден (просто игнорируется), так что объявление безопасно
+# для всех сценариев.
+STOPSIGNAL SIGRTMIN+3
 
 WORKDIR /work

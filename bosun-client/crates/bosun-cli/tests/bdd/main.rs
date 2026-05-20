@@ -21,6 +21,7 @@ mod cert_helper;
 mod defers_helper;
 mod docker_helper;
 mod runr_helper;
+mod systemd_helper;
 mod users_helper;
 mod validate_helper;
 mod world;
@@ -65,6 +66,20 @@ fn main() {
             Some(existing) => Some(TagOperation::And(Box::new(existing), Box::new(not_todo))),
             None => Some(not_todo),
         };
+
+        // `@systemd-privileged` сценарии требуют privileged docker
+        // (systemd как PID 1). По умолчанию они отфильтрованы. Включить
+        // ровно их — через `make test-bdd-systemd`, который выставляет
+        // BDD_SYSTEMD_PRIVILEGED=1 и `--tags @systemd-privileged`.
+        if std::env::var("BDD_SYSTEMD_PRIVILEGED").is_err() {
+            let not_priv = TagOperation::Not(Box::new(TagOperation::Tag(
+                "systemd-privileged".to_string(),
+            )));
+            cli.tags_filter = match cli.tags_filter.take() {
+                Some(existing) => Some(TagOperation::And(Box::new(existing), Box::new(not_priv))),
+                None => Some(not_priv),
+            };
+        }
 
         let bin_for_init = bin.clone();
         let writer = BosunWorld::cucumber()

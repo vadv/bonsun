@@ -1,5 +1,5 @@
-.PHONY: build test test-unit test-bdd docker-base bosun-bookworm runr-bookworm fmt clippy \
-        musl-x86_64 musl-aarch64 musl-docker musl-verify
+.PHONY: build test test-unit test-bdd test-bdd-systemd docker-base bosun-bookworm \
+        runr-bookworm fmt clippy musl-x86_64 musl-aarch64 musl-docker musl-verify
 
 BUILD_PROFILE ?= release
 BOSUN_TEST_IMAGE ?= bosun-test-base:latest
@@ -71,6 +71,21 @@ test-bdd: runr-bookworm docker-base bosun-bookworm
 	BOSUN_TEST_IMAGE=$(BOSUN_TEST_IMAGE) \
 	BOSUN_BINARY=$(CURDIR)/target/bookworm-release/bosun \
 	cargo test -p bosun-cli --features bdd --test bdd --release -- $(if $(TAGS),--tags '$(TAGS)',)
+
+# Сценарии `@systemd-privileged` запускают настоящий systemd как PID 1
+# в `docker run --privileged --cgroupns=private`. Обычный `test-bdd`
+# отфильтровывает их, чтобы сборка работала и без privileged-docker
+# (например, в rootless-CI). Эта цель ставит флаг и фильтрует обратно
+# только эти сценарии — остальные skip'аются.
+#
+# Требует: docker, имеющий право поднимать privileged-контейнеры на
+# host'е (rootless docker не подходит — systemd сам монтирует tmpfs
+# в /sys/fs/cgroup внутри namespace'а).
+test-bdd-systemd: runr-bookworm docker-base bosun-bookworm
+	BOSUN_TEST_IMAGE=$(BOSUN_TEST_IMAGE) \
+	BOSUN_BINARY=$(CURDIR)/target/bookworm-release/bosun \
+	BDD_SYSTEMD_PRIVILEGED=1 \
+	cargo test -p bosun-cli --features bdd --test bdd --release -- --tags '@systemd-privileged'
 
 # Статический musl-бинарь под x86_64. Требует на сборочной машине
 # `musl-tools` (Debian/Ubuntu) или `musl-dev` (Alpine). На target-узле

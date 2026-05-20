@@ -68,6 +68,12 @@ pub struct BosunWorld {
     /// PID до restart», поскольку реальный runr не инкрементит счётчик
     /// `restarts` на манульные API-вызовы (см. runr_helper).
     pub runr_pid_snapshots: std::collections::HashMap<String, u32>,
+    /// Снимки InvocationID systemd-юнитов из шага
+    /// `Given I remember InvocationID of systemd unit "<name>" as "<label>"`.
+    /// Symmetric для runr_pid_snapshots: bosun apply должен сменить
+    /// InvocationID при restart, и сценарий проверяет это через
+    /// `InvocationID of systemd unit ... differs from ...`.
+    pub systemd_invocation_snapshots: std::collections::HashMap<String, String>,
 }
 
 impl std::fmt::Debug for BosunWorld {
