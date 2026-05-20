@@ -1,0 +1,18 @@
+# cargo-audit configuration for bosun-client.
+#
+# Runs in CI via .github/workflows/security.yml. Local check:
+#   cd bosun-client && cargo audit
+#
+# cargo-audit читает этот файл из текущей рабочей директории, отдельно от
+# deny.toml. Поведение и ignore-список здесь дублируют то, что уже стоит
+# в deny.toml[advisories] — но cargo-audit не знает про cargo-deny.
+
+[advisories]
+# RSA Marvin Attack timing sidechannel — нет fixed upgrade со стороны
+# upstream `rsa` (на 2026-05-20). cert.tls использует rsa только для
+# генерации self-signed key inside bosun-client, без передачи private key
+# ненадёжной стороне и без timing-sensitive операций над приватным ключом.
+# Если upstream выпустит fix — убрать из ignore и пересобрать.
+ignore = [
+    "RUSTSEC-2023-0071",
+]
