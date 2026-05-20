@@ -23,7 +23,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Build static musl binary in rust:alpine
         # `make musl-docker` builds bosun inside rust:1-alpine; the host needs
