@@ -3,9 +3,20 @@
 //! Шаги:
 //! 1. Загрузить bundle (читает bundle.toml, валидирует entry через path_safety).
 //! 2. Прочитать --facts JSON в FactsSnapshot (если задан); иначе пустой.
-//! 3. Создать Evaluator с моками primitive'ов (они только регистрируют
-//!    Resource, не делают plan/apply).
-//! 4. Выполнить evaluate_manifest.
+//! 3. Создать Evaluator с **продакшен-набором** примитивов — те же
+//!    `build_primitives()` из `run`. На фазе evaluate_manifest вызывается
+//!    только `Primitive::build_payload` (см. `register_primitive_call` в
+//!    starlark_glue), который не делает сетевых вызовов и не лезет в систему,
+//!    но строго валидирует kwargs: required/optional типы, диапазоны
+//!    `optional_u32`/`optional_u64`, allow-list `service.unit`. Опечатки
+//!    вроде `apt.package(name="x", versionn="1.0")` (silent drop поля) не
+//!    ловятся `build_payload`'ом, поскольку он читает только известные ему
+//!    ключи; зато ловятся все ошибки типов и обязательных параметров.
+//! 4. `template_fn` — реальный `render_template` с `Strict` undefined-behavior.
+//!    С `--facts` фикстурой контекст подставляется; без — пустой объект,
+//!    и шаблон, ссылающийся на `{{ inv.X }}`, корректно валится на
+//!    UndefinedVariable. Это ловит Jinja2 syntax errors и неизвестные
+//!    переменные ДО того, как bundle поедет на ноду.
 //! 5. Распечатать «evaluate OK, N resources registered» при успехе или
 //!    диагностику при ошибке.
 //!
@@ -19,10 +30,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bosun_core::{
-    evaluate_manifest, Bundle, CallArgs, ChangeReport, Diff, EvaluatorConfig, FactValue,
-    FactsSource, PlanCtx, Primitive, PrimitiveError, Registry, Resource, ResourceKind,
+    evaluate_manifest, Bundle, EvaluatorConfig, FactValue, FactsSource, PlanCtx, Registry,
     SensitiveStore, TemplateFn,
 };
+use bosun_primitives::template::render_template;
 use tokio_util::sync::CancellationToken;
 
 use crate::args::BundleValidateArgs;
@@ -38,7 +49,14 @@ pub fn run(args: &BundleValidateArgs) -> i32 {
         eprintln!("bosun: logging init failed: {e}");
         return exit_code::CLI_ENV_ERROR;
     }
+    run_core(args)
+}
 
+/// Ядро `bundle validate` без logging-init. Выделено отдельно, чтобы юнит-тесты
+/// могли вызывать его в любом порядке: в test-binary tracing-subscriber
+/// устанавливается один раз, поэтому повторный `logging::init` всегда падает
+/// и возвращал бы `CLI_ENV_ERROR`, маскируя реальный исход validate'а.
+pub(crate) fn run_core(args: &BundleValidateArgs) -> i32 {
     let bundle = match Bundle::load_dir(&args.bundle) {
         Ok(b) => b,
         Err(e) => {
@@ -63,19 +81,49 @@ pub fn run(args: &BundleValidateArgs) -> i32 {
     tags.dedup();
     let tags: HashSet<String> = tags.into_iter().collect();
 
-    let primitives = build_validate_primitives();
+    // Продакшен-набор примитивов: те же, что run::apply. evaluate_manifest
+    // вызывает только build_payload, который не лезет в систему, поэтому
+    // pg_sql и apt без реальной БД и apt-get тут безопасны.
+    let primitives = crate::run::build_primitives();
     let registry = Rc::new(RefCell::new(Registry::new()));
     let plan_ctx = PlanCtx::new(
         Instant::now() + Duration::from_secs(60),
         CancellationToken::new(),
     );
-    let template_fn: TemplateFn =
-        Rc::new(|_resolved: &Path, _path: &str, _ctx: &serde_json::Value| {
-            // Validate не рендерит шаблоны (нет inv/facts полного), отдаёт
-            // заглушку. Если bundle обязательно вызывает template() — пройдёт,
-            // но содержимое будет пустым; это OK для статической проверки.
-            Ok(String::new())
-        });
+
+    // Материализуем facts из fixture в плоский JSON-объект для шаблонов
+    // (`{{ inv.facts.X }}` через render_template принимает facts отдельным
+    // аргументом). Без --facts всё равно пустой объект — Strict undefined
+    // тогда поймает любой шаблон, обращающийся к `{{ inv.foo }}`, что и есть
+    // желаемое поведение: оператор сразу видит, что bundle ожидает inventory.
+    let facts_json_for_templates =
+        serde_json::Value::Object(facts_snapshot.clone().into_iter().collect());
+    let template_fn: TemplateFn = Rc::new(
+        move |resolved_path: &Path, _rel: &str, ctx: &serde_json::Value| {
+            // resolved_path — абсолютный канонический путь шаблона в роли.
+            // render_template ожидает (templates_root, relative): разбиваем
+            // на parent + file_name.
+            let parent = resolved_path.parent().ok_or_else(|| {
+                anyhow::anyhow!("template: resolved path has no parent: {resolved_path:?}")
+            })?;
+            let file_name = resolved_path
+                .file_name()
+                .ok_or_else(|| anyhow::anyhow!("template: resolved path has no file name"))?
+                .to_string_lossy()
+                .into_owned();
+            // `inv` для шаблона: совпадает с продакшен-семантикой из run.rs.
+            // Если ctx — объект с ключом `inv`, берём `ctx.inv`; иначе ctx
+            // целиком кладётся как `inv`. Это даёт совместимость с
+            // legacy-шаблонами (`{{ inv.foo }}`) и новым стилем
+            // (`template(..., inv = inv)`).
+            let inv_value = match ctx {
+                serde_json::Value::Object(m) if m.contains_key("inv") => m["inv"].clone(),
+                other => other.clone(),
+            };
+            render_template(parent, &file_name, &inv_value, &facts_json_for_templates)
+                .map_err(|e| anyhow::anyhow!(e))
+        },
+    );
 
     let facts_rc: Rc<dyn FactsSource> = Rc::new(FixtureFacts {
         values: facts_snapshot,
@@ -146,127 +194,16 @@ impl FactsSource for FixtureFacts {
     }
 }
 
-/// Mock-набор примитивов для validate. Регистрируют payload, не делают
-/// plan/apply (валидация не запускает оркестратор). Состав совпадает с
-/// продакшен-набором из `run::build_primitives` плюс runr.service /
-/// systemd.service, к которым диспатчит абстрактный `service.unit`.
-fn build_validate_primitives() -> HashMap<ResourceKind, Box<dyn Primitive>> {
-    let mut m: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
-    m.insert(
-        ResourceKind::from_static("apt.key"),
-        Box::new(NoopPrimitive {
-            kind: "apt.key",
-            identity_keys: &["name"],
-        }),
-    );
-    m.insert(
-        ResourceKind::from_static("apt.package"),
-        Box::new(NoopPrimitive {
-            kind: "apt.package",
-            identity_keys: &["name"],
-        }),
-    );
-    m.insert(
-        ResourceKind::from_static("apt.update_cache"),
-        Box::new(NoopPrimitive {
-            kind: "apt.update_cache",
-            identity_keys: &["name"],
-        }),
-    );
-    m.insert(
-        ResourceKind::from_static("file.content"),
-        Box::new(NoopPrimitive {
-            kind: "file.content",
-            identity_keys: &["path"],
-        }),
-    );
-    m.insert(
-        ResourceKind::from_static("runr.service"),
-        Box::new(NoopPrimitive {
-            kind: "runr.service",
-            identity_keys: &["name"],
-        }),
-    );
-    m.insert(
-        ResourceKind::from_static("systemd.service"),
-        Box::new(NoopPrimitive {
-            kind: "systemd.service",
-            identity_keys: &["name"],
-        }),
-    );
-    m.insert(
-        ResourceKind::from_static("process.signal"),
-        Box::new(NoopPrimitive {
-            kind: "process.signal",
-            identity_keys: &["name"],
-        }),
-    );
-    m.insert(
-        ResourceKind::from_static("sysctl.reload"),
-        Box::new(NoopPrimitive {
-            kind: "sysctl.reload",
-            identity_keys: &["name"],
-        }),
-    );
-    m.insert(
-        ResourceKind::from_static("cert.tls"),
-        Box::new(NoopPrimitive {
-            kind: "cert.tls",
-            identity_keys: &["cert_path"],
-        }),
-    );
-    m
-}
-
-struct NoopPrimitive {
-    kind: &'static str,
-    identity_keys: &'static [&'static str],
-}
-
-impl Primitive for NoopPrimitive {
-    fn type_name(&self) -> ResourceKind {
-        ResourceKind::from_static(self.kind)
-    }
-    fn identity_keys(&self) -> &'static [&'static str] {
-        self.identity_keys
-    }
-    fn build_payload(
-        &self,
-        args: &CallArgs,
-        _ctx: &PlanCtx,
-    ) -> Result<serde_json::Value, PrimitiveError> {
-        // Возвращаем простой JSON-снимок identity-ключей, чтобы Resource
-        // прошёл валидацию Registry.
-        let mut out = serde_json::Map::new();
-        for key in self.identity_keys {
-            let v = args.required_str(key).map_err(|e| {
-                PrimitiveError::InvalidPayload(format!("{kind}: {e}", kind = self.kind))
-            })?;
-            out.insert((*key).to_string(), serde_json::Value::String(v));
-        }
-        Ok(serde_json::Value::Object(out))
-    }
-    fn plan(
-        &self,
-        _resource: &Resource,
-        _facts: &dyn FactsSource,
-        _ctx: &PlanCtx,
-    ) -> Result<Diff, PrimitiveError> {
-        Ok(Diff::NoChange)
-    }
-    fn apply(
-        &self,
-        _resource: &Resource,
-        _diff: &Diff,
-        _ctx: &bosun_core::ApplyCtx,
-    ) -> Result<ChangeReport, PrimitiveError> {
-        Ok(ChangeReport::no_change())
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::panic)]
 mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+
+    use tempfile::TempDir;
+
+    use crate::args::BundleValidateArgs;
+
     use super::*;
 
     #[test]
@@ -289,5 +226,158 @@ mod tests {
             FactValue::Unknown { .. } => {}
             _ => panic!("expected Unknown"),
         }
+    }
+
+    /// Соберёт минимальный bundle с заданным main.star. Без ролей и шаблонов.
+    fn make_bundle(dir: &Path, main_star: &str) {
+        fs::write(
+            dir.join("bundle.toml"),
+            "[bundle]\nname = \"test\"\nversion = \"0.0.1\"\nentry = \"main.star\"\nrequires_bosun = \"^0.1\"\n",
+        )
+        .unwrap();
+        fs::write(dir.join("main.star"), main_star).unwrap();
+    }
+
+    /// Bundle с ролью r1: main.star загружает её, роль вызывает указанный код.
+    /// Если задан `template_body`, в roles/r1/templates/x.j2 кладётся этот контент.
+    fn make_bundle_with_role(dir: &Path, role_star: &str, template_body: Option<&str>) {
+        fs::write(
+            dir.join("bundle.toml"),
+            "[bundle]\nname = \"test\"\nversion = \"0.0.1\"\nentry = \"main.star\"\nrequires_bosun = \"^0.1\"\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("main.star"),
+            "load(\"@roles/r1\", configure_r1 = \"configure\")\nconfigure_r1()\n",
+        )
+        .unwrap();
+        let role_dir = dir.join("roles").join("r1");
+        fs::create_dir_all(&role_dir).unwrap();
+        fs::write(role_dir.join("main.star"), role_star).unwrap();
+        if let Some(body) = template_body {
+            let templates_dir = role_dir.join("templates");
+            fs::create_dir_all(&templates_dir).unwrap();
+            fs::write(templates_dir.join("x.j2"), body).unwrap();
+        }
+    }
+
+    fn args_for(bundle: PathBuf) -> BundleValidateArgs {
+        BundleValidateArgs {
+            bundle,
+            facts: None,
+            tags: Vec::new(),
+        }
+    }
+
+    /// build_payload реальной AptPrimitive требует `name` строкой. Если
+    /// оператор пишет `apt.package(name = 42)` — это WrongType, validate
+    /// обязан вернуть EVAL_ERROR. До перехода на реальные примитивы
+    /// NoopPrimitive принимал любой тип.
+    #[test]
+    fn validate_rejects_wrong_type_for_required_kwarg() {
+        let tmp = TempDir::new().unwrap();
+        make_bundle(
+            tmp.path(),
+            "load(\"@bosun/builtins\", \"apt\")\napt.package(name = 42)\n",
+        );
+        let code = run_core(&args_for(tmp.path().to_path_buf()));
+        assert_eq!(
+            code,
+            exit_code::EVAL_ERROR,
+            "validate должен поймать wrong type для apt.package(name=int)",
+        );
+    }
+
+    /// Без `name` apt.package должен падать как InvalidPayload (required arg).
+    #[test]
+    fn validate_rejects_missing_required_kwarg() {
+        let tmp = TempDir::new().unwrap();
+        make_bundle(
+            tmp.path(),
+            "load(\"@bosun/builtins\", \"apt\")\napt.package(version = \"1.0.0\")\n",
+        );
+        let code = run_core(&args_for(tmp.path().to_path_buf()));
+        assert_eq!(
+            code,
+            exit_code::EVAL_ERROR,
+            "validate должен поймать отсутствие required name",
+        );
+    }
+
+    /// `service.unit` строго проверяет allow-list kwargs. Опечатка типа
+    /// `cgroup_procs_path` (runr-only) на service.unit должна валиться
+    /// reject_unexpected_service_unit_kwargs до build_payload'а.
+    #[test]
+    fn validate_rejects_unexpected_kwarg_on_service_unit() {
+        let tmp = TempDir::new().unwrap();
+        make_bundle(
+            tmp.path(),
+            "load(\"@bosun/builtins\", \"service\")\nservice.unit(name = \"nginx\", cgroup_procs_path = \"/sys/fs/cgroup/nginx\")\n",
+        );
+        // Без --tags активных тэгов нет, но service.unit вызывается на top-level,
+        // так что reject_unexpected_service_unit_kwargs срабатывает до диспатча
+        // в init-specific примитив.
+        let code = run_core(&args_for(tmp.path().to_path_buf()));
+        assert_eq!(
+            code,
+            exit_code::EVAL_ERROR,
+            "service.unit должен отвергать unexpected kwarg",
+        );
+    }
+
+    /// Jinja2 syntax error в шаблоне должен ловиться render_template'ом
+    /// при evaluate_manifest. До фикса template_fn возвращал пустую строку,
+    /// и любой syntax error проходил «evaluate OK».
+    /// template() вызывается из роли (из entry-манифеста запрещён by spec).
+    #[test]
+    fn validate_rejects_jinja_syntax_error_in_template() {
+        let tmp = TempDir::new().unwrap();
+        make_bundle_with_role(
+            tmp.path(),
+            "load(\"@bosun/builtins\", \"file\", \"template\")\n\ndef configure():\n    file.content(path = \"/etc/x.conf\", contents = template(\"x.j2\"), mode = 0o644)\n",
+            Some("broken {{ unclosed"),
+        );
+        let code = run_core(&args_for(tmp.path().to_path_buf()));
+        assert_eq!(
+            code,
+            exit_code::EVAL_ERROR,
+            "validate должен поймать jinja syntax error",
+        );
+    }
+
+    /// Strict undefined: шаблон ссылается на `{{ inv.foo }}` без fixture —
+    /// должен валиться UndefinedVariable. Это даёт оператору раннюю обратную
+    /// связь: «bundle ожидает inventory, прогони validate с --facts».
+    #[test]
+    fn validate_rejects_undefined_variable_in_template_without_fixture() {
+        let tmp = TempDir::new().unwrap();
+        make_bundle_with_role(
+            tmp.path(),
+            "load(\"@bosun/builtins\", \"file\", \"template\")\n\ndef configure():\n    file.content(path = \"/etc/x.conf\", contents = template(\"x.j2\"), mode = 0o644)\n",
+            Some("{{ inv.foo }}"),
+        );
+        let code = run_core(&args_for(tmp.path().to_path_buf()));
+        assert_eq!(
+            code,
+            exit_code::EVAL_ERROR,
+            "validate без fixture должен ловить undefined inv.foo",
+        );
+    }
+
+    /// Минимальный sanity-check: корректный bundle без шаблонов — evaluate OK.
+    /// Защита от «всегда возвращаем EVAL_ERROR».
+    #[test]
+    fn validate_accepts_well_formed_bundle() {
+        let tmp = TempDir::new().unwrap();
+        make_bundle(
+            tmp.path(),
+            "load(\"@bosun/builtins\", \"apt\")\napt.package(name = \"curl\")\n",
+        );
+        let code = run_core(&args_for(tmp.path().to_path_buf()));
+        assert_eq!(
+            code,
+            exit_code::SUCCESS,
+            "корректный bundle должен возвращать SUCCESS",
+        );
     }
 }

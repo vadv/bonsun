@@ -500,7 +500,7 @@ fn materialize_facts_json(snapshot: &bosun_facts::FactsSnapshot) -> serde_json::
     serde_json::Value::Object(map)
 }
 
-fn build_primitives() -> HashMap<ResourceKind, Box<dyn Primitive>> {
+pub(crate) fn build_primitives() -> HashMap<ResourceKind, Box<dyn Primitive>> {
     let mut m: HashMap<ResourceKind, Box<dyn Primitive>> = HashMap::new();
     m.insert(
         ResourceKind::from_static("apt.key"),
