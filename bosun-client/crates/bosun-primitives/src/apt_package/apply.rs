@@ -509,11 +509,18 @@ mod tests {
     }
 
     fn make_ctx(log_dir: std::path::PathBuf) -> ApplyCtx {
-        // Журнал defers — фиксированная директория на tmpfs. apt.package
-        // не enqueue'ит defers, журнал нужен только для удовлетворения
-        // сигнатуры конструктора.
-        let defers_root = std::env::temp_dir().join("bosun-apt-test-defers");
-        let defers = Arc::new(bosun_core::defers::Journal::open(&defers_root).unwrap());
+        // Журнал defers — отдельный tempdir на каждый тест. apt.package
+        // не enqueue'ит defers, журнал нужен только для сигнатуры конструктора.
+        // Раньше путь был фиксирован в /tmp/bosun-apt-test-defers — это
+        // ловило race на CI, когда параллельные тесты пытались владеть
+        // одним и тем же journal'ом одновременно.
+        let defers_dir = tempfile::tempdir().unwrap();
+        let defers = Arc::new(bosun_core::defers::Journal::open(defers_dir.path()).unwrap());
+        // tempdir live'нет до конца теста через RAII Drop; tempfile::TempDir
+        // удалит директорию когда переменная выйдет из scope. Здесь мы
+        // намеренно её leak'аем через Box::leak, потому что journal держит
+        // PathBuf и должен иметь access на всё время apply.
+        Box::leak(Box::new(defers_dir));
         ApplyCtx::new(
             Instant::now() + Duration::from_secs(600),
             CancellationToken::new(),

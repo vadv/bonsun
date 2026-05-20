@@ -40,7 +40,13 @@ jobs:
           tool: cargo-audit
 
       - name: Run cargo audit
-        run: cargo audit
+        # RUSTSEC-2023-0071 (rsa Marvin Attack) пока без upstream fix.
+        # cert.tls использует rsa только для локальной генерации self-signed
+        # keys без timing-sensitive операций над untrusted input. Когда
+        # upstream выпустит fix — убрать --ignore синхронно с audit.toml и
+        # deny.toml. cargo-audit не всегда подхватывает audit.toml из CWD —
+        # дублируем через CLI флаг для надёжности.
+        run: cargo audit --ignore RUSTSEC-2023-0071
 
   deny:
     name: cargo deny
