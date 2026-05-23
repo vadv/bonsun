@@ -394,15 +394,30 @@ CREATE TABLE bosun_pods (
     last_ping_at   TIMESTAMPTZ NOT NULL,
     draining       BOOLEAN NOT NULL DEFAULT FALSE
 );
+
+-- Кто сейчас держит роль фонового worker'а (rollout dispatcher и т.п.).
+-- Лидерство персистится в таблице через expires_at + heartbeat, чтобы
+-- замороженного/убитого лидера соседи перехватили по таймауту.
+-- pg_try_advisory_xact_lock внутри UPSERT-транзакции защищает от гонки
+-- двух кандидатов одновременно.
+CREATE TABLE bosun_leader (
+    role            TEXT PRIMARY KEY,                 -- 'rollout_worker', будущие роли сюда же
+    pod_id          TEXT NOT NULL,
+    acquired_at     TIMESTAMPTZ NOT NULL,
+    last_heartbeat  TIMESTAMPTZ NOT NULL,
+    expires_at      TIMESTAMPTZ NOT NULL              -- сосед может перехватить если истёк
+);
 ```
 
 `bosun_clients` обновляется на четырёх путях:
-- `GetTargetVersion` → `UPDATE last_seen_at = NOW(), bosun_version = $1`.
-- `ReportApplyResult(success=true)` → `UPDATE last_applied_version, last_applied_at, last_seen_at`.
+- `GetTargetVersion` → `UPDATE last_seen_at = NOW(), bosun_version = $1`. Поля last_applied_* НЕ трогаются — это просто heartbeat, факт «клиент жив», без подтверждения apply.
+- `ReportApplyResult` (единственный источник истины про apply) → `UPDATE last_applied_version = $1, last_applied_success = $2, last_applied_at = NOW(), last_seen_at = NOW()`. Записывается ровно тот результат, который репортнул клиент — true при успехе apply, false при ошибке. Никакая другая ручка last_applied_success не меняет.
 - `Bootstrap` → `INSERT ON CONFLICT DO UPDATE last_seen_at, created_at` (если новый host).
 - `SetTargetVersion` → `UPDATE target_version` для матча Target.
 
-Никаких bosun_heartbeats, bosun_active_sessions, bosun_commands_queue, bosun_rollouts. Если позже понадобится дополнительная метрика — добавляется колонкой в `bosun_clients`.
+Никаких bosun_heartbeats, bosun_active_sessions, bosun_commands_queue. `bosun_rollouts` сохранён для server-driven постепенной раскатки. Если позже понадобится дополнительная метрика — добавляется колонкой в `bosun_clients`.
+
+**Семантика last_applied_success для rollout-учёта.** Клиент, который не вызвал ReportApplyResult (молчит, или ещё не успел докатить), не входит ни в succeeded, ни в failed — только в pending (`target_version >= rollout.target_version AND (last_applied_version IS NULL OR last_applied_version < rollout.target_version)`). Это сознательно: мы не угадываем по heartbeat, что клиент «наверное успешно применил» — только явное подтверждение.
 
 ## Lifecycle bosun-client
 
@@ -439,9 +454,10 @@ CREATE TABLE bosun_pods (
    → возврат rollout_id, total_targets=1500
 
 3. Background worker (один на chiit-server, leader-elected через
-   advisory_lock) каждую минуту:
+   bosun_leader heartbeat, см. ниже) каждую минуту:
    a) Берёт running rollouts.
-   b) Для каждого считает по bosun_clients:
+   b) Для каждого считает по bosun_clients (cumulative с rollout.started_at,
+      БЕЗ скользящего окна):
       - dispatched = COUNT(target_version >= rollout.target_version
                            AND host IN cohort)
       - succeeded  = COUNT(last_applied_version = rollout.target_version
@@ -450,12 +466,17 @@ CREATE TABLE bosun_pods (
       - failed     = COUNT(last_applied_version = rollout.target_version
                            AND last_applied_success = false
                            AND host IN cohort)
+      - pending    = dispatched - succeeded - failed
       - failure_rate = failed / (succeeded + failed)
+        (если succeeded+failed = 0 → failure_rate считается 0)
    c) Если failure_rate > max_failure_rate:
       UPDATE bosun_rollouts SET state='halted',
                                 halted_at=NOW(),
                                 halt_reason='...'
-      (новые батчи не dispatch'ятся; уже dispatched клиенты дойдут сами)
+      Halt означает «новые батчи target_version не апдейтятся». Уже
+      dispatched клиенты доедут до новой версии сами — их target_version
+      назад НЕ откатывается. Откат — только явный новый rollout оператора
+      с target_version=N-1 (и тоже постепенно).
    d) Иначе:
       expected = total_targets * elapsed / over_duration
       diff = expected - dispatched
@@ -487,9 +508,11 @@ CREATE TABLE bosun_pods (
    max_failure_rate. Один rollout = один severity класс.
 ```
 
-Failure-rate halt автоматический (server-side), при превышении max_failure_rate worker сам переходит в halted и больше target_version'ов не апдейтит. Уже dispatched клиенты доедут (они уже знают target=42 из своего pull). Если оператор хочет вернуть назад — Abort + новый rollout с target_version=41.
+Failure-rate halt автоматический (server-side), но НЕ мгновенный: проверка происходит на тике worker'а (раз в минуту). Между тиками могут уйти ещё какие-то клиенты на новую версию — это сознательный компромисс, потому что попытка делать halt в реальном времени требовала бы реактивных триггеров на каждый ReportApplyResult, что усложняет систему и даёт ложные срабатывания на флапающих клиентах.
 
-Альтернатива (ручной точечный override): `SetTargetVersion(host=N1, target_version=41)` — без rollout state-machine, мгновенный UPDATE.
+При halt уже dispatched клиенты доедут (они уже знают target=42 из своего pull). Их target_version назад НЕ откатывается — откат не тривиален и не безопасен (cluster patroni может потерять кворум, secret в bundle уже мог быть применён, runr-задачи запущены). Если оператор хочет вернуть назад — Abort halted rollout + новый rollout с target_version=41 (тоже постепенный, тоже с failure-rate halt).
+
+Альтернатива (ручной точечный override на одной ноде, не для массового rollback): `SetTargetVersion(host=N1, target_version=41)` — мгновенный UPDATE, без rollout state-machine. Только для emergency и debug одной ноды.
 
 ### State machine rollout
 
@@ -577,7 +600,65 @@ chiit-server/
 
 ### Что сохраняется как rollout-state-machine
 
-`bosun_rollouts` остаётся (одна строка на rollout, не per-host), `IssueRollout` + `GetRolloutStatus` + `Pause/Resume/Abort` остаются. Background worker (один лидер на chiit-server через advisory_lock) расширяет cohort через UPDATE bosun_clients, считает actual failure rate из агрегата bosun_clients и при превышении max_failure_rate переходит в halted. Никакого per-host commands_queue.
+`bosun_rollouts` остаётся (одна строка на rollout, не per-host), `IssueRollout` + `GetRolloutStatus` + `Pause/Resume/Abort` остаются. Background worker (один лидер на chiit-server через bosun_leader heartbeat-table, см. раздел «Leader election» ниже) расширяет cohort через UPDATE bosun_clients, считает actual failure rate из агрегата bosun_clients (cumulative с started_at) и при превышении max_failure_rate переходит в halted. Никакого per-host commands_queue.
+
+## Leader election для фонового worker'а
+
+Источник истины — таблица `bosun_leader` с `expires_at` и `last_heartbeat`. `pg_try_advisory_xact_lock` используется как короткий mutex на время UPSERT'а (transaction-scoped, безопасен через pooler — лок живёт только до COMMIT и освобождается автоматически).
+
+### Алгоритм candidate (каждые 10s в каждом pod'е)
+
+```sql
+BEGIN;
+  -- защита от одновременного UPSERT'а двух кандидатов
+  IF NOT pg_try_advisory_xact_lock(hashtext('bosun_leader:rollout_worker')) THEN
+    ROLLBACK;
+    -- сосед сейчас претендует, тихо ждём следующего тика
+    continue;
+  END IF;
+
+  -- проверяем кто сейчас лидер (внутри той же tx)
+  SELECT pod_id, expires_at FROM bosun_leader WHERE role='rollout_worker';
+
+  IF строка отсутствует OR expires_at < NOW() OR pod_id = $self_pod THEN
+    INSERT INTO bosun_leader (role, pod_id, acquired_at, last_heartbeat, expires_at)
+    VALUES ('rollout_worker', $self_pod, NOW(), NOW(), NOW() + INTERVAL '30 seconds')
+    ON CONFLICT (role) DO UPDATE
+      SET pod_id = EXCLUDED.pod_id,
+          acquired_at = CASE WHEN bosun_leader.pod_id = EXCLUDED.pod_id
+                              THEN bosun_leader.acquired_at  -- продление, не новый старт
+                              ELSE EXCLUDED.acquired_at
+                          END,
+          last_heartbeat = EXCLUDED.last_heartbeat,
+          expires_at = EXCLUDED.expires_at;
+    -- self стал/остался лидером
+  ELSE
+    -- pod_id != self AND expires_at > NOW() → чужой лидер активен, ждём
+    null;
+  END IF;
+COMMIT;  -- xact_lock освобождается с концом транзакции
+```
+
+### Heartbeat действующего лидера (каждые 10s, только если self уже лидер)
+
+```sql
+UPDATE bosun_leader
+   SET last_heartbeat = NOW(),
+       expires_at = NOW() + INTERVAL '30 seconds'
+ WHERE role = 'rollout_worker' AND pod_id = $self_pod;
+-- если 0 rows updated → лидерство потеряно (сосед перехватил по таймауту),
+-- worker переходит обратно в candidate-режим.
+```
+
+### Поведение под нагрузкой
+
+- Лидер заморожен / убит / pod уехал в drain: heartbeat не идёт → expires_at истекает через 30s → сосед на следующем candidate-тике видит `expires_at < NOW()` и захватывает роль.
+- Один UPSERT в транзакции: гарантия что одновременно две строки `bosun_leader` не появятся, потому что PRIMARY KEY на `role`.
+- xact_lock защищает от race: двое одновременных кандидатов не успеют оба войти в UPSERT, второй блокируется до конца tx первого, увидит уже обновлённый pod_id и отступит.
+
+### Применимость к другим ролям
+
+Та же таблица `bosun_leader` ляжет под будущие фоновые роли (метрики, аудит, очистка old bundles). Просто новая строка с новым `role` и отдельный hashtext-ключ для xact_lock.
 
 ## Open follow-ups (P1)
 
