@@ -1,55 +1,24 @@
-# bosun-API: proto sketch P0 (9 RPC)
+# bosun-API: proto sketch P0 (pull-модель)
 
 Date: 2026-05-23
 Status: draft for discussion
 
-После research 2026-05-22 ([bosun-api-in-chiit-server.md](../research/2026-05-22-bosun-api-in-chiit-server.md)) и 2026-05-23 ([codegen-and-scratch.md](../research/2026-05-23-chiit-server-codegen-and-scratch.md)) и закрытия open-questions пользователем:
+После цепочки research/правок к концу дня 2026-05-23 модель упростилась радикально. Ключевая идея от пользователя: bundle меняется редко (10–15 раз/неделю), нет realtime-требований, серверу не нужна сложная rollout-машина. Клиент сам в цикле спрашивает «какая моя целевая версия?», если расходится — скачивает и применяет, потом репортит. Сервер один раз в редкий момент может «толкнуть» клиента ускорить проверку.
 
-- Bundle storage → PostgreSQL (`bytea` в bundle blobs table).
-- Secrets rotation → нет, как в chiit.
-- Web UI → нет, оператор через CLI с admin-token / Keycloak.
-- ECDSA-ключи bosun-агентов → совместная таблица с chiit для плавного переезда.
-- Sensitivity-маскирование на streaming → не используем (выключаем для `Subscribe`).
-- Stream interceptor для auth → protoc-gen-scratch поддерживает.
-- TLS на gRPC порту → не важен (warden закрывает в кластере).
+Это убирает целый класс проблем: command queue, leader-elected dispatcher, NOTIFY/LISTEN, multi-pod state synchronization, expansion target staleness, rollout state machine.
 
-Этот документ — proto sketch P0 ручек bosun-API. Реализуется внутри `chiit-server/api/` рядом с существующими `chiit/api.proto` и `pg_shard_manager/api.proto`.
+Старая version с push-моделью и rollouts удалена. Её можно посмотреть в истории git до коммита 08e6ea6.
 
-## Policy: bosun-server = chiit-server (бесшовный переход)
+## Архитектурные решения (зафиксированы 2026-05-22..23)
 
-Пользователь 2026-05-23:
-
-> «политика: bosun-сервер и chiit-сервер — это одно и то же. Нам нужен бесшовный переход клиентов.»
-
-То есть **никакого отдельного «bosun-server»** как сущности нет. Есть только chiit-server, в котором появляется новый API namespace `BosunAPI`. Один и тот же процесс, один deployment, одна команда сопровождения.
-
-Что это значит конкретно:
-
-- **Один и тот же `host_id` (fqdn)** в `chiit_validators` (или как там она называется). chiit-client и bosun-client делят одну запись на сервере.
-- **Общая ECDSA-ключевая инфраструктура.** Если host уже зарегистрирован как chiit-client с действующей подписью — `Bootstrap(host, registration_token)` от bosun-client'а **не** генерирует новый key. Сервер видит существующего host'а, возвращает существующий cert (или просит rotate'нуться если у chiit cert уже expired). Это и есть «бесшовный переход».
-- **Общий audit log, severity, canary state, bundle storage.** Одна нода может в transition period иметь и chiit-cron, и bosun-systemd-unit — оба обращаются к тому же серверу через свои API.
-- **Никаких миграционных скриптов «переключить host с chiit на bosun»** — оператор просто останавливает один агент и запускает другой. Сервер ничего специального не делает.
-
-Bootstrap-flow (решение 2026-05-23):
-
-```
-bosun-client при первом старте:
-  1. Если /etc/bosun/client.pem уже есть и валиден → пропустить Bootstrap.
-  2. Если /etc/chiit/client.pem есть и валиден (legacy chiit-key) →
-     скопировать его как /etc/bosun/client.pem (тот же приватный ключ
-     обслуживает chiit-client и bosun-client). Bootstrap НЕ нужен.
-  3. Иначе → Bootstrap(host, registration_token, public_key_pem).
-  4. Сервер проверяет registration_token (валиден / не expired).
-     Если валиден — принимает Bootstrap независимо от того, есть ли
-     уже запись под этим host в общей таблице ECDSA-ключей:
-        - Если есть chiit-key → ротируется на присланный public_key.
-        - Если нет — fresh registration.
-     В обоих случаях сервер подписывает новый cert на присланный
-     public_key и возвращает PEM в BootstrapOut.
-  5. Audit-log запись: «host X re-registered, replaced key Y with key Z».
-```
-
-Шаг (2) — реальный бесшовный переход. Оператор просто ставит bosun-client рядом с chiit-client'ом на ноду; bosun использует тот же ECDSA-key. Никакой extra процедуры — ни registration_token не нужен, ни администратор не задействован. Никаких `force_new` флагов и спецсемантики — `registration_token` (когда дойдёт до шага 3) сам является доказательством полномочий ротировать ключ.
+- **Server-side:** новый API namespace `BosunAPI` внутри существующего chiit-server (Go). Никакого отдельного процесса, общая команда, общий deployment, общая PG.
+- **Auth:** ECDSA-ключи общая таблица `chiit_validators` с chiit-агентами. Бесшовный переход: bosun-client при старте проверяет `/etc/chiit/client.pem`, использует тот же приватный ключ — Bootstrap НЕ нужен.
+- **Bundle storage:** PG bytea, immutable (только INSERT, никогда не UPDATE/DELETE).
+- **Кэширование:** агрессивное, иммутабельность даёт нам право. LRU 5 bundle'ов в каждом pod'е.
+- **Pull-модель:** клиент сам инициирует. Сервер только отвечает на запросы и опционально «kick'ает» streaming канал.
+- **Тайминги увеличены:** клиент проверяет target_version раз в 30 секунд (это и есть heartbeat). Operator commands НЕ нужны для apply-flow.
+- **Web UI:** нет. Operator через CLI с admin-token / Keycloak JWT.
+- **Bundle upload:** только через CI/CD автоматизацию, CLI оператора не предусмотрен.
 
 ## Файл `chiit-server/api/bosun/v1/bosun.proto`
 
@@ -60,75 +29,74 @@ package ozon.infrastructure.cloudozon.chiit.bosun.v1;
 
 option go_package = "gitlab.ozon.ru/infrastructure/cloudozon/chiit/chiit-server/api/bosun/v1;bosunv1";
 
-import "google/api/annotations.proto";
 import "google/protobuf/timestamp.proto";
-import "google/protobuf/duration.proto";
-// При переиспользовании 1:1 message-типов из chiit/api.proto:
-import "chiit/api.proto";  // VaultOut, CertificateData, и т.п.
+import "chiit/api.proto";  // VaultOut, CertificateData
 
 // BosunAPI — control plane для bosun-client (Rust SCM-агент).
 // Реализован как новый namespace в chiit-server. Auth:
 // - Bootstrap — registration_token (одноразовый Vault-secret).
-// - Все остальные agent-RPC — ECDSA-подпись (host, createdAt, sign) поверх той же
-//   таблицы что у chiit-агентов (плавный переезд).
-// - IssueCommand — admin-token (Vault) или Keycloak JWT.
+// - Все остальные agent-RPC — ECDSA-подпись (host, createdAt, sign) поверх
+//   общей таблицы с chiit-агентами.
+// - IssueOperatorAction — admin-token (Vault) или Keycloak JWT.
 service BosunAPI {
 
   // --- BOOTSTRAP ---
 
-  // Регистрация новой ноды. Клиент передаёт registration_token (выдан оператором
-  // или предустановлен в image), плюс host и желаемое имя. Сервер:
-  //   1. Проверяет токен в `validator-registration-token` таблице.
-  //   2. Генерирует ECDSA-keypair (или принимает public key от клиента — TODO).
-  //   3. Кладёт public key в общую таблицу с chiit-агентами.
-  //   4. Возвращает signed cert и (если генерирует server-side) private key.
+  // Регистрация новой ноды. Только если на ноде нет ни /etc/bosun/client.pem,
+  // ни legacy /etc/chiit/client.pem. Server подписывает cert на присланный
+  // public key, кладёт запись в chiit_validators.
   rpc Bootstrap(BootstrapIn) returns (BootstrapOut);
 
-  // --- SESSION ---
+  // --- PULL MODEL ---
 
-  // Server-streaming подписка на команды. Клиент один раз открывает stream;
-  // сервер push'ит Command сообщения по мере появления в commands_queue для
-  // этого host. ECDSA-валидация на каждый Subscribe — через scratch
-  // stream-interceptor. При disconnect клиент переподключается; сервер по
-  // host_id запоминает где остановилась дотавка commands.
-  rpc Subscribe(SubscribeIn) returns (stream Command);
+  // Главный endpoint клиента. Раз в 30 секунд клиент спрашивает свой
+  // target_version. Если не совпадает с локальным — клиент скачает bundle
+  // (GetBundleManifest + GetBundleBlob) и применит. Также может вернуться
+  // bundle_missing если оператор задал target на снятую/несуществующую
+  // версию — клиент остаётся на текущей.
+  rpc GetTargetVersion(GetTargetVersionIn) returns (GetTargetVersionOut);
 
-  // Лёгкий ping каждые 30s. Клиент репортит свой state (current bundle version,
-  // pending defers count, last_apply_at). Сервер обновляет active_sessions
-  // таблицу — оператор через GetNodeStatus видит свежие данные.
-  rpc Heartbeat(HeartbeatIn) returns (HeartbeatOut);
+  // Server-streaming kick-channel. Открывается ОДИН stream на жизнь
+  // bosun-client'а. Server опционально шлёт Kick{} когда хочет ускорить
+  // pull-loop клиента (например после массового UPDATE target_version у
+  // оператора). Клиент на Kick делает GetTargetVersion вне очереди.
+  // На отвал stream'а — exponential backoff reconnect.
+  rpc Subscribe(SubscribeIn) returns (stream Kick);
 
-  // Результат apply'я бандла. Клиент шлёт после каждого bosun apply (как
-  // local, так и server-managed). Сервер пишет в audit_log + обновляет
-  // active_sessions.last_apply.
+  // Клиент после успешного / неуспешного apply'я.
   rpc ReportApplyResult(ReportApplyResultIn) returns (ReportApplyResultOut);
 
-  // --- SECRETS / PKI ---
+  // --- BUNDLE ---
 
-  rpc VaultGet(VaultGetIn) returns (ozon.infrastructure.cloudozon.chiit.VaultOut);
+  rpc GetBundleManifest(GetBundleManifestIn) returns (GetBundleManifestOut);
 
-  rpc GetCert(GetCertIn) returns (ozon.infrastructure.cloudozon.chiit.CertificateData);
+  // Стрим chunks по 256KB. LRU 5 bundle'ов в каждом pod'е — cache hit
+  // отдаёт chunks без обращения к PG.
+  rpc GetBundleBlob(GetBundleBlobIn) returns (stream BundleChunk);
+
+  // --- SECRETS / PKI (тонкие обёртки над chiit-handler'ами) ---
+
+  rpc VaultGet(VaultGetIn) returns (.chiit.VaultOut);
+  rpc GetCert(GetCertIn) returns (.chiit.CertificateData);
 
   // --- INVENTORY ---
 
   rpc StorageHostInventoryGet(StorageHostInventoryGetIn) returns (StorageHostInventoryGetOut);
 
-  // --- BUNDLE ---
+  // --- OPERATOR (admin-token / Keycloak JWT) ---
 
-  // Манифест бандла: версия, sha256, signature, какие тэги задействованы.
-  rpc GetBundleManifest(GetBundleManifestIn) returns (GetBundleManifestOut);
+  // Точечное управление: установить target_version для списка host'ов
+  // или для cohort'а. Реализация = UPDATE bosun_clients SET target_version=...
+  // WHERE host IN (...). Клиенты сами доедут в своих pull-loop'ах.
+  rpc SetTargetVersion(SetTargetVersionIn) returns (SetTargetVersionOut);
 
-  // Стриминг blob'а bundle'а. 256KB chunks. Клиент перед этим вызовом
-  // получил sha256+signature через GetBundleManifest и verify'ит после
-  // последнего chunk'а.
-  rpc GetBundleBlob(GetBundleBlobIn) returns (stream BundleChunk);
+  // Только для случаев когда оператор хочет ускорить раскатку: server
+  // пройдёт по live Subscribe-stream'ам матчингу target и отправит Kick.
+  rpc KickRollout(KickRolloutIn) returns (KickRolloutOut);
 
-  // --- OPERATOR ---
-
-  // Оператор pushes команду на список target host'ов. Аутентифицируется
-  // admin-token или Keycloak. Сервер кладёт записи в commands_queue, активный
-  // Subscribe stream подписан и подбирает.
-  rpc IssueCommand(IssueCommandIn) returns (IssueCommandOut);
+  // Sread-only обзор для оператора.
+  rpc GetClientState(GetClientStateIn) returns (GetClientStateOut);
+  rpc CountByVersion(CountByVersionIn) returns (CountByVersionOut);
 }
 
 // ============================================================================
@@ -136,161 +104,58 @@ service BosunAPI {
 // ============================================================================
 
 message BootstrapIn {
-  string host = 1;                           // fqdn ноды
-  string registration_token = 2;             // одноразовый Vault-secret (или из bootstrap-secret per-park)
-  string platform = 3;                       // "linux/amd64", "linux/musl-amd64", "darwin/arm64"
-  string bosun_version = 4;                  // "0.1.0"
-  bytes  public_key_pem = 5;                 // public ECDSA key, сгенерированный клиентом (P-256, X9.62)
-  string desired_severity = 6;               // optional override для канареечной классификации
+  string host = 1;                           // fqdn
+  string registration_token = 2;             // shared per-park secret (как у chiit)
+  string platform = 3;                       // "linux/amd64", и т.п.
+  string bosun_version = 4;
+  bytes  public_key_pem = 5;                 // ECDSA P-256, сгенерированный клиентом
 }
-
-// Поведение Bootstrap для уже-зарегистрированного host'а (решение
-// 2026-05-23): если registration_token валиден, сервер принимает
-// присланный public_key_pem и ротирует cert — даже если в общей таблице
-// уже лежал chiit'овый ключ. Это и есть «бесшовный переход»:
-// оператор останавливает chiit-agent, поднимает bosun-agent, тот
-// генерит свой keypair, Bootstrap с тем же registration_token — и
-// получает свежий cert без админ-интервенции. Никаких extra полей в
-// BootstrapIn не нужно.
 
 message BootstrapOut {
-  bytes  cert_pem = 1;                       // ECDSA-cert подписанный chiit CA, validity 1y
-  string cert_serial = 2;                    // for audit
+  bytes  cert_pem = 1;                       // ECDSA cert, подписан chiit CA
+  string cert_serial = 2;
   google.protobuf.Timestamp cert_not_after = 3;
-  // Сразу bootstrap'а возвращаем минимум для первого apply:
-  uint64 initial_bundle_version = 4;         // если задана nodewise политика — версия для этой ноды
-  string severity_class = 5;                 // "low" | "medium" | "high"
 }
 
 // ============================================================================
-// Session
+// Pull-модель: target version + report
 // ============================================================================
+
+message GetTargetVersionIn {
+  string host = 1;                           // как в ECDSA-сигнатуре
+  string bosun_version = 2;
+  uint64 current_version = 3;                // что у клиента сейчас (0 = ничего не применено)
+  string sharding_key = 4;                   // обычно cluster_name; для pod redirect
+}
+
+message GetTargetVersionOut {
+  uint64 target_version = 1;                 // 0 = «никакой target не задан, ничего не делай»
+  bool   pod_redirect = 10;                  // true если этот pod не должен обслуживать клиента
+  string redirect_addr = 11;                 // куда переподключиться
+}
+
+message Kick {
+  // Пустой message; событие = «иди сейчас сделай GetTargetVersion». Не несёт
+  // payload'а намеренно: серверу нужно только триггернуть, клиент сам
+  // запросит свежий target.
+}
 
 message SubscribeIn {
-  string host = 1;                           // fqdn ноды (как в ECDSA сигнатуре)
-  string bosun_version = 2;
-  string current_bundle_version = 3;         // если уже что-то применено
-  repeated string capabilities = 4;          // "runr.service", "pg_sql.exec" — фильтрация команд по supported primitives
-
-  // Hint для pod-affinity. Сервер хеширует это поле для определения
-  // целевого pod'а. Если пустое — fallback на hash(host). Обычно
-  // равно database_name (cluster_name) — все ноды одного кластера
-  // attached к одному pod'у, что даёт locality для group-targeting.
-  string sharding_key = 5;
-}
-
-message Command {
-  string command_id = 1;                     // UUID для idempotency и audit-tracking
-  google.protobuf.Timestamp issued_at = 2;
-  string issued_by = 3;                      // оператор: Keycloak sub или admin-token name
-
-  oneof payload {
-    ApplyBundleCommand apply_bundle = 10;
-    RunTaskCommand     run_task     = 11;
-    FlushFactsCommand  flush_facts  = 12;
-
-    // Server → client управляющие сообщения. См. раздел «Pod redirect».
-    RedirectCommand    redirect     = 20;
-  }
-}
-
-message RedirectCommand {
-  string target_pod_addr = 1;                // "chiit-server-3.chiit-server-headless.infra.svc:8443"
-  string reason = 2;                         // "hash(database_name) routes to pod-3" / "pod-1 shutting down"
-  google.protobuf.Duration grace = 3;        // в течение какого времени клиент должен переподключиться
-}
-
-message ApplyBundleCommand {
-  uint64 bundle_version = 1;
-  bool   dry_run = 2;
-  repeated string tags = 3;                  // --tags=production,canary
-  google.protobuf.Duration deadline = 4;
-}
-
-message RunTaskCommand {
-  string task_name = 1;                      // "flush_pg_stat_statements", "vacuum_full:ledger"
-  map<string, string> args = 2;
-  google.protobuf.Duration deadline = 3;
-}
-
-message FlushFactsCommand {
-  repeated string facts = 1;                 // ["installed_packages", "pg_users_with_passwords"]
-}
-
-message HeartbeatIn {
   string host = 1;
-  string current_bundle_version = 2;
-  uint32 pending_defers = 3;
-  google.protobuf.Timestamp last_apply_at = 4;
-  string last_apply_result = 5;              // "success" | "partial" | "failed" | "deferred"
-  string bosun_version = 6;
-}
-
-message HeartbeatOut {
-  // Сервер может попросить клиента ускориться (новые команды появились).
-  bool kick_subscribe = 1;
+  string sharding_key = 2;                   // тот же что в GetTargetVersion, для pod redirect
 }
 
 message ReportApplyResultIn {
   string host = 1;
-  string command_id = 2;                     // если apply вызван командой; пусто если local apply
-  uint64 bundle_version = 3;
-  google.protobuf.Timestamp started_at = 4;
-  google.protobuf.Timestamp finished_at = 5;
-  int32  exit_code = 6;                      // 0 / 1 / 2 / 130 (см. bosun exit codes)
-  uint32 resources_changed = 7;
-  uint32 resources_unchanged = 8;
-  uint32 resources_failed = 9;
-  uint32 resources_deferred = 10;
-  uint32 resources_interrupted = 11;
-  repeated ResourceFailure failures = 12;    // первые N failed/interrupted с деталями
-  string log_excerpt = 13;                   // последние ~4KB логов на случай постмортема
-}
-
-message ResourceFailure {
-  string resource_id = 1;
-  string resource_kind = 2;                  // "apt.package", "service.unit"
-  string reason = 3;                         // "DpkgLocked", "RunrUnavailable", "Apply"
-  string excerpt = 4;
-  bool   is_deferrable = 5;
+  uint64 applied_version = 2;                // версия которую клиент только что прокатил
+  bool   success = 3;                        // true = applied, false = failed
+  google.protobuf.Timestamp finished_at = 4;
+  int32  exit_code = 5;                      // bosun apply exit code, 0..130
+  string error_excerpt = 6;                  // первые ~256 байт error message на failed (без полного лога — для запроса логов есть отдельный канал в будущем)
 }
 
 message ReportApplyResultOut {
-  // Пока пусто; в будущем сервер может попросить переотправить с дополнительными
-  // деталями или ack rate-limit hint.
-}
-
-// ============================================================================
-// Secrets
-// ============================================================================
-
-message VaultGetIn {
-  string host = 1;                           // для авторизации (host has access only to его cluster's секреты)
-  string path = 2;                           // "infra/postgresql/<dbname>/<env>:<key>" (новый формат) или legacy
-}
-
-message GetCertIn {
-  string host = 1;
-  int64  cert_id = 2;                        // ID в chiit cert_manager
-  string cert_type = 3;                      // "certificate" | "ca_bundle" | "private_key"
-}
-
-// ============================================================================
-// Inventory
-// ============================================================================
-
-message StorageHostInventoryGetIn {
-  string host = 1;                           // обычно equals to authenticated host, можно lookup чужой при наличии prv
-}
-
-message StorageHostInventoryGetOut {
-  // payload как в существующем chiit storage-inventory:
-  string cluster_name = 1;
-  string patroni_cluster = 2;
-  string etcd_cluster = 3;
-  string severity_class = 4;
-  string env = 5;                            // "production" | "staging"
-  map<string, string> extra = 6;             // ad-hoc fields, чтобы не править proto на каждое поле
+  // Server подтверждает receipt; UPDATE bosun_clients уже выполнен.
 }
 
 // ============================================================================
@@ -299,713 +164,287 @@ message StorageHostInventoryGetOut {
 
 message GetBundleManifestIn {
   string host = 1;
-  uint64 version = 2;                        // 0 = "latest для этого host (по severity + canary rollout)"
+  uint64 version = 2;
 }
 
 message GetBundleManifestOut {
   uint64 version = 1;
   bytes  sha256 = 2;                         // 32 байта
-  bytes  signature = 3;                      // ed25519 sig поверх (version || sha256)
+  bytes  signature = 3;                      // ed25519 поверх sha256
   uint64 size_bytes = 4;
-  repeated string tags = 5;                  // тэги активные в этом bundle
+  repeated string tags = 5;
   google.protobuf.Timestamp published_at = 6;
-  // Сам blob достаётся отдельным RPC GetBundleBlob (P1, streaming):
-  string blob_ref = 7;                       // opaque token: "pg-row:bundle_id=NNN"
 }
 
-// Bundle публикация — RPC для CI/CD автоматизации, не для ручного
-// оператора. CLI типа `bosun bundle publish` не существует и не
-// планируется. Каждый вызов = новая immutable строка в bosun_bundles.
-message PublishBundleIn {
-  bytes  blob = 1;                            // tar.gz, до ~50MB
-  bytes  signature = 2;                       // ed25519 поверх sha256(blob)
-  repeated string tags = 3;
-  string published_by = 4;                    // service-account name (CI), для audit_log
-}
-
-message PublishBundleOut {
-  uint64 version = 1;
-  bytes  sha256 = 2;
-}
-
-// Стриминг blob'а bundle'а. Отдельный RPC, потому что bytea до 50MB не
-// влезает в один gRPC message (default max_msg_size = 4MB). Клиент
-// перед этим вызовом получает sha256+signature через GetBundleManifest;
-// верифицирует blob после получения последнего chunk'а.
 message GetBundleBlobIn {
   uint64 version = 1;
 }
 
 message BundleChunk {
-  uint32 chunk_index = 1;                     // 0-indexed
-  bytes  data = 2;                            // обычно 256KB
+  uint32 chunk_index = 1;
+  bytes  data = 2;                            // 256KB
   bool   is_last = 3;
 }
 
 // ============================================================================
-// Operator commands
+// Secrets / Inventory (тонкие обёртки)
 // ============================================================================
 
-message IssueCommandIn {
-  // Auth: admin-token header ИЛИ x-bearer-token (Keycloak JWT).
-  // Сервер кладёт записи в commands_queue для каждого host в target.
-  Target target = 1;
+message VaultGetIn {
+  string host = 1;
+  string path = 2;
+}
 
-  oneof payload {
-    ApplyBundleCommand apply_bundle = 10;
-    RunTaskCommand     run_task     = 11;
-    FlushFactsCommand  flush_facts  = 12;
-  }
+message GetCertIn {
+  string host = 1;
+  int64  cert_id = 2;
+  string cert_type = 3;
+}
+
+message StorageHostInventoryGetIn {
+  string host = 1;
+}
+
+message StorageHostInventoryGetOut {
+  string cluster_name = 1;
+  string patroni_cluster = 2;
+  string etcd_cluster = 3;
+  string severity_class = 4;
+  string env = 5;
+  map<string, string> extra = 6;
+}
+
+// ============================================================================
+// Operator
+// ============================================================================
+
+message SetTargetVersionIn {
+  // Auth: admin-token header ИЛИ x-bearer-token (Keycloak JWT).
+  uint64 target_version = 1;
+  Target target = 2;
+  string reason = 3;                         // для audit_log
 }
 
 message Target {
-  // Хотя бы один из полей должен быть задан.
-  repeated string hosts = 1;                 // явный список
+  repeated string hosts = 1;
   repeated string clusters = 2;              // expanded через storage-inventory
   string severity_class = 3;                 // "low" / "medium" / "high"
-  string canary_percent = 4;                 // "10" → hash(cluster) % 100 < 10
-  bool   all = 5;                            // эскалация в "*" — только для emergency-shutdown
 }
 
-message IssueCommandOut {
-  string command_id = 1;                     // root-id, под ним группируются per-host записи
-  uint32 hosts_queued = 2;
-  google.protobuf.Timestamp issued_at = 3;
-}
-```
-
-## Rollout как первоклассный концепт (дополнение от 2026-05-23)
-
-`IssueCommand` отдаёт payload одному или нескольким хостам сразу — это OK для `RunTask` на 5-10 хостах. Для массовых apply на 60k нод нужно orchestrated rollout с rate limit и failure threshold (пользователь 2026-05-23):
-
-> «20% — это означает что раскатка будет длиться очень долго, поэтому оператор должен указывать время за которое раскатываются эти 20%. Запускается раскатка с определённым процентом приемлемых фейлов. Если количество ошибок превышает этот уровень — мы останавливаем раскатку.»
-
-### Дополнительные RPC
-
-```protobuf
-service BosunAPI {
-  // ... существующие ...
-
-  // Создать orchestrated rollout. В отличие от IssueCommand — сервер сам
-  // дозирует команды во времени и следит за failure rate.
-  rpc IssueRollout(IssueRolloutIn) returns (IssueRolloutOut);
-
-  // Статус rollout'а: сколько dispatched, succeeded, failed; текущая stage.
-  rpc GetRolloutStatus(GetRolloutStatusIn) returns (GetRolloutStatusOut);
-
-  // Управление в полёте.
-  rpc PauseRollout(RolloutControlIn) returns (RolloutControlOut);
-  rpc ResumeRollout(RolloutControlIn) returns (RolloutControlOut);
-  rpc AbortRollout(RolloutControlIn) returns (RolloutControlOut);
+message SetTargetVersionOut {
+  uint32 hosts_updated = 1;
 }
 
-message IssueRolloutIn {
-  // Те же auth-требования что у IssueCommand (admin-token / Keycloak JWT).
-  Target target = 1;                          // существующий Target с canary_percent
-
-  oneof payload {
-    ApplyBundleCommand apply_bundle = 10;
-    RunTaskCommand     run_task     = 11;
-  }
-
-  // Распределение команд во времени. `over_duration` — за какое время раскатать
-  // весь expanded target. Сервер вычисляет rate = total_hosts / over_duration
-  // и dispatch'ит хосты равномерно (с jitter).
-  google.protobuf.Duration over_duration = 20;
-
-  // Опциональный hard cap на одновременно «в полёте» команд (acked_at IS NULL).
-  // 0 = не ограничивать. Полезно если over_duration слишком короткий и dispatch
-  // обгоняет реальную скорость выполнения.
-  uint32 max_in_flight = 21;
-
-  // Acceptable failure threshold. Если процент failed > этого — rollout
-  // переходит в state=halted и больше команд не выпускает (existing pending
-  // продолжают выполняться). Расчёт failed_rate = failed / (succeeded + failed),
-  // делается после каждой ack'нутой команды.
-  // failure_rate=0.0 — halt при первом же failed.
-  // failure_rate=1.0 — не halt'ить никогда.
-  float max_failure_rate = 22;
-
-  // Что считать failure: только exit_code != 0 (strict), или ещё partial
-  // (exit=1 c resources_failed > 0)? Default — strict.
-  FailureMode failure_mode = 23;
-
-  // Опциональное delay между фазами (low → medium → high severity).
-  // 0 = phases не используются, размазываем target равномерно.
-  google.protobuf.Duration severity_phase_delay = 24;
+message KickRolloutIn {
+  Target target = 1;                         // тот же селектор
 }
 
-enum FailureMode {
-  FAILURE_MODE_UNSPECIFIED = 0;
-  FAILURE_MODE_STRICT      = 1;  // только exit_code != 0
-  FAILURE_MODE_PARTIAL     = 2;  // exit_code != 0 ИЛИ resources_failed > 0
+message KickRolloutOut {
+  uint32 clients_kicked = 1;                 // только тех у кого есть live Subscribe
 }
 
-message IssueRolloutOut {
-  string rollout_id = 1;
-  google.protobuf.Timestamp scheduled_to_start = 2;
-  uint32 total_targets = 3;
+message GetClientStateIn {
+  string host = 1;
 }
 
-message GetRolloutStatusIn {
-  string rollout_id = 1;
+message GetClientStateOut {
+  string host = 1;
+  uint64 target_version = 2;
+  uint64 last_applied_version = 3;
+  google.protobuf.Timestamp last_applied_at = 4;
+  google.protobuf.Timestamp last_seen_at = 5;
 }
 
-message GetRolloutStatusOut {
-  string rollout_id = 1;
-  RolloutState state = 2;
-  string halt_reason = 3;                     // если halted
-
-  uint32 total_targets = 10;
-  uint32 dispatched_targets = 11;             // успешно dispatched в commands_queue
-  uint32 acked_targets = 12;                  // прислали ReportApplyResult
-  uint32 succeeded_targets = 13;
-  uint32 failed_targets = 14;
-  uint32 in_flight_targets = 15;              // dispatched - acked
-
-  float current_failure_rate = 20;
-
-  google.protobuf.Timestamp started_at = 30;
-  google.protobuf.Timestamp scheduled_completion = 31;
-  google.protobuf.Timestamp halted_at = 32;
-  google.protobuf.Timestamp completed_at = 33;
+message CountByVersionIn {
+  Target target = 1;                         // ограничение query'я, опционально
 }
 
-enum RolloutState {
-  ROLLOUT_STATE_UNSPECIFIED = 0;
-  ROLLOUT_STATE_PENDING     = 1;  // создан, ещё не начат
-  ROLLOUT_STATE_RUNNING     = 2;
-  ROLLOUT_STATE_PAUSED      = 3;  // operator paused
-  ROLLOUT_STATE_HALTED      = 4;  // failure_rate threshold пробит
-  ROLLOUT_STATE_ABORTED     = 5;  // operator aborted
-  ROLLOUT_STATE_COMPLETED   = 6;
-}
-
-message RolloutControlIn {
-  string rollout_id = 1;
-  string reason = 2;                          // для audit log
-}
-
-message RolloutControlOut {
-  RolloutState new_state = 1;
+message CountByVersionOut {
+  // Сколько клиентов на какой last_applied_version.
+  map<uint64, uint32> applied = 1;
+  // Сколько клиентов с заданным target_version который ещё НЕ применён.
+  map<uint64, uint32> pending = 2;
 }
 ```
 
-### State machine
-
-```
-PENDING  → RUNNING (на первый dispatch)
-RUNNING  → PAUSED (PauseRollout) → RUNNING (ResumeRollout)
-RUNNING  → HALTED (failure_rate exceeded)
-RUNNING / PAUSED / HALTED → ABORTED (AbortRollout, operator escalation)
-RUNNING  → COMPLETED (все targets ack'нуты)
-```
-
-Из HALTED можно ResumeRollout (operator явно решает что фейлы ок); из ABORTED — нельзя.
-
-### Background worker
-
-В `internal/bosun/rollouts/dispatcher.go`:
-
-```go
-// Каждые N секунд (5? 10?) сервер:
-// 1. Берёт все RUNNING rollouts.
-// 2. Для каждого считает: сколько в commands_queue ещё pending,
-//    сколько acked, какой failure_rate.
-// 3. Если failure_rate > max_failure_rate → переводит в HALTED.
-// 4. Иначе вычисляет: сколько новых targets нужно dispatch'нуть к этому
-//    моменту по графику. rate = total / over_duration.
-//    Если уже dispatched больше — пропускает.
-//    Если меньше — dispatch'ит batch (с учётом max_in_flight).
-```
-
-dispatch batch на batch вставляет в `bosun_commands_queue`. Pod_Y, который держит Subscribe-стрим этого host'а, увидит запись через polling (см. ниже про command-dispatch loop) — обычно в пределах 500 мс.
-
-### Расширения PG schema
+## PG schema (минимальная)
 
 ```sql
-CREATE TABLE bosun_rollouts (
-    rollout_id            UUID PRIMARY KEY,
-    issued_at             TIMESTAMPTZ NOT NULL,
-    issued_by             TEXT NOT NULL,
-    target_spec           JSONB NOT NULL,                -- сериализованный Target
-    payload               JSONB NOT NULL,                -- сериализованный oneof
-    over_duration_sec     INT NOT NULL,
-    max_in_flight         INT NOT NULL,
-    max_failure_rate      REAL NOT NULL,
-    failure_mode          TEXT NOT NULL,
-    severity_phase_delay_sec INT NOT NULL,
-
-    state                 TEXT NOT NULL DEFAULT 'pending', -- enum
-    halt_reason           TEXT,
-
-    total_targets         INT NOT NULL,
-    dispatched_targets    INT NOT NULL DEFAULT 0,
-    acked_targets         INT NOT NULL DEFAULT 0,
-    succeeded_targets     INT NOT NULL DEFAULT 0,
-    failed_targets        INT NOT NULL DEFAULT 0,
-
-    scheduled_completion  TIMESTAMPTZ NOT NULL,
-    started_at            TIMESTAMPTZ,
-    halted_at             TIMESTAMPTZ,
-    completed_at          TIMESTAMPTZ
+-- Главная таблица. Всё про конкретного клиента — в одной строке.
+CREATE TABLE bosun_clients (
+    host                  TEXT PRIMARY KEY,
+    target_version        BIGINT,                                       -- что оператор задал; NULL = «ничего не делай»
+    last_applied_version  BIGINT,                                       -- что клиент реально прокатил
+    last_applied_at       TIMESTAMPTZ,
+    last_seen_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),           -- любой контакт (GetTargetVersion / Subscribe / Report)
+    bosun_version         TEXT,                                          -- последняя репортнутая версия бинаря
+    created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Привязка commands_queue к rollout'у (опциональная, для аудита и сводок):
-ALTER TABLE bosun_commands_queue ADD COLUMN rollout_id UUID
-    REFERENCES bosun_rollouts(rollout_id);
-CREATE INDEX ON bosun_commands_queue(rollout_id) WHERE rollout_id IS NOT NULL;
-
--- Чтобы worker'у быстро находить running rollouts:
-CREATE INDEX ON bosun_rollouts(state) WHERE state IN ('pending', 'running');
-```
-
-### Сравнение IssueCommand vs IssueRollout
-
-| Аспект | IssueCommand | IssueRollout |
-|---|---|---|
-| Use case | task на 5-10 хостов | apply bundle на 1k-60k хостов |
-| Время dispatch | мгновенно | размазано по `over_duration` |
-| Failure threshold | нет | `max_failure_rate` halt |
-| Управление в полёте | нет | Pause / Resume / Abort |
-| State tracking | per-host через ReportApplyResult | агрегированный через GetRolloutStatus |
-| PG-таблицы | bosun_commands_queue | + bosun_rollouts |
-
-IssueCommand остаётся для «срочных» точечных операций (например `bosun status` на одной ноде для диагностики) или для ad-hoc tasks. IssueRollout — для всего что трогает заметное количество хостов.
-
-## Pod redirect: consistent hashing + shutdown drain
-
-Пользователь 2026-05-23:
-
-> «При подключении клиента должна быть команда Redirect, а также при шатдауне сервера. Мы знаем все поды: chiit и bosun сервера — это всё одно и то же. Поэтому при подключении клиент должен редиректиться на подик, который соответствует хэшу от database name.»
-
-Это даёт два важных свойства:
-
-1. **Locality / cache hit.** Все ноды одного кластера attached к одному pod'у → pod держит in-memory cache для этого кластера (severity, inventory, last-known-bundle) с высоким hit-rate.
-2. **Graceful shutdown.** При SIGTERM pod redirect'ит свои активные сессии на остальных pods, не теряя in-flight commands.
-
-### Pod discovery
-
-В PG появляется таблица `bosun_pods` — каждый pod при старте записывает себя:
-
-```sql
-CREATE TABLE bosun_pods (
-    pod_id         TEXT PRIMARY KEY,             -- $HOSTNAME из k8s downward API
-    addr           TEXT NOT NULL,                -- "chiit-server-2.chiit-server-headless.infra.svc:8443"
-    started_at     TIMESTAMPTZ NOT NULL,
-    last_ping_at   TIMESTAMPTZ NOT NULL,         -- сам себя пингует каждые 5s
-    draining       BOOLEAN NOT NULL DEFAULT FALSE -- TRUE если получили SIGTERM
-);
-
-CREATE INDEX ON bosun_pods(draining, last_ping_at);
-```
-
-Каждый pod держит в памяти snapshot этой таблицы и refresh'ит её через `SELECT * FROM bosun_pods` каждые 5 секунд. Список не-draining pods сортируется по pod_id — это и есть consistent ring для hashing. PG `LISTEN/NOTIFY` намеренно НЕ используется (см. раздел «Command dispatch без LISTEN/NOTIFY») — у этого транспорта в PG нет at-least-once гарантий и нет cross-replica доставки.
-
-### Hash function
-
-Простой `crc32(sharding_key) % len(active_pods)`. Для `SubscribeIn.sharding_key`:
-
-- Если задан (обычно cluster_name из storage-inventory) — используется как-есть.
-- Если пустой — fallback на `host`.
-
-Не consistent-hash (типа ring или jump-hash), а простое modulo. На scale-up/down какая-то часть клиентов получит redirect — это OK при rolling-deploy одного pod'а за раз.
-
-### Subscribe flow
-
-```
-client → Subscribe(host=N1, sharding_key="ledger-cluster")
-   ↓ pod_A handler:
-       target_pod_idx = crc32("ledger-cluster") % active_pods_count
-       if target_pod_idx != self.pod_idx:
-           Send(Command{redirect: {target_pod_addr: pods[target_pod_idx].addr,
-                                   reason: "hash routes to pod_C",
-                                   grace: 5s}})
-           Close stream gracefully.
-       else:
-           // обычный flow: register session, начать слушать pub/sub.
-client получает Command::Redirect → disconnect → dial(target_pod_addr).
-```
-
-### Shutdown drain
-
-При получении SIGTERM:
-
-```
-1. Pod выставляет `bosun_pods.draining=TRUE`. Другие pods увидят флаг на следующем 5-секундном `bosun_pods` refresh (≤5s lag — приемлемо: новые Subscribe'ы за это окно могут попасть на draining pod, но он их сразу redirect'нет).
-2. Active pods пересчитывают active_pods_count БЕЗ этого pod'а.
-3. Драинящийся pod проходит по своим live sessions и каждому шлёт
-   Command::Redirect с target_pod_addr (по новому hashing).
-4. Ждёт `drain_timeout = 30s` (решение 2026-05-23) пока клиенты переподключатся.
-5. Закрывает все оставшиеся streams (force).
-6. Удаляет себя из `bosun_pods` и выходит.
-```
-
-При новом подключении в это окно — pod_A видит drained pod_C в списке и НЕ направит туда нового клиента (active_pods исключает draining).
-
-### Reshuffle на scale-up
-
-При добавлении нового pod_D:
-
-- `bosun_pods` получает запись pod_D с `started_at = NOW()`.
-- **Pod НЕ сразу включается** в active_pods для hashing. Новый pod становится «mature» только после **60 секунд** непрерывного пинга (`NOW() - started_at >= 60s` и не draining).
-- До этого pod_D принимает Subscribe запросы как обычный pod (только если кто-то напрямую в него зайдёт через DNS-round-robin), но в `Target(shardingKey)` его не выбирают.
-- После 60 секунд pod_D считается готовым; hashing начинает routing'ть на него.
-- Существующие сессии на других pods **остаются** на своих местах — только новые / переподключающиеся идут по новому hash. «Soft» reshuffle.
-
-Защита от шторма: если pod_D — flaky (crashloop, перезапускается каждые 10–30 секунд), он никогда не успеет до mature-status и не вызовет волну redirect'ов на всех остальных pods. Constant=60s — порог, при котором ребалансировка происходит, только когда новый pod действительно стабилен.
-
-Параметр зафиксирован как константа в коде (`mature_threshold = 60 * time.Second`); можно вынести в RT-config если потребуется тюнинг.
-
-### Реализация в коде
-
-`internal/bosun/pods/registry.go`:
-
-```go
-// PodRegistry — snapshot active pods, обновляется через goroutine.
-type PodRegistry struct {
-    mu           sync.RWMutex
-    selfPodID    string
-    selfPodIdx   int       // позиция в sorted-by-pod_id списке
-    activePods   []PodInfo // не-draining
-}
-
-// Target возвращает target pod для sharding key. Если совпадает с self —
-// пустой PodInfo (значит "оставайся здесь").
-func (r *PodRegistry) Target(shardingKey string) PodInfo { ... }
-```
-
-`internal/bosun/subscribe.go::onConnect`:
-
-```go
-target := pods.Target(req.ShardingKey)
-if target.PodID != "" && target.PodID != pods.SelfPodID() {
-    return stream.Send(&Command{
-        Payload: &Command_Redirect{
-            Redirect: &RedirectCommand{
-                TargetPodAddr: target.Addr,
-                Reason:        fmt.Sprintf("hash routes to %s", target.PodID),
-                Grace:         durationpb.New(5 * time.Second),
-            },
-        },
-    })
-}
-// обычный flow
-```
-
-`cmd/server/main.go`:
-
-```go
-// SIGTERM handler
-go func() {
-    <-shutdownCh
-    pods.MarkDraining()                 // UPDATE bosun_pods SET draining=TRUE
-    sessions.RedirectAll(drainTimeout)  // каждому live stream шлём Redirect
-    cancelAll()                         // через drainTimeout — force close
-    pods.Deregister()                   // DELETE FROM bosun_pods
-    os.Exit(0)
-}()
-```
-
-## Реализационные заметки
-
-### Файлы которые надо создать
-
-```
-chiit-server/
-├── api/
-│   └── bosun/
-│       └── v1/
-│           └── bosun.proto            # ← новый файл, выше
-├── internal/
-│   ├── bosun/
-│   │   ├── server.go                  # реализация BosunAPI; struct с зависимостями
-│   │   ├── bootstrap.go               # rpc Bootstrap
-│   │   ├── subscribe.go               # rpc Subscribe (stream)
-│   │   ├── heartbeat.go               # rpc Heartbeat
-│   │   ├── report_apply.go            # rpc ReportApplyResult
-│   │   ├── vault.go                   # rpc VaultGet (тонкая обёртка над internal/vault)
-│   │   ├── cert.go                    # rpc GetCert (обёртка над internal/cert)
-│   │   ├── inventory.go               # rpc StorageHostInventoryGet
-│   │   ├── bundle.go                  # rpc GetBundleManifest + БД-storage
-│   │   ├── issue_command.go           # rpc IssueCommand
-│   │   ├── interceptors.go            # ECDSA stream interceptor для Subscribe
-│   │   └── sessions.go                # in-memory map active subscribe streams
-│   └── bundle_storage/                # новый пакет под bundle blobs в PG
-│       ├── postgres.go                # CRUD над bytea
-│       └── migrations/
-│           └── 20260523_bundles.sql
-└── cmd/server/main.go                 # +добавить scratch.RegisterService(bosunSvc)
-```
-
-### Сессии и Subscribe stream
-
-В отличие от chiit (unary RPC), bosun использует server-streaming `Subscribe`. Один live-stream держит соединение на минуты-часы. В `internal/bosun/sessions.go`:
-
-```go
-type SessionMap struct {
-    mu       sync.RWMutex
-    sessions map[string]*Session // key = host
-}
-
-type Session struct {
-    Host           string
-    Stream         BosunAPI_SubscribeServer
-    Cancel         context.CancelFunc
-    Capabilities   []string
-    BosunVersion   string
-    ConnectedAt    time.Time
-    LastHeartbeat  time.Time
-}
-```
-
-При новом Subscribe старая сессия для того же host отменяется (`session.Cancel()`) и заменяется новой. Сервер использует `host` как primary key — дубликаты не нужны.
-
-`IssueCommand` пишет в `commands_queue` таблицу PG. Доставка — через polling-loop pod'а, не через PG `LISTEN/NOTIFY` (см. ниже «Command dispatch без LISTEN/NOTIFY»).
-
-### Принцип: cache + длинные интервалы
-
-У нас 60k клиентов и большая часть данных иммутабельна. Архитектурный выбор — **агрессивное кэширование на server'е, минимум хитов в PG, большие polling-интервалы**. Это не realtime control plane: задержка 10–30 секунд между event и реакцией приемлема для всех путей кроме экстренного shutdown'а.
-
-В частности:
-- `commands_queue` poll — раз в 10 секунд (не 500 мс).
-- `bosun_pods` snapshot — раз в 30 секунд.
-- mature-threshold нового pod'а — 60 секунд.
-- ECDSA-cache TTL — как у chiit-server (60s), никакой дополнительной push-инвалидации.
-- Bundle blob — LRU 5 в memory каждого pod'а.
-
-«Не realtime» — это сознательный выбор. Operator pushing команду понимает, что её исполнение клиентом начнётся в течение ~10 секунд, а не миллисекунд. Это устраняет почти весь трафик на PG.
-
-### Command dispatch без LISTEN/NOTIFY
-
-PG `LISTEN/NOTIFY` имеет известные ограничения для нашего use-case (DBA-perspective):
-
-- Notification теряется если LISTEN'ер отвалился между COMMIT и delivery (нет at-least-once).
-- Очередь memory-backed (`pg_notification_queue_usage`), при backpressure начинает блокировать COMMIT.
-- Не доставляется на hot-standby — replication-aware дispатча нет.
-- Нет ack'ов и нет per-message re-delivery.
-
-Вместо `LISTEN/NOTIFY` — простой polling от каждого pod'а:
-
-```go
-// Goroutine в pod'е, запускается при boot, останавливается при SIGTERM.
-const commandPollInterval = 10 * time.Second
-
-for {
-    select {
-    case <-ctx.Done():
-        return
-    case <-trigger:  // канал, в который пишут при новых connections (чтобы не ждать тик на первый command)
-    case <-time.After(commandPollInterval):
-    }
-
-    rows, _ := db.Query(`
-        SELECT command_id, host, payload
-        FROM bosun_commands_queue
-        WHERE host = ANY($1)
-          AND delivered_at IS NULL
-        ORDER BY issued_at
-        LIMIT 100
-    `, sessions.AttachedHostsSnapshot())
-
-    for _, row := range rows {
-        // Send в Subscribe stream
-        if err := sessions.Send(row.Host, row.Payload); err != nil {
-            continue   // stream закрыт — оставляем delivered_at IS NULL, следующий цикл вернётся
-        }
-        db.Exec(`
-            UPDATE bosun_commands_queue
-            SET delivered_at = NOW()
-            WHERE command_id = $1
-              AND delivered_at IS NULL
-        `, row.CommandID)
-    }
-}
-```
-
-Поля и инварианты:
-
-- **`$my_attached_hosts`** = keys текущего in-memory map'а Subscribe-стримов pod'а. У каждого pod'а свой set; на pod_redirect host попадает ровно к одному pod'у (consistent hashing), пересечений между pod'ами нет в нормальном режиме.
-- **`UPDATE ... WHERE delivered_at IS NULL`** — защита от двойной доставки на edge-cases reshuffle (короткое окно когда host попадает в `attached_hosts` двух pod'ов). Если оба попытаются обновить — один из UPDATE'ов вернёт rowcount=0, та сторона ничего не отправит.
-- **`FOR UPDATE SKIP LOCKED` НЕ нужен** — partitioning по host'у уже native, не несколько worker'ов спорят за одну очередь.
-- **Latency:** до 10 секунд между `IssueCommand` и Send. Для operator-команд приемлемо. На свежее подключение клиента — мгновенно через `trigger`-канал (не ждём тик).
-- **PG QPS:** N_pods × 0.1 QPS = доли запроса в секунду на нормальном развёртывании. С индексом `bosun_commands_queue(host, delivered_at) WHERE delivered_at IS NULL` — пренебрежимая нагрузка.
-
-Для `bosun_pods` snapshot — отдельный polling раз в 30 секунд. Изменения `draining` field видны pod'ам с ≤30s lag, что приемлемо в shutdown-flow (новые Subscribe'ы которые попадут на draining pod за это окно — сразу redirect'нутся самим draining pod'ом).
-
-### ECDSA-key invalidation
-
-Используем ту же ARC-cache модель что у chiit-server — стандартный TTL 60s без отдельной revocation push-инвалидации. Никаких дополнительных механизмов мы не вводим: если в будущем понадобится более быстрая revocation, это будет отдельный design pass, а пока модель chiit-server'а проверена временем.
-
-### PG недоступен
-
-Решение: pod возвращает ошибку (`codes.Unavailable` в gRPC status) на любой запрос требующий PG, не пытается retry в pod'е. Клиент (bosun-client) делает свой retry с экспоненциальным backoff и продолжает работать.
-
-Обоснование: PG равно недоступен всем pod'ам — circuit breaker / cache last-known-state в одном pod'е не помогает. Любая попытка усложнить failover'ом ведёт к inconsistent state. При reset PG все pods восстанавливаются автоматически на следующем polling-цикле.
-
-Healthcheck pod'а должен fail'ить если PG недоступен — k8s liveness probe выведет pod из ротации, новые Subscribe'ы пойдут на живых соседей.
-
-### Bundle blobs в PG
-
-```sql
--- Bundle immutable: только INSERT, никогда не UPDATE/DELETE. Каждая
--- публикация создаёт новую запись с BIGSERIAL version. Если bundle
--- оказался "плохим" — публикуется новая версия, старая остаётся в
--- таблице ради audit/forensics.
+-- Для оператора: «сколько ещё не применили target=N в severity:low»
+CREATE INDEX ON bosun_clients(target_version, last_applied_version);
+-- Для админских query'ев «когда последний раз ноду видели»
+CREATE INDEX ON bosun_clients(last_seen_at);
+
+-- Bundle blob immutable
 CREATE TABLE bosun_bundles (
     version       BIGSERIAL PRIMARY KEY,
     sha256        BYTEA NOT NULL UNIQUE,
-    blob          BYTEA NOT NULL,             -- tar.gz, до ~50MB на пакет
-    signature     BYTEA NOT NULL,             -- ed25519
+    blob          BYTEA NOT NULL,
+    signature     BYTEA NOT NULL,
     tags          TEXT[] NOT NULL,
     published_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    published_by  TEXT NOT NULL               -- service-account из CI / Keycloak sub
+    published_by  TEXT NOT NULL
+);
+
+-- Реестр pods для consistent hashing redirect
+CREATE TABLE bosun_pods (
+    pod_id         TEXT PRIMARY KEY,
+    addr           TEXT NOT NULL,
+    started_at     TIMESTAMPTZ NOT NULL,
+    last_ping_at   TIMESTAMPTZ NOT NULL,
+    draining       BOOLEAN NOT NULL DEFAULT FALSE
 );
 ```
 
-CLI оператора `bosun bundle publish` **не существует** — bundle загружается через CI/CD автоматизацию (отдельный orchestrator, который вызывает `PublishBundle` от имени service-account'а). Никаких ручных операций оператора с blob'ом.
+`bosun_clients` обновляется на четырёх путях:
+- `GetTargetVersion` → `UPDATE last_seen_at = NOW(), bosun_version = $1`.
+- `ReportApplyResult(success=true)` → `UPDATE last_applied_version, last_applied_at, last_seen_at`.
+- `Bootstrap` → `INSERT ON CONFLICT DO UPDATE last_seen_at, created_at` (если новый host).
+- `SetTargetVersion` → `UPDATE target_version` для матча Target.
 
-`GetBundleManifest` отдаёт metadata + `blob_ref="pg-row:<version>"`. Сам blob — отдельным RPC `GetBundleBlob(version) returns (stream BundleChunk)` (теперь в P0).
+Никаких bosun_heartbeats, bosun_active_sessions, bosun_commands_queue, bosun_rollouts. Если позже понадобится дополнительная метрика — добавляется колонкой в `bosun_clients`.
 
-### Commands queue
+## Lifecycle bosun-client
 
-```sql
-CREATE TABLE bosun_commands_queue (
-    command_id    UUID PRIMARY KEY,
-    host          TEXT NOT NULL,
-    payload       JSONB NOT NULL,             -- сериализованный Command.payload
-    issued_at     TIMESTAMPTZ NOT NULL,
-    issued_by     TEXT NOT NULL,
-    delivered_at  TIMESTAMPTZ,                -- когда head Subscribe доставил клиенту
-    acked_at      TIMESTAMPTZ                 -- когда клиент репортнул ReportApplyResult
-);
+1. **Старт.** Если есть `/etc/bosun/client.pem` — использовать. Если есть `/etc/chiit/client.pem` (legacy) — скопировать его как bosun.pem (тот же приватный ключ). Если нет — Bootstrap с registration_token.
+2. **Subscribe stream.** Один gRPC server-stream на жизнь процесса. На отвал — exp backoff reconnect.
+3. **Pull-loop.** Каждые 30 секунд:
+   - `GetTargetVersion(host, current_version, sharding_key)` → `target_version`.
+   - Если `pod_redirect = true` → переподключиться по `redirect_addr` (новый Subscribe, новый pull-loop).
+   - Если `target_version == 0` или `target_version == current_version` → ничего не делать.
+   - Иначе:
+     - `GetBundleManifest(target_version)` → sha256+signature.
+     - Если локальный cache соответствует — переходить к apply.
+     - Иначе `GetBundleBlob(target_version)` → стрим chunks → verify sha256+signature → tempfile rename.
+     - `bosun apply --bundle=...`.
+     - `ReportApplyResult(applied_version, success, exit_code, error_excerpt)`.
+4. **Kick-channel.** Между тиками 30s клиент слушает Subscribe stream. Server может прислать `Kick{}` — клиент сразу делает GetTargetVersion (не ждёт 30 секунд).
+5. **Завершение.** Закрыть stream gracefully. На systemd stop — без специальных действий, переподключится при следующем старте.
 
-CREATE INDEX ON bosun_commands_queue(host) WHERE delivered_at IS NULL;
+## Lifecycle оператора (rollout)
+
+Раскатка новой версии bundle на 1500 хостов:
+
+```
+1. CI публикует bundle: PublishBundle(blob, sig, tags) → version=42
+2. Оператор: bosun set-target --version=42 --severity=low
+   → SetTargetVersion(target_version=42, Target{severity_class="low"})
+   → UPDATE bosun_clients SET target_version=42 WHERE host IN (...) 
+   → возврат hosts_updated=1500
+3. (Опционально) оператор: bosun kick --severity=low
+   → KickRollout(Target{severity_class="low"})
+   → server идёт по live Subscribe-stream'ам и отправляет Kick{} тем кто матчит
+   → клиенты сразу проверяют target вместо ожидания 30s
+4. Клиенты в pull-loop'е увидят target_version=42, скачают, применят, репортят.
+5. Оператор мониторит:
+   → CountByVersion(Target{severity_class="low"})
+   → applied[42]=1245, pending[42]=255
+6. Если что-то плохо (failure rate высок) — оператор откатывает:
+   → SetTargetVersion(target_version=41, Target{severity_class="low"}, reason="rollback bad bundle")
+   → клиенты сами доедут обратно на 41
 ```
 
-### Heartbeats и sessions: две отдельные таблицы
+Failure-rate halt — наблюдается оператором извне через CountByVersion / GetClientState. Никакой автомиатической остановки server-side: clients reportят как есть, оператор смотрит и решает (UPDATE target_version обратно).
 
-По решению пользователя 2026-05-23, heartbeat tracking — **отдельная таблица** от session-state. Heartbeat — write-heavy путь (2k QPS на 60k клиентах × 30s); session-state меняется редко (только connect/disconnect/migration). Хранить их раздельно даёт независимый sizing/indexing/retention.
+## Pod redirect (без изменений)
 
-```sql
--- Heartbeat tracking. Минимальная таблица — последний heartbeat + дата
--- первого появления host'а. Поля будут расширяться (last bundle version,
--- pending defers, last apply result — но это позже, по мере появления
--- сценариев).
-CREATE TABLE bosun_heartbeats (
-    host          TEXT PRIMARY KEY,
-    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),   -- когда host первый раз появился
-    heartbeat_at  TIMESTAMPTZ NOT NULL                  -- последний полученный Heartbeat
-);
+Consistent hashing `crc32(sharding_key) % active_pods`. Если клиент попал не на свой pod — в ответе GetTargetVersion возвращается `pod_redirect=true` + `redirect_addr`. Клиент переподключается. Реестр `bosun_pods` рефрешится раз в 30 секунд, mature_threshold нового pod'а — 60 секунд.
 
-CREATE INDEX ON bosun_heartbeats(heartbeat_at);          -- для cleanup dead nodes + queries «кто не отвечает»
-
--- Session state (где живёт stream сейчас + last apply). Это reader-oriented
--- таблица — обновляется только при connect/disconnect/apply, не на каждый
--- heartbeat.
-CREATE TABLE bosun_active_sessions (
-    host                   TEXT PRIMARY KEY,
-    pod_id                 TEXT NOT NULL,                -- replica chiit-server, которая держит Subscribe stream
-    bosun_version          TEXT,
-    connected_at           TIMESTAMPTZ NOT NULL,
-    disconnected_at        TIMESTAMPTZ,                  -- NULL если активен
-    current_bundle_version BIGINT,
-    last_apply_at          TIMESTAMPTZ,
-    last_apply_result      TEXT                          -- "success" / "partial" / "failed" / "deferred"
-);
-```
-
-#### Handler logic
-
-**Heartbeat handler** (`internal/bosun/heartbeat.go`):
-
-```go
-// Hot path. Один UPSERT с COALESCE на created_at — чтобы первое появление
-// зафиксировать раз и навсегда.
-const upsertHeartbeat = `
-INSERT INTO bosun_heartbeats(host, created_at, heartbeat_at)
-VALUES ($1, NOW(), NOW())
-ON CONFLICT (host) DO UPDATE
-SET heartbeat_at = EXCLUDED.heartbeat_at
-RETURNING created_at, heartbeat_at;
-`
-```
-
-**Subscribe connect** (`internal/bosun/subscribe.go`):
-
-```go
-// При успешной аутентификации ECDSA + установке stream:
-// 1. Записать в active_sessions с pod_id.
-// 2. NOT touching bosun_heartbeats — это handle сам Heartbeat RPC.
-```
-
-**ReportApplyResult** (`internal/bosun/report_apply.go`):
-
-```go
-// Обновляет active_sessions.last_apply_*. Если host не в active_sessions
-// (например пришёл от ноды без активного Subscribe — local-mode apply
-// репортнул) — INSERT с pod_id='__local__'.
-```
-
-#### Расширения для будущего
-
-Поля которые пользователь обозначил как «дальше будут расширяться» — кандидаты:
-- `pending_defers` — счётчик из heartbeat payload.
-- `bosun_version` — на случай если хотим алертить на ноды с устаревшим бинарём.
-- `current_bundle_version` — для quick lookup без JOIN с active_sessions.
-- `severity_class` — закэшированный из последнего bootstrap'а.
-
-Добавлять буду по мере появления конкретных сценариев (alerting, диагностический dashboard, mass-targeting), не превентивно.
-
-#### Multi-pod dispatch
-
-При connect клиента pod_X пишет себя в `bosun_active_sessions.pod_id`. Если оператор IssueCommand'ит на host который attached к pod_Y — pod_Y подбирает через свой polling-loop (см. «Command dispatch без LISTEN/NOTIFY») в пределах 500 мс.
-
-### Bundle blob дispатч
+## Bundle blob дispатч
 
 Server-side handler `GetBundleBlob`:
 
 ```go
 func (s *bosunSrv) GetBundleBlob(req *bosunv1.GetBundleBlobIn, stream bosunv1.BosunAPI_GetBundleBlobServer) error {
-    // LRU memory-cache последних 5 версий в каждом pod'е (это просто
-    // текстовые tar.gz, держим в RAM целиком). cache hit отдаёт chunks
-    // без обращения к PG. Cache miss — SELECT blob FROM bosun_bundles
-    // WHERE version=$1, помещаем в LRU, стримим chunks. На rollout
-    // 60k нод одной версии в PG идёт ровно один SELECT, остальное —
-    // memory.
+    // LRU memory-cache последних 5 версий в каждом pod'е (bundle = небольшие
+    // tar.gz с starlark/jinja-text, помещаются в RAM целиком). Cache hit
+    // отдаёт chunks без обращения к PG. Cache miss — SELECT blob FROM
+    // bosun_bundles WHERE version=$1, помещаем в LRU, стримим chunks.
+    // На rollout одной версии в PG идёт ровно один SELECT на pod, не на
+    // клиента.
     ...
 }
 ```
 
-Client-side (bosun-client Rust) before `bosun apply`:
+Client-side (bosun-client Rust):
 
 ```
-1. GetBundleManifest(version) → sha256, signature, tags
-2. Если /var/lib/bosun/bundles/<version>.sha256 совпадает с manifest.sha256:
-       blob уже cached, skip download.
-3. Иначе: GetBundleBlob(version), читать chunks в tempfile.
-4. После последнего chunk'а — проверить sha256(tempfile) == manifest.sha256.
-5. verify ed25519 signature manifest.signature над manifest.sha256
-   (public key chiit CA из /etc/bosun/ca.pem).
-6. atomic rename tempfile → /var/lib/bosun/bundles/<version>.tar.gz,
-   записать /var/lib/bosun/bundles/<version>.sha256.
-7. bosun apply --bundle=/var/lib/bosun/bundles/<version>/.
+1. GetBundleManifest(version) → sha256, signature
+2. Если /var/lib/bosun/bundles/<version>.sha256 совпадает — пропустить download.
+3. Иначе GetBundleBlob → собирать chunks в tempfile.
+4. Verify sha256 + ed25519 signature над manifest'ом (CA = chiit CA / /etc/bosun/ca.pem).
+5. Atomic rename tempfile → /var/lib/bosun/bundles/<version>.tar.gz.
+6. bosun apply --bundle=...
 ```
 
-PG-нагрузка: один SELECT blob на версию в каждом pod'е (cold miss), дальше memory-LRU отдаёт chunks. На rollout одной версии на 60k нод — ровно N_pods SELECT'ов в PG, не 60k.
+PG-нагрузка: ровно N_pods SELECT'ов в PG на одну новую версию (не 60k).
 
-### Open follow-ups (для P1)
+## Реализационные заметки
 
-- `PublishBundle(PublishBundleIn) returns (PublishBundleOut)` — INSERT-only, вызывается CI/CD service-account'ом, не оператором. (CLI оператора не предусмотрен.)
-- `GetRSAPairs`, `GetTalosKeys`, `BootstrapBucket` — повторяют chiit handlers 1:1.
-- `GetSeverity`, `GetDatabaseList`, `GetMasterOfPatroniCluster` — targeting helpers.
-- `GetPersonRoles` — RBAC через Hallpass.
-- `ReportLogs(stream LogLine)` — стриминг детальных логов для пост-мортема (опционально).
-- `RotateCert`, `RevokeCert` — для security-операций (manual).
+### Файлы в chiit-server
 
-### Open questions
+```
+chiit-server/
+├── api/bosun/v1/bosun.proto                       # выше
+├── internal/bosun/
+│   ├── server.go                                  # реализация BosunAPI
+│   ├── bootstrap.go
+│   ├── pull.go                                    # rpc GetTargetVersion + ReportApplyResult
+│   ├── subscribe.go                               # stream Kick
+│   ├── bundle.go                                  # GetBundleManifest + GetBundleBlob + LRU cache
+│   ├── operator.go                                # SetTargetVersion + KickRollout + GetClientState + CountByVersion
+│   ├── secrets.go                                 # VaultGet + GetCert (обёртки)
+│   ├── inventory.go                               # StorageHostInventoryGet (обёртка)
+│   ├── pods.go                                    # pod registry для redirect
+│   └── interceptors.go                            # ECDSA + admin-token + JWT
+├── internal/bundle_storage/                       # CRUD над bosun_bundles
+├── migrations/                                    # 20260523_bosun.sql (3 таблицы)
+└── cmd/server/main.go                             # +RegisterService(bosunSvc)
+```
 
-1. **Bootstrap: cert генерирует server или client?** Сейчас в proto `BootstrapIn.public_key_pem` — клиент генерирует key, server подписывает. Альтернатива — server генерирует и отдаёт private key (проще для клиента, но private key в network).
-2. **Subscribe stream timeout.** chiit-server, скорее всего, имеет default 5-10 min timeout. Для long-lived sessions надо настроить keepalive (`grpc.KeepaliveParams`) — какие значения у chiit-server?
-3. **`Target.canary_percent`** — это string чтобы поддержать "10.5" в будущем, но сейчас integer 0-100 хватит. Сделать `uint32 canary_percent`?
-4. **`ReportApplyResult.log_excerpt`** — 4KB достаточно для большинства failure post-mortem'ов, но для интерактивного debug'а оператор хочет больше. Сделать ли `ReportLogs(stream LogLine)` P0 или отложить?
+### Server-side тайминги
+
+| Параметр | Значение | Зачем |
+|---|---|---|
+| Client pull-loop | 30 sec | heartbeat + target version check одновременно |
+| Bundle LRU в pod'е | 5 версий | bundle = текст, ~50 MB max, RAM дёшев |
+| Pod registry refresh | 30 sec | список меняется редко |
+| Pod mature-threshold | 60 sec | защита от crashloop reshuffle |
+| Pod drain timeout | 30 sec | при SIGTERM на graceful shutdown |
+| ECDSA cache | TTL 60 sec (как у chiit) | без отдельной revocation push-инвалидации |
+
+### Что убрано из P0 (по сравнению с прошлой версией спека)
+
+- `commands_queue` таблица + polling-loop в pod'е.
+- `bosun_rollouts` таблица + state machine + background dispatcher.
+- `bosun_heartbeats` отдельная таблица — объединена в `bosun_clients`.
+- `bosun_active_sessions` отдельная таблица — pod_id больше не персистится (Subscribe-stream — in-memory map в pod'е, на reconnect Subscribe просто новый stream).
+- `IssueCommand`, `IssueRollout`, `PauseRollout`, `ResumeRollout`, `AbortRollout`, `GetRolloutStatus`.
+- `ApplyBundleCommand`, `RunTaskCommand`, `FlushFactsCommand` — для P0 не нужны, добавятся отдельной фазой если понадобятся ad-hoc task'и.
+
+## Open follow-ups (P1)
+
+- `PublishBundle(blob, sig, tags) → version` — RPC для CI/CD. В P0 описано в proto sketch выше, реализация очевидна.
+- `RotateCert`, `RevokeCert` — manual ops для security.
+- `GetRSAPairs`, `GetTalosKeys`, `BootstrapBucket` — повторяют chiit handlers 1:1, добавятся когда понадобятся в Starlark glue.
+- `GetSeverity`, `GetDatabaseList`, `GetMasterOfPatroniCluster`, `GetWhiteListForResource` — нужны когда автор bundle'а начнёт использовать в Starlark.
+- `GetPersonRoles` (Hallpass) — для админских инструментов.
+- `RunTask` / ad-hoc one-off команды — если возникнет use case «pg_repack на одной ноде из CLI оператора».
+
+## Что осталось решить (open questions)
+
+1. **Subscribe stream auth.** protoc-gen-scratch поддерживает stream-interceptor (research 2026-05-23) — подтвердить что наш ECDSA interceptor работает на нём.
+2. **bosun-clients cleanup.** Host который decommission'ировался — навсегда остаётся в таблице или есть TTL по `last_seen_at`? Пока ничего не чистим (60k rows = тривиально для PG).
+3. **CountByVersion для больших cohort'ов.** Если оператор сделает CountByVersion(Target{все 60k}) — нужен индекс. Сейчас покрыто `(target_version, last_applied_version)` и `(last_seen_at)`. Должно хватить, но проверить на реальных query plan'ах.
+4. **GetTargetVersion latency budget.** При 60k клиентов × один запрос/30s = 2k QPS. С учётом ECDSA-verify это ~5-10ms/request → один pod держит 200-400 QPS. Дольше — нагрузка на PG (для UPDATE last_seen_at). Возможно нужен batch update last_seen_at (например раз в 5 минут вместо каждого запроса). Это micro-optimization — посмотреть в проде.
