@@ -306,6 +306,21 @@ message GetBundleManifestOut {
   string blob_ref = 7;                       // opaque token: "pg-row:bundle_id=NNN"
 }
 
+// Bundle публикация — RPC для CI/CD автоматизации, не для ручного
+// оператора. CLI типа `bosun bundle publish` не существует и не
+// планируется. Каждый вызов = новая immutable строка в bosun_bundles.
+message PublishBundleIn {
+  bytes  blob = 1;                            // tar.gz, до ~50MB
+  bytes  signature = 2;                       // ed25519 поверх sha256(blob)
+  repeated string tags = 3;
+  string published_by = 4;                    // service-account name (CI), для audit_log
+}
+
+message PublishBundleOut {
+  uint64 version = 1;
+  bytes  sha256 = 2;
+}
+
 // ============================================================================
 // Operator commands
 // ============================================================================
@@ -730,6 +745,10 @@ type Session struct {
 ### Bundle blobs в PG
 
 ```sql
+-- Bundle immutable: только INSERT, никогда не UPDATE/DELETE. Каждая
+-- публикация создаёт новую запись с BIGSERIAL version. Если bundle
+-- оказался "плохим" — публикуется новая версия, старая остаётся в
+-- таблице ради audit/forensics.
 CREATE TABLE bosun_bundles (
     version       BIGSERIAL PRIMARY KEY,
     sha256        BYTEA NOT NULL UNIQUE,
@@ -737,12 +756,11 @@ CREATE TABLE bosun_bundles (
     signature     BYTEA NOT NULL,             -- ed25519
     tags          TEXT[] NOT NULL,
     published_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    published_by  TEXT NOT NULL,              -- operator login
-    retracted_at  TIMESTAMPTZ
+    published_by  TEXT NOT NULL               -- service-account из CI / Keycloak sub
 );
-
-CREATE INDEX ON bosun_bundles(retracted_at) WHERE retracted_at IS NULL;
 ```
+
+CLI оператора `bosun bundle publish` **не существует** — bundle загружается через CI/CD автоматизацию (отдельный orchestrator, который вызывает `PublishBundle` от имени service-account'а). Никаких ручных операций оператора с blob'ом.
 
 `GetBundleManifest` отдаёт metadata + `blob_ref="pg-row:<version>"`. Сам blob — отдельным RPC `GetBundleBlob(version) returns (stream BundleChunk)` (P1, потом).
 
@@ -842,6 +860,7 @@ RETURNING created_at, heartbeat_at;
 
 ### Open follow-ups (для P1)
 
+- `PublishBundle(PublishBundleIn) returns (PublishBundleOut)` — INSERT-only, вызывается CI/CD service-account'ом, не оператором. (CLI оператора не предусмотрен.)
 - `GetBundleBlob(version) returns (stream BundleChunk)` — отдельный streaming RPC для самого blob, 4KB chunks.
 - `GetRSAPairs`, `GetTalosKeys`, `BootstrapBucket` — повторяют chiit handlers 1:1.
 - `GetSeverity`, `GetDatabaseList`, `GetMasterOfPatroniCluster` — targeting helpers.
