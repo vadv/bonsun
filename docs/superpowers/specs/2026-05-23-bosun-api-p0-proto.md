@@ -281,6 +281,205 @@ message IssueCommandOut {
 }
 ```
 
+## Rollout как первоклассный концепт (дополнение от 2026-05-23)
+
+`IssueCommand` отдаёт payload одному или нескольким хостам сразу — это OK для `RunTask` на 5-10 хостах. Для массовых apply на 60k нод нужно orchestrated rollout с rate limit и failure threshold (пользователь 2026-05-23):
+
+> «20% — это означает что раскатка будет длиться очень долго, поэтому оператор должен указывать время за которое раскатываются эти 20%. Запускается раскатка с определённым процентом приемлемых фейлов. Если количество ошибок превышает этот уровень — мы останавливаем раскатку.»
+
+### Дополнительные RPC
+
+```protobuf
+service BosunAPI {
+  // ... существующие ...
+
+  // Создать orchestrated rollout. В отличие от IssueCommand — сервер сам
+  // дозирует команды во времени и следит за failure rate.
+  rpc IssueRollout(IssueRolloutIn) returns (IssueRolloutOut);
+
+  // Статус rollout'а: сколько dispatched, succeeded, failed; текущая stage.
+  rpc GetRolloutStatus(GetRolloutStatusIn) returns (GetRolloutStatusOut);
+
+  // Управление в полёте.
+  rpc PauseRollout(RolloutControlIn) returns (RolloutControlOut);
+  rpc ResumeRollout(RolloutControlIn) returns (RolloutControlOut);
+  rpc AbortRollout(RolloutControlIn) returns (RolloutControlOut);
+}
+
+message IssueRolloutIn {
+  // Те же auth-требования что у IssueCommand (admin-token / Keycloak JWT).
+  Target target = 1;                          // существующий Target с canary_percent
+
+  oneof payload {
+    ApplyBundleCommand apply_bundle = 10;
+    RunTaskCommand     run_task     = 11;
+  }
+
+  // Распределение команд во времени. `over_duration` — за какое время раскатать
+  // весь expanded target. Сервер вычисляет rate = total_hosts / over_duration
+  // и dispatch'ит хосты равномерно (с jitter).
+  google.protobuf.Duration over_duration = 20;
+
+  // Опциональный hard cap на одновременно «в полёте» команд (acked_at IS NULL).
+  // 0 = не ограничивать. Полезно если over_duration слишком короткий и dispatch
+  // обгоняет реальную скорость выполнения.
+  uint32 max_in_flight = 21;
+
+  // Acceptable failure threshold. Если процент failed > этого — rollout
+  // переходит в state=halted и больше команд не выпускает (existing pending
+  // продолжают выполняться). Расчёт failed_rate = failed / (succeeded + failed),
+  // делается после каждой ack'нутой команды.
+  // failure_rate=0.0 — halt при первом же failed.
+  // failure_rate=1.0 — не halt'ить никогда.
+  float max_failure_rate = 22;
+
+  // Что считать failure: только exit_code != 0 (strict), или ещё partial
+  // (exit=1 c resources_failed > 0)? Default — strict.
+  FailureMode failure_mode = 23;
+
+  // Опциональное delay между фазами (low → medium → high severity).
+  // 0 = phases не используются, размазываем target равномерно.
+  google.protobuf.Duration severity_phase_delay = 24;
+}
+
+enum FailureMode {
+  FAILURE_MODE_UNSPECIFIED = 0;
+  FAILURE_MODE_STRICT      = 1;  // только exit_code != 0
+  FAILURE_MODE_PARTIAL     = 2;  // exit_code != 0 ИЛИ resources_failed > 0
+}
+
+message IssueRolloutOut {
+  string rollout_id = 1;
+  google.protobuf.Timestamp scheduled_to_start = 2;
+  uint32 total_targets = 3;
+}
+
+message GetRolloutStatusIn {
+  string rollout_id = 1;
+}
+
+message GetRolloutStatusOut {
+  string rollout_id = 1;
+  RolloutState state = 2;
+  string halt_reason = 3;                     // если halted
+
+  uint32 total_targets = 10;
+  uint32 dispatched_targets = 11;             // успешно dispatched в commands_queue
+  uint32 acked_targets = 12;                  // прислали ReportApplyResult
+  uint32 succeeded_targets = 13;
+  uint32 failed_targets = 14;
+  uint32 in_flight_targets = 15;              // dispatched - acked
+
+  float current_failure_rate = 20;
+
+  google.protobuf.Timestamp started_at = 30;
+  google.protobuf.Timestamp scheduled_completion = 31;
+  google.protobuf.Timestamp halted_at = 32;
+  google.protobuf.Timestamp completed_at = 33;
+}
+
+enum RolloutState {
+  ROLLOUT_STATE_UNSPECIFIED = 0;
+  ROLLOUT_STATE_PENDING     = 1;  // создан, ещё не начат
+  ROLLOUT_STATE_RUNNING     = 2;
+  ROLLOUT_STATE_PAUSED      = 3;  // operator paused
+  ROLLOUT_STATE_HALTED      = 4;  // failure_rate threshold пробит
+  ROLLOUT_STATE_ABORTED     = 5;  // operator aborted
+  ROLLOUT_STATE_COMPLETED   = 6;
+}
+
+message RolloutControlIn {
+  string rollout_id = 1;
+  string reason = 2;                          // для audit log
+}
+
+message RolloutControlOut {
+  RolloutState new_state = 1;
+}
+```
+
+### State machine
+
+```
+PENDING  → RUNNING (на первый dispatch)
+RUNNING  → PAUSED (PauseRollout) → RUNNING (ResumeRollout)
+RUNNING  → HALTED (failure_rate exceeded)
+RUNNING / PAUSED / HALTED → ABORTED (AbortRollout, operator escalation)
+RUNNING  → COMPLETED (все targets ack'нуты)
+```
+
+Из HALTED можно ResumeRollout (operator явно решает что фейлы ок); из ABORTED — нельзя.
+
+### Background worker
+
+В `internal/bosun/rollouts/dispatcher.go`:
+
+```go
+// Каждые N секунд (5? 10?) сервер:
+// 1. Берёт все RUNNING rollouts.
+// 2. Для каждого считает: сколько в commands_queue ещё pending,
+//    сколько acked, какой failure_rate.
+// 3. Если failure_rate > max_failure_rate → переводит в HALTED.
+// 4. Иначе вычисляет: сколько новых targets нужно dispatch'нуть к этому
+//    моменту по графику. rate = total / over_duration.
+//    Если уже dispatched больше — пропускает.
+//    Если меньше — dispatch'ит batch (с учётом max_in_flight).
+```
+
+dispatch batch на batch вставляет в `bosun_commands_queue` + триггерит `NOTIFY bosun_command_<host>` для каждого. Если host attached к pod_Y, его Subscribe-стрим сразу подбирает.
+
+### Расширения PG schema
+
+```sql
+CREATE TABLE bosun_rollouts (
+    rollout_id            UUID PRIMARY KEY,
+    issued_at             TIMESTAMPTZ NOT NULL,
+    issued_by             TEXT NOT NULL,
+    target_spec           JSONB NOT NULL,                -- сериализованный Target
+    payload               JSONB NOT NULL,                -- сериализованный oneof
+    over_duration_sec     INT NOT NULL,
+    max_in_flight         INT NOT NULL,
+    max_failure_rate      REAL NOT NULL,
+    failure_mode          TEXT NOT NULL,
+    severity_phase_delay_sec INT NOT NULL,
+
+    state                 TEXT NOT NULL DEFAULT 'pending', -- enum
+    halt_reason           TEXT,
+
+    total_targets         INT NOT NULL,
+    dispatched_targets    INT NOT NULL DEFAULT 0,
+    acked_targets         INT NOT NULL DEFAULT 0,
+    succeeded_targets     INT NOT NULL DEFAULT 0,
+    failed_targets        INT NOT NULL DEFAULT 0,
+
+    scheduled_completion  TIMESTAMPTZ NOT NULL,
+    started_at            TIMESTAMPTZ,
+    halted_at             TIMESTAMPTZ,
+    completed_at          TIMESTAMPTZ
+);
+
+-- Привязка commands_queue к rollout'у (опциональная, для аудита и сводок):
+ALTER TABLE bosun_commands_queue ADD COLUMN rollout_id UUID
+    REFERENCES bosun_rollouts(rollout_id);
+CREATE INDEX ON bosun_commands_queue(rollout_id) WHERE rollout_id IS NOT NULL;
+
+-- Чтобы worker'у быстро находить running rollouts:
+CREATE INDEX ON bosun_rollouts(state) WHERE state IN ('pending', 'running');
+```
+
+### Сравнение IssueCommand vs IssueRollout
+
+| Аспект | IssueCommand | IssueRollout |
+|---|---|---|
+| Use case | task на 5-10 хостов | apply bundle на 1k-60k хостов |
+| Время dispatch | мгновенно | размазано по `over_duration` |
+| Failure threshold | нет | `max_failure_rate` halt |
+| Управление в полёте | нет | Pause / Resume / Abort |
+| State tracking | per-host через ReportApplyResult | агрегированный через GetRolloutStatus |
+| PG-таблицы | bosun_commands_queue | + bosun_rollouts |
+
+IssueCommand остаётся для «срочных» точечных операций (например `bosun status` на одной ноде для диагностики) или для ad-hoc tasks. IssueRollout — для всего что трогает заметное количество хостов.
+
 ## Реализационные заметки
 
 ### Файлы которые надо создать
