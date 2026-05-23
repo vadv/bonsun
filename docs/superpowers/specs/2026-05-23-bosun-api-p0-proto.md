@@ -35,18 +35,21 @@ Bootstrap-flow (решение 2026-05-23):
 ```
 bosun-client при первом старте:
   1. Если /etc/bosun/client.pem уже есть и валиден → пропустить Bootstrap.
-  2. Иначе → Bootstrap(host, registration_token, public_key_pem).
-  3. Сервер проверяет registration_token (валиден / не expired).
+  2. Если /etc/chiit/client.pem есть и валиден (legacy chiit-key) →
+     скопировать его как /etc/bosun/client.pem (тот же приватный ключ
+     обслуживает chiit-client и bosun-client). Bootstrap НЕ нужен.
+  3. Иначе → Bootstrap(host, registration_token, public_key_pem).
+  4. Сервер проверяет registration_token (валиден / не expired).
      Если валиден — принимает Bootstrap независимо от того, есть ли
      уже запись под этим host в общей таблице ECDSA-ключей:
         - Если есть chiit-key → ротируется на присланный public_key.
         - Если нет — fresh registration.
      В обоих случаях сервер подписывает новый cert на присланный
      public_key и возвращает PEM в BootstrapOut.
-  4. Audit-log запись: «host X re-registered, replaced key Y with key Z».
+  5. Audit-log запись: «host X re-registered, replaced key Y with key Z».
 ```
 
-Никаких `force_new` флагов и спецсемантики — `registration_token` сам является доказательством полномочий ротировать ключ.
+Шаг (2) — реальный бесшовный переход. Оператор просто ставит bosun-client рядом с chiit-client'ом на ноду; bosun использует тот же ECDSA-key. Никакой extra процедуры — ни registration_token не нужен, ни администратор не задействован. Никаких `force_new` флагов и спецсемантики — `registration_token` (когда дойдёт до шага 3) сам является доказательством полномочий ротировать ключ.
 
 ## Файл `chiit-server/api/bosun/v1/bosun.proto`
 
@@ -319,6 +322,20 @@ message PublishBundleIn {
 message PublishBundleOut {
   uint64 version = 1;
   bytes  sha256 = 2;
+}
+
+// Стриминг blob'а bundle'а. Отдельный RPC, потому что bytea до 50MB не
+// влезает в один gRPC message (default max_msg_size = 4MB). Клиент
+// перед этим вызовом получает sha256+signature через GetBundleManifest;
+// верифицирует blob после получения последнего chunk'а.
+message GetBundleBlobIn {
+  uint64 version = 1;
+}
+
+message BundleChunk {
+  uint32 chunk_index = 1;                     // 0-indexed
+  bytes  data = 2;                            // обычно 256KB
+  bool   is_last = 3;
 }
 
 // ============================================================================
@@ -797,6 +814,47 @@ for {
 
 Для `bosun_pods` snapshot — отдельный 5-секундный polling. Изменения `draining` field видны pod'ам с ≤5s lag, что приемлемо в shutdown-flow (новые Subscribe'ы которые попадут на draining pod за это окно — сразу redirect'нутся).
 
+### ECDSA-key revocation invalidation
+
+chiit-server держит ARC-cache для ECDSA public keys в `internal/validator/validator.go` с TTL ~60s (баланс PG load — без cache был бы SELECT chiit_validators на каждый запрос от 60k клиентов). Race window для revocation: оператор revoke'нул скомпрометированный ключ → 60s старый ключ всё ещё валиден на pods'ах.
+
+Решение: **polling revocations через timestamp filter**, без `LISTEN/NOTIFY`.
+
+```go
+// Отдельный goroutine в каждом pod'е, рядом с командным dispatch loop.
+for {
+    select {
+    case <-ctx.Done():
+        return
+    case <-time.After(5 * time.Second):
+    }
+
+    rows, _ := db.Query(`
+        SELECT host
+        FROM chiit_validators
+        WHERE revoked_at IS NOT NULL
+          AND revoked_at > $1
+    `, lastCheckTs)
+
+    for _, row := range rows {
+        ecdsaCache.Invalidate(row.Host)  // drop entry
+    }
+    lastCheckTs = time.Now()
+}
+```
+
+Window для revocation — ≤5s (вместо 60s). PG-нагрузка минимальна благодаря фильтру по `revoked_at > $last_check_ts` (нужен индекс `chiit_validators(revoked_at) WHERE revoked_at IS NOT NULL`). ARC-cache TTL остаётся 60s для штатных reads — баланс PG load сохраняется.
+
+Случай compromised-key-without-revoke (атакующий получил приватный ключ, оператор не знает) — не решается cache, это другой класс проблем (anomaly detection через unusual traffic / IP-источник / т.п.), out of scope текущего design'а.
+
+### PG недоступен
+
+Решение: pod возвращает ошибку (`codes.Unavailable` в gRPC status) на любой запрос требующий PG, не пытается retry в pod'е. Клиент (bosun-client) делает свой retry с экспоненциальным backoff и продолжает работать.
+
+Обоснование: PG равно недоступен всем pod'ам — circuit breaker / cache last-known-state в одном pod'е не помогает. Любая попытка усложнить failover'ом ведёт к inconsistent state. При reset PG все pods восстанавливаются автоматически на следующем polling-цикле.
+
+Healthcheck pod'а должен fail'ить если PG недоступен — k8s liveness probe выведет pod из ротации, новые Subscribe'ы пойдут на живых соседей.
+
 ### Bundle blobs в PG
 
 ```sql
@@ -913,10 +971,40 @@ RETURNING created_at, heartbeat_at;
 
 При connect клиента pod_X пишет себя в `bosun_active_sessions.pod_id`. Если оператор IssueCommand'ит на host который attached к pod_Y — pod_Y подбирает через свой polling-loop (см. «Command dispatch без LISTEN/NOTIFY») в пределах 500 мс.
 
+### Bundle blob дispатч
+
+Server-side handler `GetBundleBlob`:
+
+```go
+func (s *bosunSrv) GetBundleBlob(req *bosunv1.GetBundleBlobIn, stream bosunv1.BosunAPI_GetBundleBlobServer) error {
+    // SELECT blob FROM bosun_bundles WHERE version=$1.
+    // Стриминг через io.Copy chunks по 256KB, чтобы не держать 50MB в Go heap.
+    // chiit-server держит LRU memory-cache последних N версий (default N=3) —
+    // при cold-cache rollout 60k нод не идёт прямо в PG.
+    ...
+}
+```
+
+Client-side (bosun-client Rust) before `bosun apply`:
+
+```
+1. GetBundleManifest(version) → sha256, signature, tags
+2. Если /var/lib/bosun/bundles/<version>.sha256 совпадает с manifest.sha256:
+       blob уже cached, skip download.
+3. Иначе: GetBundleBlob(version), читать chunks в tempfile.
+4. После последнего chunk'а — проверить sha256(tempfile) == manifest.sha256.
+5. verify ed25519 signature manifest.signature над manifest.sha256
+   (public key chiit CA из /etc/bosun/ca.pem).
+6. atomic rename tempfile → /var/lib/bosun/bundles/<version>.tar.gz,
+   записать /var/lib/bosun/bundles/<version>.sha256.
+7. bosun apply --bundle=/var/lib/bosun/bundles/<version>/.
+```
+
+PG-нагрузка при cold-cache initial rollout: 60k × 50MB = ~3TB чтения. Memory-cache на server'е (LRU N=3) даёт ~99% cache-hit rate если все ноды качают одну и ту же версию через rollout.
+
 ### Open follow-ups (для P1)
 
 - `PublishBundle(PublishBundleIn) returns (PublishBundleOut)` — INSERT-only, вызывается CI/CD service-account'ом, не оператором. (CLI оператора не предусмотрен.)
-- `GetBundleBlob(version) returns (stream BundleChunk)` — отдельный streaming RPC для самого blob, 4KB chunks.
 - `GetRSAPairs`, `GetTalosKeys`, `BootstrapBucket` — повторяют chiit handlers 1:1.
 - `GetSeverity`, `GetDatabaseList`, `GetMasterOfPatroniCluster` — targeting helpers.
 - `GetPersonRoles` — RBAC через Hallpass.
