@@ -15,6 +15,41 @@ Status: draft for discussion
 
 Этот документ — proto sketch P0 ручек bosun-API. Реализуется внутри `chiit-server/api/` рядом с существующими `chiit/api.proto` и `pg_shard_manager/api.proto`.
 
+## Policy: bosun-server = chiit-server (бесшовный переход)
+
+Пользователь 2026-05-23:
+
+> «политика: bosun-сервер и chiit-сервер — это одно и то же. Нам нужен бесшовный переход клиентов.»
+
+То есть **никакого отдельного «bosun-server»** как сущности нет. Есть только chiit-server, в котором появляется новый API namespace `BosunAPI`. Один и тот же процесс, один deployment, одна команда сопровождения.
+
+Что это значит конкретно:
+
+- **Один и тот же `host_id` (fqdn)** в `chiit_validators` (или как там она называется). chiit-client и bosun-client делят одну запись на сервере.
+- **Общая ECDSA-ключевая инфраструктура.** Если host уже зарегистрирован как chiit-client с действующей подписью — `Bootstrap(host, registration_token)` от bosun-client'а **не** генерирует новый key. Сервер видит существующего host'а, возвращает существующий cert (или просит rotate'нуться если у chiit cert уже expired). Это и есть «бесшовный переход».
+- **Общий audit log, severity, canary state, bundle storage.** Одна нода может в transition period иметь и chiit-cron, и bosun-systemd-unit — оба обращаются к тому же серверу через свои API.
+- **Никаких миграционных скриптов «переключить host с chiit на bosun»** — оператор просто останавливает один агент и запускает другой. Сервер ничего специального не делает.
+
+Bootstrap-flow с учётом этого:
+
+```
+bosun-client при первом старте:
+  1. Если /etc/bosun/client.pem уже есть и валиден → пропустить Bootstrap.
+  2. Иначе → Bootstrap(host, registration_token, public_key_pem).
+  3. Сервер ищет host в общей таблице ECDSA-ключей:
+     a) Найден активный chiit-key → возвращаем существующий cert
+        (НЕ перевыпускаем), bosun-client использует его же.
+     b) Найден expired chiit-key → перевыпускаем cert на новый
+        public_key_pem от bosun-client, audit-log событие.
+     c) Не найден → fresh registration (новая запись в таблице).
+```
+
+В случае (a) `BootstrapIn.public_key_pem` от bosun-client'а может расходиться с тем что лежит у chiit. Решения:
+- Если bosun-client пришёл первый раз — он генерит свой keypair, шлёт public, сервер видит chiit-key и **отказывает** (`AlreadyRegisteredErr`). bosun-client должен прочитать chiit's `/etc/chiit/client.pem` (если он tеперь scope of bosun) или явно сказать `force_new=true` чтобы перевыпустить cert.
+- Альтернатива: bosun-client при первом старте сначала смотрит на `/etc/chiit/client.pem` (legacy path), если есть и валиден — копирует к себе как `/etc/bosun/client.pem` без Bootstrap.
+
+Это нужно решить в дизайне Bootstrap-flow перед началом реализации. В proto'е сейчас оставляю `force_new = bool` поле в BootstrapIn как escape-hatch.
+
 ## Файл `chiit-server/api/bosun/v1/bosun.proto`
 
 ```protobuf
@@ -102,6 +137,12 @@ message BootstrapIn {
   string bosun_version = 4;                  // "0.1.0"
   bytes  public_key_pem = 5;                 // public ECDSA key, сгенерированный клиентом (P-256, X9.62)
   string desired_severity = 6;               // optional override для канареечной классификации
+
+  // Бесшовный переход с chiit: если host уже зарегистрирован под
+  // chiit'овым ключом, сервер откажет с AlreadyRegisteredErr. Установка
+  // force_new=true разрешает rotate ключа на присланный public_key_pem.
+  // Используется операторами при намеренной миграции; default false.
+  bool   force_new = 7;
 }
 
 message BootstrapOut {
