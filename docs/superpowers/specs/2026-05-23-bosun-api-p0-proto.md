@@ -571,24 +571,83 @@ CREATE TABLE bosun_commands_queue (
 CREATE INDEX ON bosun_commands_queue(host) WHERE delivered_at IS NULL;
 ```
 
-### Active sessions
+### Heartbeats и sessions: две отдельные таблицы
+
+По решению пользователя 2026-05-23, heartbeat tracking — **отдельная таблица** от session-state. Heartbeat — write-heavy путь (2k QPS на 60k клиентах × 30s); session-state меняется редко (только connect/disconnect/migration). Хранить их раздельно даёт независимый sizing/indexing/retention.
 
 ```sql
-CREATE TABLE bosun_active_sessions (
-    host                  TEXT PRIMARY KEY,
-    bosun_version         TEXT,
-    pod_id                TEXT NOT NULL,      -- какой replica chiit-server держит stream (для multi-pod)
-    connected_at          TIMESTAMPTZ NOT NULL,
-    last_heartbeat        TIMESTAMPTZ NOT NULL,
-    current_bundle_version BIGINT,
-    last_apply_at         TIMESTAMPTZ,
-    last_apply_result     TEXT
+-- Heartbeat tracking. Минимальная таблица — последний heartbeat + дата
+-- первого появления host'а. Поля будут расширяться (last bundle version,
+-- pending defers, last apply result — но это позже, по мере появления
+-- сценариев).
+CREATE TABLE bosun_heartbeats (
+    host          TEXT PRIMARY KEY,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),   -- когда host первый раз появился
+    heartbeat_at  TIMESTAMPTZ NOT NULL                  -- последний полученный Heartbeat
 );
 
-CREATE INDEX ON bosun_active_sessions(last_heartbeat);   -- для cleanup dead sessions
+CREATE INDEX ON bosun_heartbeats(heartbeat_at);          -- для cleanup dead nodes + queries «кто не отвечает»
+
+-- Session state (где живёт stream сейчас + last apply). Это reader-oriented
+-- таблица — обновляется только при connect/disconnect/apply, не на каждый
+-- heartbeat.
+CREATE TABLE bosun_active_sessions (
+    host                   TEXT PRIMARY KEY,
+    pod_id                 TEXT NOT NULL,                -- replica chiit-server, которая держит Subscribe stream
+    bosun_version          TEXT,
+    connected_at           TIMESTAMPTZ NOT NULL,
+    disconnected_at        TIMESTAMPTZ,                  -- NULL если активен
+    current_bundle_version BIGINT,
+    last_apply_at          TIMESTAMPTZ,
+    last_apply_result      TEXT                          -- "success" / "partial" / "failed" / "deferred"
+);
 ```
 
-При connect клиента pod_X пишет себя в `pod_id`. Если оператор IssueCommand'ит на host который attached к pod_Y, pod_X получает NOTIFY (PG LISTEN/NOTIFY работает cross-replica).
+#### Handler logic
+
+**Heartbeat handler** (`internal/bosun/heartbeat.go`):
+
+```go
+// Hot path. Один UPSERT с COALESCE на created_at — чтобы первое появление
+// зафиксировать раз и навсегда.
+const upsertHeartbeat = `
+INSERT INTO bosun_heartbeats(host, created_at, heartbeat_at)
+VALUES ($1, NOW(), NOW())
+ON CONFLICT (host) DO UPDATE
+SET heartbeat_at = EXCLUDED.heartbeat_at
+RETURNING created_at, heartbeat_at;
+`
+```
+
+**Subscribe connect** (`internal/bosun/subscribe.go`):
+
+```go
+// При успешной аутентификации ECDSA + установке stream:
+// 1. Записать в active_sessions с pod_id.
+// 2. NOT touching bosun_heartbeats — это handle сам Heartbeat RPC.
+```
+
+**ReportApplyResult** (`internal/bosun/report_apply.go`):
+
+```go
+// Обновляет active_sessions.last_apply_*. Если host не в active_sessions
+// (например пришёл от ноды без активного Subscribe — local-mode apply
+// репортнул) — INSERT с pod_id='__local__'.
+```
+
+#### Расширения для будущего
+
+Поля которые пользователь обозначил как «дальше будут расширяться» — кандидаты:
+- `pending_defers` — счётчик из heartbeat payload.
+- `bosun_version` — на случай если хотим алертить на ноды с устаревшим бинарём.
+- `current_bundle_version` — для quick lookup без JOIN с active_sessions.
+- `severity_class` — закэшированный из последнего bootstrap'а.
+
+Добавлять буду по мере появления конкретных сценариев (alerting, диагностический dashboard, mass-targeting), не превентивно.
+
+#### Multi-pod dispatch
+
+При connect клиента pod_X пишет себя в `bosun_active_sessions.pod_id`. Если оператор IssueCommand'ит на host который attached к pod_Y — pod_Y подбирает через `LISTEN bosun_command_<host>` (PG NOTIFY работает cross-replica).
 
 ### Open follow-ups (для P1)
 
