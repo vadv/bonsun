@@ -498,7 +498,7 @@ RUNNING  → COMPLETED (все targets ack'нуты)
 //    Если меньше — dispatch'ит batch (с учётом max_in_flight).
 ```
 
-dispatch batch на batch вставляет в `bosun_commands_queue` + триггерит `NOTIFY bosun_command_<host>` для каждого. Если host attached к pod_Y, его Subscribe-стрим сразу подбирает.
+dispatch batch на batch вставляет в `bosun_commands_queue`. Pod_Y, который держит Subscribe-стрим этого host'а, увидит запись через polling (см. ниже про command-dispatch loop) — обычно в пределах 500 мс.
 
 ### Расширения PG schema
 
@@ -579,7 +579,7 @@ CREATE TABLE bosun_pods (
 CREATE INDEX ON bosun_pods(draining, last_ping_at);
 ```
 
-Каждый pod держит в памяти snapshot этой таблицы (refresh каждые 5s + LISTEN на изменения). Список не-draining pods сортируется по pod_id — это и есть consistent ring для hashing.
+Каждый pod держит в памяти snapshot этой таблицы и refresh'ит её через `SELECT * FROM bosun_pods` каждые 5 секунд. Список не-draining pods сортируется по pod_id — это и есть consistent ring для hashing. PG `LISTEN/NOTIFY` намеренно НЕ используется (см. раздел «Command dispatch без LISTEN/NOTIFY») — у этого транспорта в PG нет at-least-once гарантий и нет cross-replica доставки.
 
 ### Hash function
 
@@ -611,7 +611,7 @@ client получает Command::Redirect → disconnect → dial(target_pod_add
 При получении SIGTERM:
 
 ```
-1. Pod выставляет `bosun_pods.draining=TRUE` (cross-pod notification через NOTIFY).
+1. Pod выставляет `bosun_pods.draining=TRUE`. Другие pods увидят флаг на следующем 5-секундном `bosun_pods` refresh (≤5s lag — приемлемо: новые Subscribe'ы за это окно могут попасть на draining pod, но он их сразу redirect'нет).
 2. Active pods пересчитывают active_pods_count БЕЗ этого pod'а.
 3. Драинящийся pod проходит по своим live sessions и каждому шлёт
    Command::Redirect с target_pod_addr (по новому hashing).
@@ -740,7 +740,62 @@ type Session struct {
 
 При новом Subscribe старая сессия для того же host отменяется (`session.Cancel()`) и заменяется новой. Сервер использует `host` как primary key — дубликаты не нужны.
 
-`IssueCommand` пишет в `commands_queue` таблицу PG; голова `Subscribe` подписана на `LISTEN bosun_command_<host>` (`NOTIFY` в момент INSERT). На notification head делает SELECT pending commands и шлёт по stream через `Send(...)`.
+`IssueCommand` пишет в `commands_queue` таблицу PG. Доставка — через polling-loop pod'а, не через PG `LISTEN/NOTIFY` (см. ниже «Command dispatch без LISTEN/NOTIFY»).
+
+### Command dispatch без LISTEN/NOTIFY
+
+PG `LISTEN/NOTIFY` имеет известные ограничения для нашего use-case (DBA-perspective):
+
+- Notification теряется если LISTEN'ер отвалился между COMMIT и delivery (нет at-least-once).
+- Очередь memory-backed (`pg_notification_queue_usage`), при backpressure начинает блокировать COMMIT.
+- Не доставляется на hot-standby — replication-aware дispатча нет.
+- Нет ack'ов и нет per-message re-delivery.
+
+Вместо `LISTEN/NOTIFY` — простой polling от каждого pod'а:
+
+```go
+// Goroutine в pod'е, запускается при boot, останавливается при SIGTERM.
+for {
+    select {
+    case <-ctx.Done():
+        return
+    case <-trigger:  // канал, в который пишут при новых connections (чтобы не ждать 500ms на первый command)
+    case <-time.After(500 * time.Millisecond):
+    }
+
+    rows, _ := db.Query(`
+        SELECT command_id, host, payload
+        FROM bosun_commands_queue
+        WHERE host = ANY($1)
+          AND delivered_at IS NULL
+        ORDER BY issued_at
+        LIMIT 100
+    `, sessions.AttachedHostsSnapshot())
+
+    for _, row := range rows {
+        // Send в Subscribe stream
+        if err := sessions.Send(row.Host, row.Payload); err != nil {
+            continue   // stream закрыт — оставляем delivered_at IS NULL, следующий цикл вернётся
+        }
+        db.Exec(`
+            UPDATE bosun_commands_queue
+            SET delivered_at = NOW()
+            WHERE command_id = $1
+              AND delivered_at IS NULL
+        `, row.CommandID)
+    }
+}
+```
+
+Поля и инварианты:
+
+- **`$my_attached_hosts`** = keys текущего in-memory map'а Subscribe-стримов pod'а. У каждого pod'а свой set; на pod_redirect host попадает ровно к одному pod'у (consistent hashing), пересечений между pod'ами нет в нормальном режиме.
+- **`UPDATE ... WHERE delivered_at IS NULL`** — защита от двойной доставки на edge-cases reshuffle (короткое окно когда host попадает в `attached_hosts` двух pod'ов). Если оба попытаются обновить — один из UPDATE'ов вернёт rowcount=0, та сторона ничего не отправит.
+- **`FOR UPDATE SKIP LOCKED` НЕ нужен** — partitioning по host'у уже native, не несколько worker'ов спорят за одну очередь.
+- **Latency:** до 500 мс между `IssueCommand` и Send. Для operator-команд приемлемо — это не realtime control.
+- **PG QPS:** N_pods × 2 QPS = 4-10 QPS поллинга на нормальном развёртывании. С индексом `bosun_commands_queue(host, delivered_at) WHERE delivered_at IS NULL` — мизерная нагрузка.
+
+Для `bosun_pods` snapshot — отдельный 5-секундный polling. Изменения `draining` field видны pod'ам с ≤5s lag, что приемлемо в shutdown-flow (новые Subscribe'ы которые попадут на draining pod за это окно — сразу redirect'нутся).
 
 ### Bundle blobs в PG
 
@@ -856,7 +911,7 @@ RETURNING created_at, heartbeat_at;
 
 #### Multi-pod dispatch
 
-При connect клиента pod_X пишет себя в `bosun_active_sessions.pod_id`. Если оператор IssueCommand'ит на host который attached к pod_Y — pod_Y подбирает через `LISTEN bosun_command_<host>` (PG NOTIFY работает cross-replica).
+При connect клиента pod_X пишет себя в `bosun_active_sessions.pod_id`. Если оператор IssueCommand'ит на host который attached к pod_Y — pod_Y подбирает через свой polling-loop (см. «Command dispatch без LISTEN/NOTIFY») в пределах 500 мс.
 
 ### Open follow-ups (для P1)
 
