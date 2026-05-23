@@ -30,25 +30,23 @@ Status: draft for discussion
 - **Общий audit log, severity, canary state, bundle storage.** Одна нода может в transition period иметь и chiit-cron, и bosun-systemd-unit — оба обращаются к тому же серверу через свои API.
 - **Никаких миграционных скриптов «переключить host с chiit на bosun»** — оператор просто останавливает один агент и запускает другой. Сервер ничего специального не делает.
 
-Bootstrap-flow с учётом этого:
+Bootstrap-flow (решение 2026-05-23):
 
 ```
 bosun-client при первом старте:
   1. Если /etc/bosun/client.pem уже есть и валиден → пропустить Bootstrap.
   2. Иначе → Bootstrap(host, registration_token, public_key_pem).
-  3. Сервер ищет host в общей таблице ECDSA-ключей:
-     a) Найден активный chiit-key → возвращаем существующий cert
-        (НЕ перевыпускаем), bosun-client использует его же.
-     b) Найден expired chiit-key → перевыпускаем cert на новый
-        public_key_pem от bosun-client, audit-log событие.
-     c) Не найден → fresh registration (новая запись в таблице).
+  3. Сервер проверяет registration_token (валиден / не expired).
+     Если валиден — принимает Bootstrap независимо от того, есть ли
+     уже запись под этим host в общей таблице ECDSA-ключей:
+        - Если есть chiit-key → ротируется на присланный public_key.
+        - Если нет — fresh registration.
+     В обоих случаях сервер подписывает новый cert на присланный
+     public_key и возвращает PEM в BootstrapOut.
+  4. Audit-log запись: «host X re-registered, replaced key Y with key Z».
 ```
 
-В случае (a) `BootstrapIn.public_key_pem` от bosun-client'а может расходиться с тем что лежит у chiit. Решения:
-- Если bosun-client пришёл первый раз — он генерит свой keypair, шлёт public, сервер видит chiit-key и **отказывает** (`AlreadyRegisteredErr`). bosun-client должен прочитать chiit's `/etc/chiit/client.pem` (если он tеперь scope of bosun) или явно сказать `force_new=true` чтобы перевыпустить cert.
-- Альтернатива: bosun-client при первом старте сначала смотрит на `/etc/chiit/client.pem` (legacy path), если есть и валиден — копирует к себе как `/etc/bosun/client.pem` без Bootstrap.
-
-Это нужно решить в дизайне Bootstrap-flow перед началом реализации. В proto'е сейчас оставляю `force_new = bool` поле в BootstrapIn как escape-hatch.
+Никаких `force_new` флагов и спецсемантики — `registration_token` сам является доказательством полномочий ротировать ключ.
 
 ## Файл `chiit-server/api/bosun/v1/bosun.proto`
 
@@ -137,13 +135,16 @@ message BootstrapIn {
   string bosun_version = 4;                  // "0.1.0"
   bytes  public_key_pem = 5;                 // public ECDSA key, сгенерированный клиентом (P-256, X9.62)
   string desired_severity = 6;               // optional override для канареечной классификации
-
-  // Бесшовный переход с chiit: если host уже зарегистрирован под
-  // chiit'овым ключом, сервер откажет с AlreadyRegisteredErr. Установка
-  // force_new=true разрешает rotate ключа на присланный public_key_pem.
-  // Используется операторами при намеренной миграции; default false.
-  bool   force_new = 7;
 }
+
+// Поведение Bootstrap для уже-зарегистрированного host'а (решение
+// 2026-05-23): если registration_token валиден, сервер принимает
+// присланный public_key_pem и ротирует cert — даже если в общей таблице
+// уже лежал chiit'овый ключ. Это и есть «бесшовный переход»:
+// оператор останавливает chiit-agent, поднимает bosun-agent, тот
+// генерит свой keypair, Bootstrap с тем же registration_token — и
+// получает свежий cert без админ-интервенции. Никаких extra полей в
+// BootstrapIn не нужно.
 
 message BootstrapOut {
   bytes  cert_pem = 1;                       // ECDSA-cert подписанный chiit CA, validity 1y
@@ -599,7 +600,7 @@ client получает Command::Redirect → disconnect → dial(target_pod_add
 2. Active pods пересчитывают active_pods_count БЕЗ этого pod'а.
 3. Драинящийся pod проходит по своим live sessions и каждому шлёт
    Command::Redirect с target_pod_addr (по новому hashing).
-4. Ждёт N секунд (`drain_timeout`, обычно 30-60s) пока клиенты переподключатся.
+4. Ждёт `drain_timeout = 30s` (решение 2026-05-23) пока клиенты переподключатся.
 5. Закрывает все оставшиеся streams (force).
 6. Удаляет себя из `bosun_pods` и выходит.
 ```
@@ -609,11 +610,16 @@ client получает Command::Redirect → disconnect → dial(target_pod_add
 ### Reshuffle на scale-up
 
 При добавлении нового pod_D:
-- `active_pods_count` увеличивается с 3 до 4.
-- Существующие сессии остаются на своих pods (ничего не делаем).
-- Только при следующем Subscribe (reconnect / first-time-connect) клиент перехеширует и попадёт на нужный pod.
 
-Это даёт «soft» reshuffle — на scale-up загрузка нового pod'а растёт постепенно по мере reconnect'ов. Если хочется быстрее — оператор может сделать rolling restart всех pods (каждый при шатдауне redirect'нет своих клиентов).
+- `bosun_pods` получает запись pod_D с `started_at = NOW()`.
+- **Pod НЕ сразу включается** в active_pods для hashing. Решение 2026-05-23: новый pod становится «mature» только после **20 секунд** непрерывного пинга (`NOW() - started_at >= 20s` и не draining).
+- До этого pod_D принимает Subscribe запросы как обычный pod (только если кто-то напрямую в него зайдёт через DNS-round-robin), но в `Target(shardingKey)` его не выбирают.
+- После 20 секунд pod_D считается готовым; hashing начинает routing'ть на него.
+- Существующие сессии на других pods **остаются** на своих местах — только новые / переподключающиеся идут по новому hash. «Soft» reshuffle.
+
+Защита от шторма: если pod_D — flaky (crashloop, перезапускается каждые 5s), он никогда не успеет до mature-status и не вызовет волну redirect'ов на всех остальных pods. Constant=20s — порог, при котором ребалансировка происходит, только когда новый pod действительно стабилен.
+
+Параметр зафиксирован как константа в коде (`mature_threshold = 20 * time.Second`); можно вынести в RT-config если потребуется тюнинг.
 
 ### Реализация в коде
 
