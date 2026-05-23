@@ -163,6 +163,12 @@ message SubscribeIn {
   string bosun_version = 2;
   string current_bundle_version = 3;         // если уже что-то применено
   repeated string capabilities = 4;          // "runr.service", "pg_sql.exec" — фильтрация команд по supported primitives
+
+  // Hint для pod-affinity. Сервер хеширует это поле для определения
+  // целевого pod'а. Если пустое — fallback на hash(host). Обычно
+  // равно database_name (cluster_name) — все ноды одного кластера
+  // attached к одному pod'у, что даёт locality для group-targeting.
+  string sharding_key = 5;
 }
 
 message Command {
@@ -174,7 +180,16 @@ message Command {
     ApplyBundleCommand apply_bundle = 10;
     RunTaskCommand     run_task     = 11;
     FlushFactsCommand  flush_facts  = 12;
+
+    // Server → client управляющие сообщения. См. раздел «Pod redirect».
+    RedirectCommand    redirect     = 20;
   }
+}
+
+message RedirectCommand {
+  string target_pod_addr = 1;                // "chiit-server-3.chiit-server-headless.infra.svc:8443"
+  string reason = 2;                         // "hash(database_name) routes to pod-3" / "pod-1 shutting down"
+  google.protobuf.Duration grace = 3;        // в течение какого времени клиент должен переподключиться
 }
 
 message ApplyBundleCommand {
@@ -520,6 +535,135 @@ CREATE INDEX ON bosun_rollouts(state) WHERE state IN ('pending', 'running');
 | PG-таблицы | bosun_commands_queue | + bosun_rollouts |
 
 IssueCommand остаётся для «срочных» точечных операций (например `bosun status` на одной ноде для диагностики) или для ad-hoc tasks. IssueRollout — для всего что трогает заметное количество хостов.
+
+## Pod redirect: consistent hashing + shutdown drain
+
+Пользователь 2026-05-23:
+
+> «При подключении клиента должна быть команда Redirect, а также при шатдауне сервера. Мы знаем все поды: chiit и bosun сервера — это всё одно и то же. Поэтому при подключении клиент должен редиректиться на подик, который соответствует хэшу от database name.»
+
+Это даёт два важных свойства:
+
+1. **Locality / cache hit.** Все ноды одного кластера attached к одному pod'у → pod держит in-memory cache для этого кластера (severity, inventory, last-known-bundle) с высоким hit-rate.
+2. **Graceful shutdown.** При SIGTERM pod redirect'ит свои активные сессии на остальных pods, не теряя in-flight commands.
+
+### Pod discovery
+
+В PG появляется таблица `bosun_pods` — каждый pod при старте записывает себя:
+
+```sql
+CREATE TABLE bosun_pods (
+    pod_id         TEXT PRIMARY KEY,             -- $HOSTNAME из k8s downward API
+    addr           TEXT NOT NULL,                -- "chiit-server-2.chiit-server-headless.infra.svc:8443"
+    started_at     TIMESTAMPTZ NOT NULL,
+    last_ping_at   TIMESTAMPTZ NOT NULL,         -- сам себя пингует каждые 5s
+    draining       BOOLEAN NOT NULL DEFAULT FALSE -- TRUE если получили SIGTERM
+);
+
+CREATE INDEX ON bosun_pods(draining, last_ping_at);
+```
+
+Каждый pod держит в памяти snapshot этой таблицы (refresh каждые 5s + LISTEN на изменения). Список не-draining pods сортируется по pod_id — это и есть consistent ring для hashing.
+
+### Hash function
+
+Простой `crc32(sharding_key) % len(active_pods)`. Для `SubscribeIn.sharding_key`:
+
+- Если задан (обычно cluster_name из storage-inventory) — используется как-есть.
+- Если пустой — fallback на `host`.
+
+Не consistent-hash (типа ring или jump-hash), а простое modulo. На scale-up/down какая-то часть клиентов получит redirect — это OK при rolling-deploy одного pod'а за раз.
+
+### Subscribe flow
+
+```
+client → Subscribe(host=N1, sharding_key="ledger-cluster")
+   ↓ pod_A handler:
+       target_pod_idx = crc32("ledger-cluster") % active_pods_count
+       if target_pod_idx != self.pod_idx:
+           Send(Command{redirect: {target_pod_addr: pods[target_pod_idx].addr,
+                                   reason: "hash routes to pod_C",
+                                   grace: 5s}})
+           Close stream gracefully.
+       else:
+           // обычный flow: register session, начать слушать pub/sub.
+client получает Command::Redirect → disconnect → dial(target_pod_addr).
+```
+
+### Shutdown drain
+
+При получении SIGTERM:
+
+```
+1. Pod выставляет `bosun_pods.draining=TRUE` (cross-pod notification через NOTIFY).
+2. Active pods пересчитывают active_pods_count БЕЗ этого pod'а.
+3. Драинящийся pod проходит по своим live sessions и каждому шлёт
+   Command::Redirect с target_pod_addr (по новому hashing).
+4. Ждёт N секунд (`drain_timeout`, обычно 30-60s) пока клиенты переподключатся.
+5. Закрывает все оставшиеся streams (force).
+6. Удаляет себя из `bosun_pods` и выходит.
+```
+
+При новом подключении в это окно — pod_A видит drained pod_C в списке и НЕ направит туда нового клиента (active_pods исключает draining).
+
+### Reshuffle на scale-up
+
+При добавлении нового pod_D:
+- `active_pods_count` увеличивается с 3 до 4.
+- Существующие сессии остаются на своих pods (ничего не делаем).
+- Только при следующем Subscribe (reconnect / first-time-connect) клиент перехеширует и попадёт на нужный pod.
+
+Это даёт «soft» reshuffle — на scale-up загрузка нового pod'а растёт постепенно по мере reconnect'ов. Если хочется быстрее — оператор может сделать rolling restart всех pods (каждый при шатдауне redirect'нет своих клиентов).
+
+### Реализация в коде
+
+`internal/bosun/pods/registry.go`:
+
+```go
+// PodRegistry — snapshot active pods, обновляется через goroutine.
+type PodRegistry struct {
+    mu           sync.RWMutex
+    selfPodID    string
+    selfPodIdx   int       // позиция в sorted-by-pod_id списке
+    activePods   []PodInfo // не-draining
+}
+
+// Target возвращает target pod для sharding key. Если совпадает с self —
+// пустой PodInfo (значит "оставайся здесь").
+func (r *PodRegistry) Target(shardingKey string) PodInfo { ... }
+```
+
+`internal/bosun/subscribe.go::onConnect`:
+
+```go
+target := pods.Target(req.ShardingKey)
+if target.PodID != "" && target.PodID != pods.SelfPodID() {
+    return stream.Send(&Command{
+        Payload: &Command_Redirect{
+            Redirect: &RedirectCommand{
+                TargetPodAddr: target.Addr,
+                Reason:        fmt.Sprintf("hash routes to %s", target.PodID),
+                Grace:         durationpb.New(5 * time.Second),
+            },
+        },
+    })
+}
+// обычный flow
+```
+
+`cmd/server/main.go`:
+
+```go
+// SIGTERM handler
+go func() {
+    <-shutdownCh
+    pods.MarkDraining()                 // UPDATE bosun_pods SET draining=TRUE
+    sessions.RedirectAll(drainTimeout)  // каждому live stream шлём Redirect
+    cancelAll()                         // через drainTimeout — force close
+    pods.Deregister()                   // DELETE FROM bosun_pods
+    os.Exit(0)
+}()
+```
 
 ## Реализационные заметки
 
