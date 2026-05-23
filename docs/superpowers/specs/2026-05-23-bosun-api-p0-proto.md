@@ -818,38 +818,9 @@ for {
 
 Для `bosun_pods` snapshot — отдельный 5-секундный polling. Изменения `draining` field видны pod'ам с ≤5s lag, что приемлемо в shutdown-flow (новые Subscribe'ы которые попадут на draining pod за это окно — сразу redirect'нутся).
 
-### ECDSA-key revocation invalidation
+### ECDSA-key invalidation
 
-chiit-server держит ARC-cache для ECDSA public keys в `internal/validator/validator.go` с TTL ~60s (баланс PG load — без cache был бы SELECT chiit_validators на каждый запрос от 60k клиентов). Race window для revocation: оператор revoke'нул скомпрометированный ключ → 60s старый ключ всё ещё валиден на pods'ах.
-
-Решение: **polling revocations через timestamp filter**, без `LISTEN/NOTIFY`.
-
-```go
-// Отдельный goroutine в каждом pod'е, рядом с командным dispatch loop.
-for {
-    select {
-    case <-ctx.Done():
-        return
-    case <-time.After(5 * time.Second):
-    }
-
-    rows, _ := db.Query(`
-        SELECT host
-        FROM chiit_validators
-        WHERE revoked_at IS NOT NULL
-          AND revoked_at > $1
-    `, lastCheckTs)
-
-    for _, row := range rows {
-        ecdsaCache.Invalidate(row.Host)  // drop entry
-    }
-    lastCheckTs = time.Now()
-}
-```
-
-Window для revocation — ≤5s (вместо 60s). PG-нагрузка минимальна благодаря фильтру по `revoked_at > $last_check_ts` (нужен индекс `chiit_validators(revoked_at) WHERE revoked_at IS NOT NULL`). ARC-cache TTL остаётся 60s для штатных reads — баланс PG load сохраняется.
-
-Случай compromised-key-without-revoke (атакующий получил приватный ключ, оператор не знает) — не решается cache, это другой класс проблем (anomaly detection через unusual traffic / IP-источник / т.п.), out of scope текущего design'а.
+Используем ту же ARC-cache модель что у chiit-server — стандартный TTL 60s без отдельной revocation push-инвалидации. Никаких дополнительных механизмов мы не вводим: если в будущем понадобится более быстрая revocation, это будет отдельный design pass, а пока модель chiit-server'а проверена временем.
 
 ### PG недоступен
 
@@ -981,10 +952,12 @@ Server-side handler `GetBundleBlob`:
 
 ```go
 func (s *bosunSrv) GetBundleBlob(req *bosunv1.GetBundleBlobIn, stream bosunv1.BosunAPI_GetBundleBlobServer) error {
-    // SELECT blob FROM bosun_bundles WHERE version=$1.
-    // Стриминг через io.Copy chunks по 256KB, чтобы не держать 50MB в Go heap.
-    // chiit-server держит LRU memory-cache последних N версий (default N=3) —
-    // при cold-cache rollout 60k нод не идёт прямо в PG.
+    // LRU memory-cache последних 5 версий в каждом pod'е (это просто
+    // текстовые tar.gz, держим в RAM целиком). cache hit отдаёт chunks
+    // без обращения к PG. Cache miss — SELECT blob FROM bosun_bundles
+    // WHERE version=$1, помещаем в LRU, стримим chunks. На rollout
+    // 60k нод одной версии в PG идёт ровно один SELECT, остальное —
+    // memory.
     ...
 }
 ```
@@ -1004,7 +977,7 @@ Client-side (bosun-client Rust) before `bosun apply`:
 7. bosun apply --bundle=/var/lib/bosun/bundles/<version>/.
 ```
 
-PG-нагрузка при cold-cache initial rollout: 60k × 50MB = ~3TB чтения. Memory-cache на server'е (LRU N=3) даёт ~99% cache-hit rate если все ноды качают одну и ту же версию через rollout.
+PG-нагрузка: один SELECT blob на версию в каждом pod'е (cold miss), дальше memory-LRU отдаёт chunks. На rollout одной версии на 60k нод — ровно N_pods SELECT'ов в PG, не 60k.
 
 ### Open follow-ups (для P1)
 
