@@ -85,16 +85,29 @@ service BosunAPI {
 
   // --- OPERATOR (admin-token / Keycloak JWT) ---
 
-  // Точечное управление: установить target_version для списка host'ов
-  // или для cohort'а. Реализация = UPDATE bosun_clients SET target_version=...
-  // WHERE host IN (...). Клиенты сами доедут в своих pull-loop'ах.
+  // Точечный override: жёстко установить target_version на список host'ов
+  // (минуя rollout-постепенность). Реализация = UPDATE bosun_clients
+  // SET target_version=... WHERE host IN (...). Для emergency или ручной
+  // отладки одной ноды.
   rpc SetTargetVersion(SetTargetVersionIn) returns (SetTargetVersionOut);
+
+  // Постепенный rollout с failure-rate halt. Сервер сам в фоновом цикле
+  // расширяет cohort: батчами апдейтит target_version на части хостов из
+  // селектора, считает actual failure rate через bosun_clients и при
+  // превышении max_failure_rate переходит в state=halted (UPDATE'ы
+  // прекращаются, уже dispatched клиенты продолжают применять). Клиенты
+  // сами пулят и катят в своём pull-loop'е — никакого push-канала.
+  rpc IssueRollout(IssueRolloutIn) returns (IssueRolloutOut);
+  rpc GetRolloutStatus(GetRolloutStatusIn) returns (GetRolloutStatusOut);
+  rpc PauseRollout(RolloutControlIn) returns (RolloutControlOut);
+  rpc ResumeRollout(RolloutControlIn) returns (RolloutControlOut);
+  rpc AbortRollout(RolloutControlIn) returns (RolloutControlOut);
 
   // Только для случаев когда оператор хочет ускорить раскатку: server
   // пройдёт по live Subscribe-stream'ам матчингу target и отправит Kick.
   rpc KickRollout(KickRolloutIn) returns (KickRolloutOut);
 
-  // Sread-only обзор для оператора.
+  // Read-only обзор для оператора.
   rpc GetClientState(GetClientStateIn) returns (GetClientStateOut);
   rpc CountByVersion(CountByVersionIn) returns (CountByVersionOut);
 }
@@ -235,6 +248,62 @@ message SetTargetVersionOut {
   uint32 hosts_updated = 1;
 }
 
+message IssueRolloutIn {
+  uint64 target_version = 1;                 // версия в bosun_bundles
+  Target target = 2;                          // селектор cohort'а
+  google.protobuf.Duration over_duration = 3; // за это время раскатать
+  float  max_failure_rate = 4;                // 0.0..1.0; превышение → state=halted
+  string issued_by = 5;                       // для audit (или взять из auth-контекста)
+  string reason = 6;
+}
+
+message IssueRolloutOut {
+  string rollout_id = 1;
+  uint32 total_targets = 2;
+  google.protobuf.Timestamp scheduled_completion = 3;
+}
+
+message GetRolloutStatusIn {
+  string rollout_id = 1;
+}
+
+message GetRolloutStatusOut {
+  string rollout_id = 1;
+  RolloutState state = 2;
+  string halt_reason = 3;
+
+  uint32 total_targets = 10;
+  uint32 dispatched_targets = 11;             // UPDATE'нутых в bosun_clients.target_version
+  uint32 succeeded_targets = 12;              // last_applied_version == rollout.target_version
+  uint32 failed_targets = 13;                 // last_apply_success=false на этой версии
+
+  float  current_failure_rate = 20;
+
+  google.protobuf.Timestamp issued_at = 30;
+  google.protobuf.Timestamp started_at = 31;
+  google.protobuf.Timestamp halted_at = 32;
+  google.protobuf.Timestamp completed_at = 33;
+}
+
+enum RolloutState {
+  ROLLOUT_STATE_UNSPECIFIED = 0;
+  ROLLOUT_STATE_PENDING     = 1;
+  ROLLOUT_STATE_RUNNING     = 2;
+  ROLLOUT_STATE_PAUSED      = 3;
+  ROLLOUT_STATE_HALTED      = 4;
+  ROLLOUT_STATE_ABORTED     = 5;
+  ROLLOUT_STATE_COMPLETED   = 6;
+}
+
+message RolloutControlIn {
+  string rollout_id = 1;
+  string reason = 2;
+}
+
+message RolloutControlOut {
+  RolloutState new_state = 1;
+}
+
 message KickRolloutIn {
   Target target = 1;                         // тот же селектор
 }
@@ -275,6 +344,7 @@ CREATE TABLE bosun_clients (
     host                  TEXT PRIMARY KEY,
     target_version        BIGINT,                                       -- что оператор задал; NULL = «ничего не делай»
     last_applied_version  BIGINT,                                       -- что клиент реально прокатил
+    last_applied_success  BOOLEAN,                                      -- true=success, false=failed, NULL=ничего не пробовали
     last_applied_at       TIMESTAMPTZ,
     last_seen_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),           -- любой контакт (GetTargetVersion / Subscribe / Report)
     bosun_version         TEXT,                                          -- последняя репортнутая версия бинаря
@@ -285,6 +355,25 @@ CREATE TABLE bosun_clients (
 CREATE INDEX ON bosun_clients(target_version, last_applied_version);
 -- Для админских query'ев «когда последний раз ноду видели»
 CREATE INDEX ON bosun_clients(last_seen_at);
+
+-- План раскатки. Одна строка на rollout. Никаких per-host записей —
+-- расширение target_version у клиентов идёт через UPDATE bosun_clients.
+CREATE TABLE bosun_rollouts (
+    rollout_id          UUID PRIMARY KEY,
+    target_version      BIGINT NOT NULL REFERENCES bosun_bundles(version),
+    target_spec         JSONB NOT NULL,                                 -- сериализованный Target (hosts/clusters/severity)
+    over_duration_sec   INT NOT NULL,
+    max_failure_rate    REAL NOT NULL,
+    state               TEXT NOT NULL DEFAULT 'pending',                -- enum
+    halt_reason         TEXT,
+    issued_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    issued_by           TEXT NOT NULL,
+    started_at          TIMESTAMPTZ,
+    halted_at           TIMESTAMPTZ,
+    completed_at        TIMESTAMPTZ
+);
+
+CREATE INDEX ON bosun_rollouts(state) WHERE state IN ('pending', 'running');
 
 -- Bundle blob immutable
 CREATE TABLE bosun_bundles (
@@ -334,28 +423,83 @@ CREATE TABLE bosun_pods (
 
 ## Lifecycle оператора (rollout)
 
-Раскатка новой версии bundle на 1500 хостов:
+Постепенная раскатка новой версии bundle на 1500 хостов severity=low с автоматическим halt при превышении failure rate:
 
 ```
 1. CI публикует bundle: PublishBundle(blob, sig, tags) → version=42
-2. Оператор: bosun set-target --version=42 --severity=low
-   → SetTargetVersion(target_version=42, Target{severity_class="low"})
-   → UPDATE bosun_clients SET target_version=42 WHERE host IN (...) 
-   → возврат hosts_updated=1500
-3. (Опционально) оператор: bosun kick --severity=low
-   → KickRollout(Target{severity_class="low"})
-   → server идёт по live Subscribe-stream'ам и отправляет Kick{} тем кто матчит
-   → клиенты сразу проверяют target вместо ожидания 30s
-4. Клиенты в pull-loop'е увидят target_version=42, скачают, применят, репортят.
+
+2. Оператор:
+   bosun rollout --version=42 --severity=low \
+                 --over 30m --max-failure-rate 0.05
+
+   → IssueRollout(target_version=42,
+                  Target{severity_class="low"},
+                  over_duration=30m, max_failure_rate=0.05)
+   → INSERT bosun_rollouts (state=pending)
+   → возврат rollout_id, total_targets=1500
+
+3. Background worker (один на chiit-server, leader-elected через
+   advisory_lock) каждую минуту:
+   a) Берёт running rollouts.
+   b) Для каждого считает по bosun_clients:
+      - dispatched = COUNT(target_version >= rollout.target_version
+                           AND host IN cohort)
+      - succeeded  = COUNT(last_applied_version = rollout.target_version
+                           AND last_applied_success = true
+                           AND host IN cohort)
+      - failed     = COUNT(last_applied_version = rollout.target_version
+                           AND last_applied_success = false
+                           AND host IN cohort)
+      - failure_rate = failed / (succeeded + failed)
+   c) Если failure_rate > max_failure_rate:
+      UPDATE bosun_rollouts SET state='halted',
+                                halted_at=NOW(),
+                                halt_reason='...'
+      (новые батчи не dispatch'ятся; уже dispatched клиенты дойдут сами)
+   d) Иначе:
+      expected = total_targets * elapsed / over_duration
+      diff = expected - dispatched
+      Если diff > 0:
+        SELECT host FROM bosun_clients
+        WHERE host IN cohort
+          AND (target_version IS NULL OR target_version < $target)
+        LIMIT diff
+      UPDATE bosun_clients SET target_version=$target WHERE host IN (...)
+      INSERT в audit_log
+
+4. Клиенты в pull-loop'е (раз в 30s) видят новый target_version, скачивают
+   bundle (GetBundleManifest+Blob), применяют, репортят результат через
+   ReportApplyResult.
+
 5. Оператор мониторит:
-   → CountByVersion(Target{severity_class="low"})
-   → applied[42]=1245, pending[42]=255
-6. Если что-то плохо (failure rate высок) — оператор откатывает:
-   → SetTargetVersion(target_version=41, Target{severity_class="low"}, reason="rollback bad bundle")
-   → клиенты сами доедут обратно на 41
+   bosun rollout-status <rollout_id>
+   → GetRolloutStatus → dispatched=600/1500, succeeded=540, failed=12,
+                        failure_rate=2.2%, ETA через ~18m
+
+6. Если оператор хочет вмешаться:
+   bosun rollout-pause / --resume / --abort
+   → PauseRollout/ResumeRollout/AbortRollout
+   → UPDATE bosun_rollouts SET state='paused' / 'running' / 'aborted'
+   Worker сам видит изменение state и реагирует.
+
+7. Severity-aware multi-stage: оператор делает несколько rollout'ов подряд
+   (low → medium → high), либо запускает их параллельно с разными
+   max_failure_rate. Один rollout = один severity класс.
 ```
 
-Failure-rate halt — наблюдается оператором извне через CountByVersion / GetClientState. Никакой автомиатической остановки server-side: clients reportят как есть, оператор смотрит и решает (UPDATE target_version обратно).
+Failure-rate halt автоматический (server-side), при превышении max_failure_rate worker сам переходит в halted и больше target_version'ов не апдейтит. Уже dispatched клиенты доедут (они уже знают target=42 из своего pull). Если оператор хочет вернуть назад — Abort + новый rollout с target_version=41.
+
+Альтернатива (ручной точечный override): `SetTargetVersion(host=N1, target_version=41)` — без rollout state-machine, мгновенный UPDATE.
+
+### State machine rollout
+
+```
+pending → running (старт background worker'ом)
+running → paused (PauseRollout) → running (ResumeRollout)
+running → halted (failure_rate > max) → running (ResumeRollout с оператором по своему решению)
+running / paused / halted → aborted (AbortRollout, без возврата)
+running → completed (когда succeeded + failed == total_targets)
+```
 
 ## Pod redirect (без изменений)
 
@@ -424,14 +568,16 @@ chiit-server/
 | Pod drain timeout | 30 sec | при SIGTERM на graceful shutdown |
 | ECDSA cache | TTL 60 sec (как у chiit) | без отдельной revocation push-инвалидации |
 
-### Что убрано из P0 (по сравнению с прошлой версией спека)
+### Что убрано из P0 (по сравнению с прошлой push-моделью)
 
-- `commands_queue` таблица + polling-loop в pod'е.
-- `bosun_rollouts` таблица + state machine + background dispatcher.
-- `bosun_heartbeats` отдельная таблица — объединена в `bosun_clients`.
+- `commands_queue` таблица + polling-loop в pod'е — rollout идёт через UPDATE bosun_clients.target_version, не через INSERT в очередь.
+- `bosun_heartbeats` отдельная таблица — объединена в `bosun_clients.last_seen_at`.
 - `bosun_active_sessions` отдельная таблица — pod_id больше не персистится (Subscribe-stream — in-memory map в pod'е, на reconnect Subscribe просто новый stream).
-- `IssueCommand`, `IssueRollout`, `PauseRollout`, `ResumeRollout`, `AbortRollout`, `GetRolloutStatus`.
-- `ApplyBundleCommand`, `RunTaskCommand`, `FlushFactsCommand` — для P0 не нужны, добавятся отдельной фазой если понадобятся ad-hoc task'и.
+- `IssueCommand`, `ApplyBundleCommand`, `RunTaskCommand`, `FlushFactsCommand` — для P0 не нужны (apply идёт через pull, не через push-команды).
+
+### Что сохраняется как rollout-state-machine
+
+`bosun_rollouts` остаётся (одна строка на rollout, не per-host), `IssueRollout` + `GetRolloutStatus` + `Pause/Resume/Abort` остаются. Background worker (один лидер на chiit-server через advisory_lock) расширяет cohort через UPDATE bosun_clients, считает actual failure rate из агрегата bosun_clients и при превышении max_failure_rate переходит в halted. Никакого per-host commands_queue.
 
 ## Open follow-ups (P1)
 
