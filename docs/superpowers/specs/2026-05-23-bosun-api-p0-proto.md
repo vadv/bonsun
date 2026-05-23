@@ -116,8 +116,12 @@ service BosunAPI {
   // --- BUNDLE ---
 
   // Манифест бандла: версия, sha256, signature, какие тэги задействованы.
-  // Сам tar.gz клиент достаёт через GetBundleBlob (отдельный stream, P1).
   rpc GetBundleManifest(GetBundleManifestIn) returns (GetBundleManifestOut);
+
+  // Стриминг blob'а bundle'а. 256KB chunks. Клиент перед этим вызовом
+  // получил sha256+signature через GetBundleManifest и verify'ит после
+  // последнего chunk'а.
+  rpc GetBundleBlob(GetBundleBlobIn) returns (stream BundleChunk);
 
   // --- OPERATOR ---
 
@@ -875,7 +879,7 @@ CREATE TABLE bosun_bundles (
 
 CLI оператора `bosun bundle publish` **не существует** — bundle загружается через CI/CD автоматизацию (отдельный orchestrator, который вызывает `PublishBundle` от имени service-account'а). Никаких ручных операций оператора с blob'ом.
 
-`GetBundleManifest` отдаёт metadata + `blob_ref="pg-row:<version>"`. Сам blob — отдельным RPC `GetBundleBlob(version) returns (stream BundleChunk)` (P1, потом).
+`GetBundleManifest` отдаёт metadata + `blob_ref="pg-row:<version>"`. Сам blob — отдельным RPC `GetBundleBlob(version) returns (stream BundleChunk)` (теперь в P0).
 
 ### Commands queue
 
